@@ -1,0 +1,71 @@
+# === Secrets & env ===
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# === Python build artifacts ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+
+# === uv / virtualenv ===
+.venv/
+venv/
+env/
+.python-version
+
+# === IDE / editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# === OS ===
+Thumbs.db
+
+# === Engram runtime artifacts ===
+# Per-channel state directories live in ~/.engram/, NOT in the repo.
+# But if someone sets ENGRAM_STATE_DIR=./state/ during local testing,
+# don't commit it:
+state/
+logs/
+*.log
+*.log.*
+routing-state.json
+message-queue.json
+
+# === Internal planning / working docs ===
+# Keep long-form planning, retros, and internal specs OUT of the public repo.
+# The canonical location for those is ~/.openclaw/workspace/memory/engram-planning/
+# If anyone drops working notes into the repo for convenience, gitignore them:
+internal/
+planning/
+retro/
+*.internal.md
+NOTES.md
+SCRATCH.md
+
+# === M0 / verification scratch (never committed) ===
+verify-scratch/
+m0-*.md
+
+# === Test output ===
+.pytest_cache/
+test-results/
+coverage.xml
