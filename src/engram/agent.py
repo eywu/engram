@@ -50,9 +50,16 @@ class Agent:
         """Run one turn for the given channel. Returns aggregated response."""
         session.turn_count += 1
 
+        # setting_sources=["user"] chosen over ["user", "project"] based on
+        # 2026-04-20 cost experiment (scripts/cost_experiment.py): user-only
+        # drops per-turn priming cost ~47% ($0.0107 -> $0.0057) with zero
+        # tool-availability loss (both configs surfaced 125 tools).
+        # Explicitly setting user-only also beats SDK default ($0.0156/turn).
+        # If we ever need project-level CLAUDE.md priming for a specific
+        # channel, M2 will re-introduce it per-manifest.
         options = ClaudeAgentOptions(
             max_turns=self._config.max_turns_per_message,
-            setting_sources=["user", "project"],
+            setting_sources=["user"],
             cwd=str(session.cwd) if session.cwd else None,
             model=self._config.anthropic.model,
         )
