@@ -145,10 +145,15 @@ def _which(cmd: str) -> str | None:
     return which(cmd)
 
 
-def _safe_run(argv: list[str]) -> str:
+def _safe_run(argv: list[str], timeout: float = 10.0) -> str:
+    """Run a command, return stdout (or stderr) as text. Timeout-bounded.
+
+    Default 10s tolerates `claude mcp list` doing its health-check sweep
+    across multiple hosted MCPs. Short commands still return promptly.
+    """
     try:
         out = subprocess.run(
-            argv, capture_output=True, text=True, timeout=5, check=False
+            argv, capture_output=True, text=True, timeout=timeout, check=False
         )
         return (out.stdout or out.stderr).strip()
     except Exception:
