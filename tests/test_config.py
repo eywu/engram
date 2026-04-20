@@ -1,0 +1,84 @@
+"""Config loading tests — no network, no secrets."""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import yaml
+
+from engram.config import EngramConfig
+
+
+@pytest.fixture
+def clean_env(monkeypatch):
+    """Strip all env vars that config.load() reads."""
+    for key in (
+        "ENGRAM_SLACK_BOT_TOKEN",
+        "ENGRAM_SLACK_APP_TOKEN",
+        "ENGRAM_SLACK_SIGNING_SECRET",
+        "ENGRAM_ANTHROPIC_API_KEY",
+        "ENGRAM_MODEL",
+        "SLACK_BOT_TOKEN",
+        "SLACK_APP_TOKEN",
+        "SLACK_SIGNING_SECRET",
+        "ANTHROPIC_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+def _write_yaml(tmp_path: Path, content: dict) -> Path:
+    p = tmp_path / "config.yaml"
+    p.write_text(yaml.safe_dump(content))
+    return p
+
+
+def test_load_from_yaml(tmp_path, clean_env):
+    path = _write_yaml(
+        tmp_path,
+        {
+            "slack": {"bot_token": "xoxb-file", "app_token": "xapp-file"},
+            "anthropic": {"api_key": "sk-ant-file", "model": "claude-sonnet-4-6"},
+            "allowed_channels": ["C123"],
+            "max_turns_per_message": 5,
+        },
+    )
+    cfg = EngramConfig.load(path)
+    assert cfg.slack.bot_token == "xoxb-file"
+    assert cfg.slack.app_token == "xapp-file"
+    assert cfg.anthropic.api_key == "sk-ant-file"
+    assert cfg.anthropic.model == "claude-sonnet-4-6"
+    assert cfg.allowed_channels == ["C123"]
+    assert cfg.max_turns_per_message == 5
+
+
+def test_env_fallback(tmp_path, clean_env, monkeypatch):
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-env")
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-env")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env")
+    path = tmp_path / "empty.yaml"  # doesn't exist
+    cfg = EngramConfig.load(path)
+    assert cfg.slack.bot_token == "xoxb-env"
+    assert cfg.slack.app_token == "xapp-env"
+    assert cfg.anthropic.api_key == "sk-ant-env"
+
+
+def test_missing_required_raises(tmp_path, clean_env):
+    path = tmp_path / "empty.yaml"
+    with pytest.raises(RuntimeError, match="Missing required"):
+        EngramConfig.load(path)
+
+
+def test_yaml_wins_over_env(tmp_path, clean_env, monkeypatch):
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-env")
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-env")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env")
+    path = _write_yaml(
+        tmp_path,
+        {
+            "slack": {"bot_token": "xoxb-file", "app_token": "xapp-file"},
+            "anthropic": {"api_key": "sk-ant-file"},
+        },
+    )
+    cfg = EngramConfig.load(path)
+    assert cfg.slack.bot_token == "xoxb-file"
+    assert cfg.anthropic.api_key == "sk-ant-file"
