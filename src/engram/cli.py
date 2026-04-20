@@ -14,6 +14,7 @@ from rich.table import Table
 
 from engram import __version__
 from engram.config import DEFAULT_CONFIG_PATH, EngramConfig
+from engram.costs import CostLedger
 
 app = typer.Typer(
     name="engram",
@@ -80,6 +81,28 @@ def status() -> None:
     else:
         for name, src in mcps.items():
             rprint(f"  [green]•[/green] {name}  [dim]from {src}[/dim]")
+    rprint()
+
+    # --- Cost ledger (M1 promoted from M3) ---
+    rprint("[bold]Costs[/bold] (from JSONL ledger)")
+    if cfg:
+        ledger = CostLedger(cfg.paths.log_dir / "costs.jsonl")
+        summary = ledger.summarize()
+        if summary.total_turns == 0:
+            rprint("  [dim](no turns recorded yet)[/dim]")
+        else:
+            ctable = Table(show_header=False, box=None, padding=(0, 1))
+            ctable.add_column()
+            ctable.add_column(justify="right")
+            ctable.add_column(justify="right")
+            ctable.add_row("  period", "turns", "spend")
+            ctable.add_row("  today", str(summary.today_turns), f"${summary.today_cost_usd:.4f}")
+            ctable.add_row("  month-to-date", str(summary.month_turns), f"${summary.month_cost_usd:.4f}")
+            ctable.add_row("  all-time", str(summary.total_turns), f"${summary.total_cost_usd:.4f}")
+            console.print(ctable)
+            if summary.total_turns > 0:
+                avg = summary.total_cost_usd / summary.total_turns
+                rprint(f"  [dim]avg/turn: ${avg:.4f}[/dim]")
     rprint()
 
     # --- Bridge process ---

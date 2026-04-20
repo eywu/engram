@@ -8,19 +8,27 @@ M2 replaces the allowlist with manifest-driven provisioning.
 """
 from __future__ import annotations
 
+import datetime
 import logging
 
 from slack_bolt.async_app import AsyncApp
 
 from engram.agent import Agent
 from engram.config import EngramConfig
+from engram.costs import CostLedger, TurnCost
 from engram.egress import post_reply
 from engram.router import Router
 
 log = logging.getLogger(__name__)
 
 
-def register_listeners(app: AsyncApp, config: EngramConfig, router: Router, agent: Agent) -> None:
+def register_listeners(
+    app: AsyncApp,
+    config: EngramConfig,
+    router: Router,
+    agent: Agent,
+    cost_ledger: CostLedger | None = None,
+) -> None:
     """Attach message/app_mention handlers to a Bolt AsyncApp."""
 
     @app.event("message")
@@ -72,12 +80,28 @@ def register_listeners(app: AsyncApp, config: EngramConfig, router: Router, agen
                 )
                 return
 
-            await post_reply(
+            egress_result = await post_reply(
                 say,
                 turn,
                 thread_ts=thread_ts if not is_dm else None,
                 session_label=session.label(),
             )
+
+            if cost_ledger is not None and turn.cost_usd is not None:
+                cost_ledger.record(
+                    TurnCost(
+                        timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
+                        session_label=session.label(),
+                        channel_id=session.channel_id,
+                        is_dm=session.is_dm,
+                        cost_usd=turn.cost_usd,
+                        duration_ms=turn.duration_ms,
+                        num_turns=turn.num_turns,
+                        user_text_len=len(text),
+                        chunks_posted=egress_result.chunks_posted,
+                        is_error=turn.is_error,
+                    )
+                )
 
     @app.event("app_mention")
     async def on_mention(event, say):

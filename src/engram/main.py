@@ -16,8 +16,11 @@ from slack_bolt.async_app import AsyncApp
 from engram import __version__
 from engram.agent import Agent
 from engram.config import EngramConfig
+from engram.costs import CostLedger
 from engram.ingress import register_listeners
 from engram.router import Router
+
+READY_LOG_LINE = "engram.ready"  # stable string for health probes / test harnesses
 
 
 def _configure_logging() -> None:
@@ -59,15 +62,17 @@ async def run() -> int:
     app = AsyncApp(token=config.slack.bot_token)
     router = Router(shared_cwd=config.paths.state_dir)
     agent = Agent(config)
-    register_listeners(app, config, router, agent)
+    cost_ledger = CostLedger(config.paths.log_dir / "costs.jsonl")
+    register_listeners(app, config, router, agent, cost_ledger=cost_ledger)
 
     handler = AsyncSocketModeHandler(app, config.slack.app_token)
 
     stop_event = asyncio.Event()
 
     def _graceful(*_):
-        log.info("engram.signal_received initiating_shutdown")
-        stop_event.set()
+        if not stop_event.is_set():
+            log.info("engram.signal_received initiating_shutdown")
+            stop_event.set()
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -78,13 +83,23 @@ async def run() -> int:
             signal.signal(sig, _graceful)
 
     log.info("engram.starting socket_mode=True")
-    await handler.start_async()
+    # Use connect_async (returns after WS handshake) instead of start_async
+    # (which blocks on asyncio.sleep(inf)); the stop_event below is what
+    # keeps us alive until a signal arrives.
+    await handler.connect_async()
+    log.info("engram.ready")
 
-    # Wait for signal.
+    # Block until SIGTERM / SIGINT.
     await stop_event.wait()
 
     log.info("engram.shutting_down")
-    await handler.close_async()
+    try:
+        # close_async() tears down the WebSocket + background tasks. Wrap in a
+        # timeout so a stuck socket never keeps the process from exiting.
+        await asyncio.wait_for(handler.close_async(), timeout=5.0)
+    except (TimeoutError, Exception) as e:
+        log.warning("engram.shutdown_close_failed %s: %s", type(e).__name__, e)
+    log.info("engram.shutdown_complete")
     return 0
 
 
