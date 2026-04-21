@@ -14,6 +14,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -23,6 +24,7 @@ from claude_agent_sdk import (
     tag_session,
 )
 
+from engram.budget import BUDGET_PAUSE_MESSAGE, Budget, CheckResult
 from engram.config import EngramConfig
 from engram.router import SessionState
 from engram.scope import build_scope_decision, build_tool_guard
@@ -40,6 +42,9 @@ class AgentTurn:
     num_turns: int | None
     is_error: bool
     error_message: str | None = None
+    budget_warnings: tuple[Decimal, ...] = ()
+    budget_month_to_date_usd: Decimal | None = None
+    budget_monthly_cap_usd: Decimal | None = None
 
 
 ClientFactory = Callable[[ClaudeAgentOptions], ClaudeSDKClient]
@@ -58,20 +63,45 @@ class Agent:
         config: EngramConfig,
         *,
         client_factory: ClientFactory = ClaudeSDKClient,
+        budget: Budget | None = None,
     ):
         self._config = config
         self._client_factory = client_factory
+        self._budget = budget
 
-    async def run_turn(self, session: SessionState, user_text: str) -> AgentTurn:
+    async def run_turn(
+        self,
+        session: SessionState,
+        user_text: str,
+        *,
+        user_id: str | None = None,
+    ) -> AgentTurn:
         """Run one turn for the given channel. Returns aggregated response."""
         text_chunks: list[str] = []
         result: ResultMessage | None = None
         error_message: str | None = None
+        budget_checks: list[CheckResult] = []
 
         await session.agent_lock.acquire()
         try:
             session.turn_count += 1
+            budget_check = self._check_budget(session.channel_id)
+            if budget_check is not None:
+                budget_checks.append(budget_check)
+                if budget_check.pause:
+                    return AgentTurn(
+                        text=BUDGET_PAUSE_MESSAGE,
+                        cost_usd=None,
+                        duration_ms=None,
+                        num_turns=None,
+                        is_error=False,
+                        budget_warnings=budget_check.thresholds_fired,
+                        budget_month_to_date_usd=budget_check.month_to_date_usd,
+                        budget_monthly_cap_usd=budget_check.monthly_cap_usd,
+                    )
+
             client = await self._ensure_client(session)
+            self._refresh_client_budget_limit(client)
 
             await client.query(user_text, session_id=session.session_id)
             async for message in client.receive_response():
@@ -82,6 +112,16 @@ class Agent:
                             text_chunks.append(text)
                 elif isinstance(message, ResultMessage):
                     result = message
+            if result is not None and self._budget is not None:
+                try:
+                    self._budget.record(session.channel_id, user_id, result)
+                    budget_checks.append(self._budget.check(session.channel_id))
+                except Exception:
+                    log.warning(
+                        "agent.budget_record_failed session=%s",
+                        session.label(),
+                        exc_info=True,
+                    )
             if not session.agent_session_tagged:
                 session.agent_session_tagged = await self._tag_session(
                     session, client
@@ -104,6 +144,9 @@ class Agent:
         elif not text:
             text = "(no response)"
 
+        budget_warnings, budget_mtd, budget_cap = _summarize_budget_checks(
+            budget_checks
+        )
         return AgentTurn(
             text=text,
             cost_usd=getattr(result, "total_cost_usd", None) if result else None,
@@ -111,6 +154,9 @@ class Agent:
             num_turns=getattr(result, "num_turns", None) if result else None,
             is_error=bool(error_message) or (result.is_error if result else False),
             error_message=error_message,
+            budget_warnings=budget_warnings,
+            budget_month_to_date_usd=budget_mtd,
+            budget_monthly_cap_usd=budget_cap,
         )
 
     # ──────────────────────────────────────────────────────────────
@@ -123,6 +169,7 @@ class Agent:
         Caller must hold session.agent_lock.
         """
         if session.agent_client is not None:
+            self._refresh_client_budget_limit(session.agent_client)
             return session.agent_client
 
         options = self._build_options(
@@ -258,4 +305,47 @@ class Agent:
             skills=skills,
             # Scope (runtime — final enforcement)
             can_use_tool=can_use_tool,
+            max_budget_usd=self._max_budget_usd_for_options(),
         )
+
+    def _check_budget(self, channel_id: str) -> CheckResult | None:
+        if self._budget is None:
+            return None
+        try:
+            return self._budget.check(channel_id)
+        except Exception:
+            log.warning("agent.budget_check_failed channel=%s", channel_id, exc_info=True)
+            return None
+
+    def _max_budget_usd_for_options(self) -> float | None:
+        if self._budget is None:
+            return None
+        try:
+            remaining = self._budget.remaining_usd()
+        except Exception:
+            log.warning("agent.budget_remaining_failed", exc_info=True)
+            return None
+        if remaining <= 0 and not self._budget.config.hard_cap_enabled:
+            return None
+        return float(remaining)
+
+    def _refresh_client_budget_limit(self, client: ClaudeSDKClient) -> None:
+        options = getattr(client, "options", None)
+        if options is None:
+            return
+        options.max_budget_usd = self._max_budget_usd_for_options()
+
+
+def _summarize_budget_checks(
+    checks: list[CheckResult],
+) -> tuple[tuple[Decimal, ...], Decimal | None, Decimal | None]:
+    warnings: list[Decimal] = []
+    month_to_date: Decimal | None = None
+    monthly_cap: Decimal | None = None
+    for check in checks:
+        month_to_date = check.month_to_date_usd
+        monthly_cap = check.monthly_cap_usd
+        for threshold in check.thresholds_fired:
+            if threshold not in warnings:
+                warnings.append(threshold)
+    return tuple(warnings), month_to_date, monthly_cap
