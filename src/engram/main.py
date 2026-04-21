@@ -39,6 +39,57 @@ def _configure_logging() -> None:
     )
 
 
+async def _discover_template_vars(
+    app: AsyncApp,
+    owner_dm_channel_id: str | None,
+    log: logging.Logger,
+) -> dict[str, str]:
+    """Query Slack for workspace + owner display name at boot.
+
+    Returns a dict suitable for bootstrap's `_render_identity_md` — missing
+    keys fall back to the generic defaults ("the operator", "this workspace").
+    Best-effort: any Slack API error is logged and swallowed.
+    """
+    vars_: dict[str, str] = {}
+    try:
+        auth = await app.client.auth_test()
+        team_name = auth.get("team")
+        if team_name:
+            vars_["slack_workspace_name"] = team_name
+            log.info("engram.discovered slack_workspace_name=%s", team_name)
+    except Exception as e:
+        log.warning(
+            "engram.discover_workspace_failed %s: %s", type(e).__name__, e
+        )
+
+    if owner_dm_channel_id:
+        try:
+            info = await app.client.conversations_info(
+                channel=owner_dm_channel_id
+            )
+            user_id = info.get("channel", {}).get("user")
+            if user_id:
+                u = await app.client.users_info(user=user_id)
+                profile = u.get("user", {})
+                display = (
+                    profile.get("real_name")
+                    or profile.get("name")
+                )
+                if display:
+                    vars_["owner_display_name"] = display
+                    log.info(
+                        "engram.discovered owner_display_name=%s user_id=%s",
+                        display,
+                        user_id,
+                    )
+        except Exception as e:
+            log.warning(
+                "engram.discover_owner_failed %s: %s", type(e).__name__, e
+            )
+
+    return vars_
+
+
 async def run() -> int:
     _configure_logging()
     log = logging.getLogger("engram.main")
@@ -72,10 +123,20 @@ async def run() -> int:
     )
 
     app = AsyncApp(token=config.slack.bot_token)
+
+    # Discover workspace + owner display name so CLAUDE.md templates render
+    # with real identity ("Eric" / "growthgauge") instead of the generic
+    # fallbacks ("the operator" / "this workspace"). Best-effort: any Slack
+    # API failure here falls back to the defaults in bootstrap._render_identity_md.
+    template_vars = await _discover_template_vars(
+        app, config.owner_dm_channel_id, log
+    )
+
     router = Router(
         shared_cwd=project_root_path,
         home=engram_home,
         owner_dm_channel_id=config.owner_dm_channel_id,
+        template_vars=template_vars,
     )
     agent = Agent(config)
     cost_ledger = CostLedger(config.paths.log_dir / "costs.jsonl")

@@ -116,3 +116,37 @@ async def test_legacy_mode_sessions_are_always_active():
     s = await r.get("C1")
     assert s.manifest is None
     assert s.is_active()
+
+
+@pytest.mark.asyncio
+async def test_template_vars_flow_into_claude_md(tmp_path: Path):
+    """owner_display_name + slack_workspace_name must reach the rendered CLAUDE.md."""
+    r = Router(
+        home=tmp_path,
+        owner_dm_channel_id="D07ERIC",
+        template_vars={
+            "owner_display_name": "Eric",
+            "slack_workspace_name": "growthgauge",
+        },
+    )
+    await r.get("D07ERIC", is_dm=True)
+    body = paths.channel_claude_md_path("D07ERIC", tmp_path).read_text()
+    assert "Eric" in body
+    assert "growthgauge" in body
+    # The workspace default (which is ONLY used in the workspace slot) must
+    # not appear when we've supplied a real workspace name.
+    assert "this workspace" not in body
+    # Raw {{var}} markers must be fully resolved.
+    assert "{{owner_display_name}}" not in body
+    assert "{{slack_workspace_name}}" not in body
+
+
+@pytest.mark.asyncio
+async def test_template_vars_optional(tmp_path: Path):
+    """Omitting template_vars falls back to defaults (no crash)."""
+    r = Router(home=tmp_path)
+    await r.get("D07ANY", is_dm=True)
+    body = paths.channel_claude_md_path("D07ANY", tmp_path).read_text()
+    # Generic defaults are used in the slots — workspace slot shows "this workspace".
+    assert "this workspace" in body
+    assert "{{owner_display_name}}" not in body
