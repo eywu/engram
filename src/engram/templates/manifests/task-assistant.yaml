@@ -30,11 +30,14 @@ tools:
     - Edit
     - NotebookEdit
 
-# Team channels must explicitly list MCPs. Empty allowed list means zero MCPs.
+# Team channels must explicitly list privileged MCPs. Engram's own memory
+# search is a base capability; remove it here and add it to `disallowed` only
+# when a channel should not recall stored conversation history.
 # To grant one, add the server name here and define its config in
 # ~/.claude/mcp.json.
 mcp_servers:
-  allowed: []
+  allowed:
+    - engram-memory
 
 # Skills: inherit all by default. Exclude per-channel as needed.
 skills: {}

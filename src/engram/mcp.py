@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from engram.manifest import ChannelManifest
+from engram.mcp_tools import (
+    MEMORY_SEARCH_SERVER_NAME,
+    make_memory_search_server,
+)
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +69,9 @@ def resolve_team_mcp_servers(
     servers: dict[str, dict[str, Any]] = {}
     missing: list[str] = []
     for name in effective_names:
+        if name == MEMORY_SEARCH_SERVER_NAME:
+            servers[name] = make_memory_search_server(manifest.channel_id)
+            continue
         config = configured.get(name)
         if config is None:
             missing.append(name)

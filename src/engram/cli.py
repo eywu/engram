@@ -22,6 +22,10 @@ from engram.config import DEFAULT_CONFIG_PATH, EngramConfig, PathsConfig
 from engram.costs import CostDatabase
 from engram.manifest import ChannelManifest, ManifestError, load_manifest
 from engram.mcp import resolve_team_mcp_servers
+from engram.mcp_tools import (
+    MEMORY_SEARCH_FULL_TOOL_NAME,
+    MEMORY_SEARCH_SERVER_NAME,
+)
 from engram.paths import contexts_dir, engram_home
 from engram.runtime import health_path, pid_path, status_path
 from engram.telemetry import process_exists, read_json
@@ -276,11 +280,16 @@ def _merge_channels(
         channel.setdefault("manifest_status", str(manifest.status))
         channel.setdefault("identity", str(manifest.identity))
         channel["mcp"] = _manifest_mcp_policy(manifest)
+        channel["tools"] = _merge_registered_tools(
+            channel.get("tools"),
+            _manifest_registered_tools(manifest),
+        )
 
     for channel_id, channel in by_channel.items():
         channel.setdefault("rate_limit", cost_db.latest_rate_limit(channel_id))
         channel.setdefault("mcp_status", None)
         channel.setdefault("mcp", {"strict_mode": None, "servers": []})
+        channel.setdefault("tools", {"registered": []})
         channel.setdefault("context_usage", None)
         channel.setdefault("live", False)
     return sorted(by_channel.values(), key=lambda item: item["channel_id"])
@@ -293,6 +302,26 @@ def _manifest_mcp_policy(manifest: ChannelManifest) -> dict[str, Any]:
         resolved, _allowed, _missing = resolve_team_mcp_servers(manifest)
         servers = list(resolved)
     return {"strict_mode": strict_mode, "servers": servers}
+
+
+def _manifest_registered_tools(manifest: ChannelManifest) -> list[str]:
+    if manifest.is_owner_dm():
+        return [MEMORY_SEARCH_FULL_TOOL_NAME]
+    mcp = manifest.mcp_servers
+    if MEMORY_SEARCH_SERVER_NAME in mcp.disallowed:
+        return []
+    if mcp.allowed is not None and MEMORY_SEARCH_SERVER_NAME in mcp.allowed:
+        return [MEMORY_SEARCH_FULL_TOOL_NAME]
+    return []
+
+
+def _merge_registered_tools(raw_tools: Any, registered: list[str]) -> dict[str, Any]:
+    tools = dict(raw_tools) if isinstance(raw_tools, dict) else {}
+    existing = tools.get("registered")
+    if isinstance(existing, list):
+        registered = [*existing, *registered]
+    tools["registered"] = sorted(set(registered))
+    return tools
 
 
 def _memory_counts(path: Path) -> dict[str, int]:

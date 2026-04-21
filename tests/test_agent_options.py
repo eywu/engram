@@ -75,7 +75,8 @@ def test_owner_dm_manifest_full_inheritance():
     opts = a._build_options(_session(m))
     assert opts.setting_sources == ["user"]
     assert opts.disallowed_tools == []
-    assert opts.allowed_tools == []
+    assert opts.allowed_tools == ["mcp__engram-memory__memory_search"]
+    assert set(opts.mcp_servers) == {"engram-memory"}
     assert getattr(opts, "strict_mcp_config", False) is False
     assert "strict-mcp-config" not in opts.extra_args
     # Runtime guard is always wired when a manifest is present — even
@@ -168,6 +169,20 @@ def test_owner_dm_does_not_use_strict_mode():
     opts = a._build_options(_session(m))
     assert getattr(opts, "strict_mcp_config", False) is False
     assert "strict-mcp-config" not in opts.extra_args
+
+
+def test_team_channel_memory_mcp_server_matches_manifest():
+    m = ChannelManifest(
+        channel_id="C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        status=ChannelStatus.ACTIVE,
+        mcp_servers=ScopeList(allowed=["engram-memory"]),
+    )
+    a = Agent(_cfg())
+    opts = a._build_options(_session(m))
+    assert set(opts.mcp_servers) == {"engram-memory"}
+    assert opts.allowed_tools == ["mcp__engram-memory__memory_search"]
+    assert "mcp-config" not in opts.extra_args
 
 
 # ── Behavior overrides ─────────────────────────────────────────────────
