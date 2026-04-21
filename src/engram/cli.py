@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.table import Table
 
 from engram import __version__
+from engram.cli_channels import app as channels_app
 from engram.config import DEFAULT_CONFIG_PATH, EngramConfig
 from engram.costs import CostLedger
 
@@ -21,6 +22,11 @@ app = typer.Typer(
     help="Personal AI agent for Slack.",
     no_args_is_help=True,
     add_completion=False,
+)
+app.add_typer(
+    channels_app,
+    name="channels",
+    help="List and manage per-channel manifests.",
 )
 console = Console()
 
