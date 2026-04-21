@@ -3,19 +3,24 @@
 M1: one Slack message = one `query()` call = one turn.
 M2: the per-channel ChannelManifest drives scope (tools/MCPs/skills),
     setting_sources, max_turns, cwd, and system-prompt identity.
-M3 will add cost-budget enforcement on top of this.
+M3: one ClaudeSDKClient per active Slack channel, serialized by the
+    per-channel SessionState.agent_lock.
 M4 will add AskUserQuestion stream-watching.
 """
 from __future__ import annotations
 
+import inspect
 import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     ResultMessage,
-    query,
+    tag_session,
 )
 
 from engram.config import EngramConfig
@@ -37,29 +42,39 @@ class AgentTurn:
     error_message: str | None = None
 
 
+ClientFactory = Callable[[ClaudeAgentOptions], ClaudeSDKClient]
+
+
 class Agent:
     """Runs a single Claude turn for a channel.
 
-    Stateless; SessionState is passed per call. When the session carries a
-    ChannelManifest (M2), agent reads scope from it; otherwise falls back
-    to M1 behavior (setting_sources=["user"], no tool guards).
+    SessionState owns the per-channel ClaudeSDKClient and asyncio.Lock. When
+    the session carries a ChannelManifest (M2), agent reads scope from it;
+    otherwise falls back to M1 behavior (setting_sources=["user"], no guards).
     """
 
-    def __init__(self, config: EngramConfig):
+    def __init__(
+        self,
+        config: EngramConfig,
+        *,
+        client_factory: ClientFactory = ClaudeSDKClient,
+    ):
         self._config = config
+        self._client_factory = client_factory
 
     async def run_turn(self, session: SessionState, user_text: str) -> AgentTurn:
         """Run one turn for the given channel. Returns aggregated response."""
-        session.turn_count += 1
-
-        options = self._build_options(session)
-
         text_chunks: list[str] = []
         result: ResultMessage | None = None
         error_message: str | None = None
 
+        await session.agent_lock.acquire()
         try:
-            async for message in query(prompt=user_text, options=options):
+            session.turn_count += 1
+            client = await self._ensure_client(session)
+
+            await client.query(user_text, session_id=session.session_id)
+            async for message in client.receive_response():
                 if isinstance(message, AssistantMessage):
                     for block in getattr(message, "content", []) or []:
                         text = getattr(block, "text", None)
@@ -67,11 +82,18 @@ class Agent:
                             text_chunks.append(text)
                 elif isinstance(message, ResultMessage):
                     result = message
+            if not session.agent_session_tagged:
+                session.agent_session_tagged = await self._tag_session(
+                    session, client
+                )
         except Exception as e:
             error_message = f"{type(e).__name__}: {e}"
             log.exception(
                 "agent.run_turn failed for session=%s", session.label()
             )
+        finally:
+            session.agent_last_active_at = time.monotonic()
+            session.agent_lock.release()
 
         text = "".join(text_chunks).strip()
         if not text and error_message:
@@ -95,7 +117,93 @@ class Agent:
     # Option construction
     # ──────────────────────────────────────────────────────────────
 
-    def _build_options(self, session: SessionState) -> ClaudeAgentOptions:
+    async def _ensure_client(self, session: SessionState) -> ClaudeSDKClient:
+        """Create and connect the per-channel client if needed.
+
+        Caller must hold session.agent_lock.
+        """
+        if session.agent_client is not None:
+            return session.agent_client
+
+        options = self._build_options(
+            session,
+            resume=session.agent_session_initialized,
+        )
+        client = self._client_factory(options)
+        try:
+            await client.connect()
+        except Exception:
+            try:
+                await client.disconnect()
+            except Exception:
+                log.debug(
+                    "agent.client_disconnect_after_connect_failure_failed "
+                    "session=%s",
+                    session.label(),
+                    exc_info=True,
+                )
+            raise
+
+        session.agent_client = client
+        session.agent_session_initialized = True
+        log.info("agent.client_connected session=%s", session.label())
+        return client
+
+    async def _tag_session(
+        self,
+        session: SessionState,
+        client: ClaudeSDKClient,
+    ) -> bool:
+        """Tag the Claude session with the Slack channel id when possible."""
+        method = getattr(client, "tag_session", None)
+        if method is not None:
+            try:
+                maybe_awaitable = method(
+                    session_id=session.session_id,
+                    tags={"channel_id": session.channel_id},
+                )
+                if inspect.isawaitable(maybe_awaitable):
+                    await maybe_awaitable
+            except Exception:
+                log.warning(
+                    "agent.session_tag_failed session=%s session_id=%s",
+                    session.label(),
+                    session.session_id,
+                    exc_info=True,
+                )
+                return False
+            else:
+                return True
+
+        try:
+            tag_session(
+                session.session_id,
+                f"channel_id:{session.channel_id}",
+                directory=str(session.cwd) if session.cwd else None,
+            )
+        except FileNotFoundError:
+            log.debug(
+                "agent.session_tag_deferred session=%s session_id=%s",
+                session.label(),
+                session.session_id,
+            )
+            return False
+        except Exception:
+            log.warning(
+                "agent.session_tag_failed session=%s session_id=%s",
+                session.label(),
+                session.session_id,
+                exc_info=True,
+            )
+            return False
+        return True
+
+    def _build_options(
+        self,
+        session: SessionState,
+        *,
+        resume: bool = False,
+    ) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions from config + (optional) channel manifest."""
         manifest = session.manifest
 
@@ -129,11 +237,18 @@ class Agent:
             # can't always enumerate).
             can_use_tool = build_tool_guard(manifest)
 
+        session_kwargs = (
+            {"resume": session.session_id}
+            if resume
+            else {"session_id": session.session_id}
+        )
+
         return ClaudeAgentOptions(
             # Identity & discovery
             setting_sources=setting_sources,
             cwd=str(session.cwd) if session.cwd else None,
             model=self._config.anthropic.model,
+            **session_kwargs,
             # Runtime limits
             max_turns=max_turns,
             permission_mode=permission_mode,

@@ -5,6 +5,7 @@ Starts a Bolt AsyncApp in Socket Mode, wires router + agent, blocks forever.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import signal
 import sys
@@ -142,6 +143,7 @@ async def run() -> int:
     agent = Agent(config)
     cost_ledger = CostLedger(config.paths.log_dir / "costs.jsonl")
     register_listeners(app, config, router, agent, cost_ledger=cost_ledger)
+    idle_sweeper_task = router.start_idle_sweeper()
 
     handler = AsyncSocketModeHandler(app, config.slack.app_token)
 
@@ -177,6 +179,19 @@ async def run() -> int:
         await asyncio.wait_for(handler.close_async(), timeout=5.0)
     except (TimeoutError, Exception) as e:
         log.warning("engram.shutdown_close_failed %s: %s", type(e).__name__, e)
+    finally:
+        idle_sweeper_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await idle_sweeper_task
+
+        try:
+            await router.close_all_agent_clients()
+        except (TimeoutError, Exception) as e:
+            log.warning(
+                "engram.shutdown_agent_close_failed %s: %s",
+                type(e).__name__,
+                e,
+            )
     log.info("engram.shutdown_complete")
     return 0
 
