@@ -13,9 +13,13 @@ off when no `home` is provided.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from engram import paths
 from engram.bootstrap import provision_channel
@@ -27,7 +31,18 @@ from engram.manifest import (
     load_manifest,
 )
 
+if TYPE_CHECKING:
+    from claude_agent_sdk import ClaudeSDKClient
+
 log = logging.getLogger(__name__)
+
+AGENT_IDLE_TIMEOUT_SECONDS = 15 * 60
+AGENT_IDLE_SWEEP_INTERVAL_SECONDS = 60
+
+
+def derive_session_id(channel_id: str) -> str:
+    """Derive the deterministic Claude session UUID for a Slack channel."""
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"engram-v3/{channel_id}"))
 
 
 @dataclass
@@ -35,15 +50,30 @@ class SessionState:
     """Per-channel state.
 
     M2 adds `manifest` + `cwd` derivation from the project root.
+    M3 adds the per-channel ClaudeSDKClient and lock.
     """
 
     channel_id: str
     channel_name: str | None = None
     is_dm: bool = False
     cwd: Path | None = None
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    session_id: str = ""
+    agent_client: ClaudeSDKClient | None = None
+    agent_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    agent_session_initialized: bool = False
+    agent_session_tagged: bool = False
+    agent_last_active_at: float = field(default_factory=time.monotonic)
     turn_count: int = 0
     manifest: ChannelManifest | None = None
+
+    def __post_init__(self) -> None:
+        if not self.session_id:
+            self.session_id = derive_session_id(self.channel_id)
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        """Backward-compatible alias for the per-channel agent lock."""
+        return self.agent_lock
 
     def label(self) -> str:
         if self.channel_name:
@@ -88,6 +118,7 @@ class Router:
         # Discovered at boot from Slack auth.test / users.info.
         self._template_vars = dict(template_vars) if template_vars else {}
         self._create_lock = asyncio.Lock()
+        self._idle_sweeper_task: asyncio.Task[None] | None = None
 
     async def get(
         self,
@@ -185,3 +216,99 @@ class Router:
 
     def session_count(self) -> int:
         return len(self._sessions)
+
+    # ──────────────────────────────────────────────────────────────
+    # Agent client lifecycle
+    # ──────────────────────────────────────────────────────────────
+
+    def start_idle_sweeper(
+        self,
+        *,
+        idle_timeout_seconds: float = AGENT_IDLE_TIMEOUT_SECONDS,
+        sweep_interval_seconds: float = AGENT_IDLE_SWEEP_INTERVAL_SECONDS,
+    ) -> asyncio.Task[None]:
+        """Start the background task that closes idle Claude clients."""
+        if (
+            self._idle_sweeper_task is not None
+            and not self._idle_sweeper_task.done()
+        ):
+            return self._idle_sweeper_task
+
+        self._idle_sweeper_task = asyncio.create_task(
+            self._idle_sweeper(
+                idle_timeout_seconds=idle_timeout_seconds,
+                sweep_interval_seconds=sweep_interval_seconds,
+            ),
+            name="engram-agent-idle-sweeper",
+        )
+        return self._idle_sweeper_task
+
+    async def stop_idle_sweeper(self) -> None:
+        """Cancel the idle sweeper if this Router owns one."""
+        if self._idle_sweeper_task is None:
+            return
+        self._idle_sweeper_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._idle_sweeper_task
+        self._idle_sweeper_task = None
+
+    async def _idle_sweeper(
+        self,
+        *,
+        idle_timeout_seconds: float,
+        sweep_interval_seconds: float,
+    ) -> None:
+        while True:
+            await asyncio.sleep(sweep_interval_seconds)
+            await self.close_idle_agent_clients(
+                idle_timeout_seconds=idle_timeout_seconds
+            )
+
+    async def close_idle_agent_clients(
+        self,
+        *,
+        idle_timeout_seconds: float = AGENT_IDLE_TIMEOUT_SECONDS,
+        now: float | None = None,
+    ) -> int:
+        """Close clients idle for at least `idle_timeout_seconds`.
+
+        The per-channel agent lock is acquired before calling disconnect so an
+        idle sweep cannot race an in-flight ClaudeSDKClient method call.
+        """
+        closed = 0
+        current = time.monotonic() if now is None else now
+        for session in self.list_sessions():
+            if session.agent_client is None:
+                continue
+            if current - session.agent_last_active_at < idle_timeout_seconds:
+                continue
+            async with session.agent_lock:
+                if session.agent_client is None:
+                    continue
+                check_now = time.monotonic() if now is None else now
+                if (
+                    check_now - session.agent_last_active_at
+                    < idle_timeout_seconds
+                ):
+                    continue
+                await session.agent_client.disconnect()
+                session.agent_client = None
+                closed += 1
+                log.info("router.agent_client_closed_idle session=%s", session.label())
+        return closed
+
+    async def close_all_agent_clients(self) -> int:
+        """Wait for in-flight turns and close every active Claude client."""
+        closed = 0
+        for session in self.list_sessions():
+            async with session.agent_lock:
+                if session.agent_client is None:
+                    continue
+                await session.agent_client.disconnect()
+                session.agent_client = None
+                closed += 1
+                log.info(
+                    "router.agent_client_closed_shutdown session=%s",
+                    session.label(),
+                )
+        return closed

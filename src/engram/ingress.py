@@ -83,40 +83,38 @@ def register_listeners(
             len(text),
         )
 
-        # Serialize concurrent messages per-channel.
-        async with session.lock:
-            try:
-                turn = await agent.run_turn(session, text)
-            except Exception:
-                log.exception("ingress.agent_failure session=%s", session.label())
-                await say(
-                    text="Something went wrong on my side. I've logged it.",
-                    thread_ts=thread_ts,
-                )
-                return
-
-            egress_result = await post_reply(
-                say,
-                turn,
-                thread_ts=thread_ts if not is_dm else None,
-                session_label=session.label(),
+        try:
+            turn = await agent.run_turn(session, text)
+        except Exception:
+            log.exception("ingress.agent_failure session=%s", session.label())
+            await say(
+                text="Something went wrong on my side. I've logged it.",
+                thread_ts=thread_ts,
             )
+            return
 
-            if cost_ledger is not None and turn.cost_usd is not None:
-                cost_ledger.record(
-                    TurnCost(
-                        timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
-                        session_label=session.label(),
-                        channel_id=session.channel_id,
-                        is_dm=session.is_dm,
-                        cost_usd=turn.cost_usd,
-                        duration_ms=turn.duration_ms,
-                        num_turns=turn.num_turns,
-                        user_text_len=len(text),
-                        chunks_posted=egress_result.chunks_posted,
-                        is_error=turn.is_error,
-                    )
+        egress_result = await post_reply(
+            say,
+            turn,
+            thread_ts=thread_ts if not is_dm else None,
+            session_label=session.label(),
+        )
+
+        if cost_ledger is not None and turn.cost_usd is not None:
+            cost_ledger.record(
+                TurnCost(
+                    timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
+                    session_label=session.label(),
+                    channel_id=session.channel_id,
+                    is_dm=session.is_dm,
+                    cost_usd=turn.cost_usd,
+                    duration_ms=turn.duration_ms,
+                    num_turns=turn.num_turns,
+                    user_text_len=len(text),
+                    chunks_posted=egress_result.chunks_posted,
+                    is_error=turn.is_error,
                 )
+            )
 
     @app.event("app_mention")
     async def on_mention(event, say):
