@@ -237,16 +237,41 @@ async def test_pending_channel_is_not_active(
     assert not s.is_active()
 
 
-# ── Documented M2→M3 gap ────────────────────────────────────────────────
+# ── Path-argument isolation (via native Claude Code permission rules) ──
 
 
-def test_documented_gap_path_filters_not_in_m2():
-    """M2 enforces tool NAMES. Path-argument filtering (e.g. 'Read must not
-    touch ~/.ssh/*') is not in scope for M2 — it's a future tightening
-    that would hook into the tool input inspection side of can_use_tool.
+@pytest.mark.asyncio
+async def test_isolation_path_filters_flow_into_sdk_options(
+    cfg: EngramConfig, home: Path
+):
+    """Post-M2 addendum: path filtering IS in scope, enforced by the SDK
+    via `Tool(specifier)` rules merged into disallowed_tools. This
+    verifies rules arrive verbatim in the options the CLI sees.
 
-    This test exists to document the gap, not to test behavior. If/when
-    we add path filters, replace this with a real isolation test.
+    We don't exec the CLI here; the CLI's own test suite covers glob
+    semantics. Our contract is: rules round-trip intact.
     """
-    # Intentionally trivial; the real test is the comment above.
-    pass
+    owner_dm_id = "D07OWNER"
+    team_id = "C07TEAM"
+    router = Router(home=home, owner_dm_channel_id=owner_dm_id)
+    agent = Agent(cfg)
+
+    dm_session = await router.get(owner_dm_id, is_dm=True)
+    team_session = await router.get(team_id, is_dm=False)
+
+    dm_opts = agent._build_options(dm_session)
+    team_opts = agent._build_options(team_session)
+
+    # Team channel ships with the aggressive default deny list.
+    assert any("Read(~/.ssh/" in t for t in team_opts.disallowed_tools), (
+        "team channel should block Read on ~/.ssh/** via native rule"
+    )
+    assert any("Read(**/.env" in t for t in team_opts.disallowed_tools), (
+        "team channel should block Read on .env files"
+    )
+    # Grep/Glob variants also covered (searching a secret == reading it).
+    assert any("Grep(~/.ssh/" in t for t in team_opts.disallowed_tools)
+
+    # Owner-DM ships with a lighter but non-empty deny list.
+    assert any("Read(~/.ssh/" in t for t in dm_opts.disallowed_tools)
+    assert any("Read(**/.env" in t for t in dm_opts.disallowed_tools)
