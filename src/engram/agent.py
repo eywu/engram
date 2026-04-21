@@ -1,9 +1,10 @@
 """Agent — thin wrapper around the Claude Agent SDK.
 
 M1: one Slack message = one `query()` call = one turn.
-M2 adds per-channel system prompts and tool scoping via `canUseTool`.
-M3 adds cost tracking.
-M4 adds AskUserQuestion stream-watching (fallback path per M0-F3).
+M2: the per-channel ChannelManifest drives scope (tools/MCPs/skills),
+    setting_sources, max_turns, cwd, and system-prompt identity.
+M3 will add cost-budget enforcement on top of this.
+M4 will add AskUserQuestion stream-watching.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from claude_agent_sdk import (
 
 from engram.config import EngramConfig
 from engram.router import SessionState
+from engram.scope import build_scope_decision, build_tool_guard
 
 log = logging.getLogger(__name__)
 
@@ -38,9 +40,9 @@ class AgentTurn:
 class Agent:
     """Runs a single Claude turn for a channel.
 
-    Stateless; SessionState is passed per call. This keeps the agent
-    trivially testable and lets M2 introduce per-channel overrides without
-    re-plumbing.
+    Stateless; SessionState is passed per call. When the session carries a
+    ChannelManifest (M2), agent reads scope from it; otherwise falls back
+    to M1 behavior (setting_sources=["user"], no tool guards).
     """
 
     def __init__(self, config: EngramConfig):
@@ -50,19 +52,7 @@ class Agent:
         """Run one turn for the given channel. Returns aggregated response."""
         session.turn_count += 1
 
-        # setting_sources=["user"] chosen over ["user", "project"] based on
-        # 2026-04-20 cost experiment (scripts/cost_experiment.py): user-only
-        # drops per-turn priming cost ~47% ($0.0107 -> $0.0057) with zero
-        # tool-availability loss (both configs surfaced 125 tools).
-        # Explicitly setting user-only also beats SDK default ($0.0156/turn).
-        # If we ever need project-level CLAUDE.md priming for a specific
-        # channel, M2 will re-introduce it per-manifest.
-        options = ClaudeAgentOptions(
-            max_turns=self._config.max_turns_per_message,
-            setting_sources=["user"],
-            cwd=str(session.cwd) if session.cwd else None,
-            model=self._config.anthropic.model,
-        )
+        options = self._build_options(session)
 
         text_chunks: list[str] = []
         result: ResultMessage | None = None
@@ -99,4 +89,58 @@ class Agent:
             num_turns=getattr(result, "num_turns", None) if result else None,
             is_error=bool(error_message) or (result.is_error if result else False),
             error_message=error_message,
+        )
+
+    # ──────────────────────────────────────────────────────────────
+    # Option construction
+    # ──────────────────────────────────────────────────────────────
+
+    def _build_options(self, session: SessionState) -> ClaudeAgentOptions:
+        """Build ClaudeAgentOptions from config + (optional) channel manifest."""
+        manifest = session.manifest
+
+        # Defaults — applied when no manifest is available (legacy tests).
+        setting_sources: list[str] = ["user"]
+        max_turns = self._config.max_turns_per_message
+        permission_mode = "default"
+        allowed_tools: list[str] = []
+        disallowed_tools: list[str] = []
+        skills: list[str] | str | None = "all"
+        can_use_tool = None
+
+        if manifest is not None:
+            # setting_sources: cost-significant. Team channels should use
+            # ["project"] to avoid pulling in the operator's personal
+            # user-level settings (and to keep cost profile predictable).
+            setting_sources = list(manifest.setting_sources)
+
+            # Behavior overrides
+            if manifest.behavior.max_turns is not None:
+                max_turns = manifest.behavior.max_turns
+            permission_mode = manifest.behavior.permission_mode
+
+            # Static scope
+            decision = build_scope_decision(manifest)
+            allowed_tools = decision.allowed_tools
+            disallowed_tools = decision.disallowed_tools
+            skills = decision.skills
+
+            # Runtime scope guard (covers MCPs, which the static fields
+            # can't always enumerate).
+            can_use_tool = build_tool_guard(manifest)
+
+        return ClaudeAgentOptions(
+            # Identity & discovery
+            setting_sources=setting_sources,
+            cwd=str(session.cwd) if session.cwd else None,
+            model=self._config.anthropic.model,
+            # Runtime limits
+            max_turns=max_turns,
+            permission_mode=permission_mode,
+            # Scope (static — helps SDK skip priming denied entries)
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
+            skills=skills,
+            # Scope (runtime — final enforcement)
+            can_use_tool=can_use_tool,
         )

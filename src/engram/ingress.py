@@ -50,16 +50,31 @@ def register_listeners(
             return
 
         is_dm = channel_type == "im"
-        if not is_dm and channel_id not in config.allowed_channels:
-            # Not a DM and not in our allowlist — stay quiet.
-            log.debug("ingress.skip channel=%s reason=not-allowed", channel_id)
-            return
 
         session = await router.get(
             channel_id,
             channel_name=None,  # resolve lazily later
             is_dm=is_dm,
         )
+
+        # M2: manifest-driven gating replaces the M1 allowlist.
+        # If the router produced a manifest, use its status. Otherwise
+        # fall back to the M1 allowlist behavior so legacy configs keep
+        # working.
+        if session.manifest is not None:
+            if not session.is_active():
+                log.info(
+                    "ingress.skip session=%s reason=manifest_status_%s",
+                    session.label(),
+                    session.manifest.status,
+                )
+                return
+        else:
+            if not is_dm and channel_id not in config.allowed_channels:
+                log.debug(
+                    "ingress.skip channel=%s reason=not-allowed", channel_id
+                )
+                return
 
         log.info(
             "ingress.received session=%s user=%s len=%d",

@@ -13,8 +13,9 @@ import structlog
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
-from engram import __version__
+from engram import __version__, paths
 from engram.agent import Agent
+from engram.bootstrap import ensure_project_root
 from engram.config import EngramConfig
 from engram.costs import CostLedger
 from engram.ingress import register_listeners
@@ -59,8 +60,23 @@ async def run() -> int:
         config.paths.state_dir,
     )
 
+    # M2: seed the project-level inheritance layer (~/.engram/project/.claude/)
+    # before the router resolves any channels. Idempotent — preserves operator
+    # edits to SOUL.md / AGENTS.md / skills/.
+    engram_home = paths.engram_home()
+    project_root_path = ensure_project_root(home=engram_home)
+    log.info(
+        "engram.project_root_ready path=%s owner_dm=%s",
+        project_root_path,
+        config.owner_dm_channel_id or "(unset)",
+    )
+
     app = AsyncApp(token=config.slack.bot_token)
-    router = Router(shared_cwd=config.paths.state_dir)
+    router = Router(
+        shared_cwd=project_root_path,
+        home=engram_home,
+        owner_dm_channel_id=config.owner_dm_channel_id,
+    )
     agent = Agent(config)
     cost_ledger = CostLedger(config.paths.log_dir / "costs.jsonl")
     register_listeners(app, config, router, agent, cost_ledger=cost_ledger)

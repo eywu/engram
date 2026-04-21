@@ -1,0 +1,296 @@
+"""Tests for the channel manifest schema."""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import yaml
+
+from engram.manifest import (
+    AskUserQuestion,
+    Behavior,
+    ChannelManifest,
+    ChannelStatus,
+    CostBudget,
+    IdentityTemplate,
+    ManifestError,
+    ScopeList,
+    dump_manifest,
+    load_manifest,
+)
+
+# ── Defaults & inheritance model ────────────────────────────────────────
+
+
+def test_scope_list_defaults_to_unrestricted():
+    s = ScopeList()
+    assert s.allowed is None
+    assert s.disallowed == []
+    assert s.is_unrestricted()
+
+
+def test_scope_list_with_disallowed_is_restricted():
+    s = ScopeList(disallowed=["Bash"])
+    assert not s.is_unrestricted()
+
+
+def test_scope_list_with_allowed_is_restricted():
+    s = ScopeList(allowed=["Read", "Grep"])
+    assert not s.is_unrestricted()
+
+
+def test_owner_dm_minimal_manifest_full_inheritance():
+    """Owner-DM should be expressible as a near-empty manifest."""
+    m = ChannelManifest(
+        channel_id="D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        setting_sources=["user"],
+    )
+    assert m.tools.is_unrestricted()
+    assert m.mcp_servers.is_unrestricted()
+    assert m.skills.is_unrestricted()
+    assert m.is_owner_dm()
+
+
+def test_team_channel_typical_exclusions():
+    """Typical team channel: exclude write-side tools, inherit everything else."""
+    m = ChannelManifest(
+        channel_id="C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        tools=ScopeList(disallowed=["Bash", "Write", "Edit"]),
+    )
+    assert "Bash" in m.tools.disallowed
+    assert m.mcp_servers.is_unrestricted()  # MCPs still inherited
+    assert not m.is_owner_dm()
+
+
+# ── Validation ──────────────────────────────────────────────────────────
+
+
+def test_empty_channel_id_rejected():
+    with pytest.raises(ValueError, match="channel_id"):
+        ChannelManifest(
+            channel_id="",
+            identity=IdentityTemplate.TASK_ASSISTANT,
+        )
+
+
+def test_whitespace_channel_id_normalized():
+    m = ChannelManifest(
+        channel_id="  C07ABC  ",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+    )
+    assert m.channel_id == "C07ABC"
+
+
+def test_setting_sources_cannot_be_empty():
+    with pytest.raises(ValueError, match="setting_sources"):
+        ChannelManifest(
+            channel_id="C07ABC",
+            identity=IdentityTemplate.TASK_ASSISTANT,
+            setting_sources=[],
+        )
+
+
+def test_setting_sources_invalid_value_rejected():
+    with pytest.raises(ValueError):
+        ChannelManifest(
+            channel_id="C07ABC",
+            identity=IdentityTemplate.TASK_ASSISTANT,
+            setting_sources=["bogus"],
+        )
+
+
+def test_invalid_identity_rejected():
+    with pytest.raises(ValueError):
+        ChannelManifest(
+            channel_id="C07ABC",
+            identity="not-a-template",  # type: ignore[arg-type]
+        )
+
+
+def test_behavior_max_turns_must_be_positive():
+    with pytest.raises(ValueError, match="max_turns"):
+        Behavior(max_turns=0)
+
+
+def test_cost_budget_rejects_negative():
+    with pytest.raises(ValueError, match="must be >= 0"):
+        CostBudget(daily_usd=-1.0)
+
+
+def test_cost_budget_warn_at_percent_bounded():
+    with pytest.raises(ValueError):
+        CostBudget(warn_at_percent=0)
+    with pytest.raises(ValueError):
+        CostBudget(warn_at_percent=101)
+
+
+# ── Defaults across the M3/M4-deferred fields ───────────────────────────
+
+
+def test_status_defaults_to_pending():
+    m = ChannelManifest(
+        channel_id="C07ABC", identity=IdentityTemplate.TASK_ASSISTANT
+    )
+    assert m.status == ChannelStatus.PENDING
+
+
+def test_setting_sources_default_is_project():
+    """Team channels default to project-level priming, not user-level."""
+    m = ChannelManifest(
+        channel_id="C07ABC", identity=IdentityTemplate.TASK_ASSISTANT
+    )
+    assert m.setting_sources == ["project"]
+
+
+def test_ask_user_question_defaults():
+    a = AskUserQuestion()
+    assert a.enabled is True
+    assert a.fallback == "escalate-to-owner"
+
+
+def test_subagents_default_empty():
+    m = ChannelManifest(
+        channel_id="C07ABC", identity=IdentityTemplate.TASK_ASSISTANT
+    )
+    assert m.subagents == []
+
+
+# ── YAML I/O round-trip ─────────────────────────────────────────────────
+
+
+def test_load_manifest_owner_dm(tmp_path: Path):
+    p = tmp_path / "manifest.yaml"
+    p.write_text(
+        """
+channel_id: D07OWNER
+identity: owner-dm-full
+label: Eric (DM)
+status: active
+setting_sources: [user]
+"""
+    )
+    m = load_manifest(p)
+    assert m.channel_id == "D07OWNER"
+    assert m.identity == IdentityTemplate.OWNER_DM_FULL
+    assert m.status == ChannelStatus.ACTIVE
+    assert m.setting_sources == ["user"]
+    assert m.tools.is_unrestricted()
+
+
+def test_load_manifest_team_channel(tmp_path: Path):
+    p = tmp_path / "manifest.yaml"
+    p.write_text(
+        """
+channel_id: C07TEAM
+identity: task-assistant
+label: "#growth"
+status: active
+setting_sources: [project]
+tools:
+  disallowed: [Bash, Write, Edit]
+mcp_servers:
+  disallowed: [personal-notes]
+behavior:
+  style: concise
+  max_turns: 6
+cost_budget:
+  daily_usd: 5.0
+  monthly_usd: 50.0
+"""
+    )
+    m = load_manifest(p)
+    assert m.tools.disallowed == ["Bash", "Write", "Edit"]
+    assert m.mcp_servers.disallowed == ["personal-notes"]
+    assert m.behavior.style == "concise"
+    assert m.behavior.max_turns == 6
+    assert m.cost_budget.daily_usd == 5.0
+
+
+def test_round_trip(tmp_path: Path):
+    """Dump then load must produce identical manifest."""
+    original = ChannelManifest(
+        channel_id="C07ROUND",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#round",
+        status=ChannelStatus.ACTIVE,
+        tools=ScopeList(disallowed=["Bash"]),
+        behavior=Behavior(style="thorough", max_turns=10),
+        cost_budget=CostBudget(monthly_usd=20.0),
+    )
+    p = tmp_path / "round.yaml"
+    dump_manifest(original, p)
+    reloaded = load_manifest(p)
+    assert reloaded == original
+
+
+def test_load_missing_file_raises_manifest_error(tmp_path: Path):
+    with pytest.raises(ManifestError, match="not found"):
+        load_manifest(tmp_path / "nope.yaml")
+
+
+def test_load_empty_file_raises_manifest_error(tmp_path: Path):
+    p = tmp_path / "empty.yaml"
+    p.write_text("")
+    with pytest.raises(ManifestError, match="empty"):
+        load_manifest(p)
+
+
+def test_load_non_mapping_raises_manifest_error(tmp_path: Path):
+    p = tmp_path / "list.yaml"
+    p.write_text("- just\n- a\n- list\n")
+    with pytest.raises(ManifestError, match="mapping"):
+        load_manifest(p)
+
+
+def test_load_malformed_yaml_raises_manifest_error(tmp_path: Path):
+    p = tmp_path / "bad.yaml"
+    p.write_text("key: : :\n  bad\n  - indent\n")
+    with pytest.raises(ManifestError, match="parse"):
+        load_manifest(p)
+
+
+def test_load_invalid_schema_raises_manifest_error(tmp_path: Path):
+    p = tmp_path / "invalid.yaml"
+    p.write_text(
+        """
+channel_id: C07
+identity: not-a-real-template
+"""
+    )
+    with pytest.raises(ManifestError, match="validation failed"):
+        load_manifest(p)
+
+
+# ── Edge cases for the escape-hatch allow-list ──────────────────────────
+
+
+def test_allowed_list_takes_precedence_in_intent():
+    """When both allowed and disallowed are set, both are stored.
+
+    The agent layer (Phase B) is responsible for interpreting:
+    `allowed` defines the universe; `disallowed` further filters.
+    """
+    s = ScopeList(allowed=["Read", "Grep"], disallowed=["Bash"])
+    assert s.allowed == ["Read", "Grep"]
+    assert s.disallowed == ["Bash"]
+    assert not s.is_unrestricted()
+
+
+def test_yaml_serialization_omits_default_values_cleanly(tmp_path: Path):
+    """A minimal manifest should round-trip without polluting YAML with defaults."""
+    m = ChannelManifest(
+        channel_id="D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        setting_sources=["user"],
+    )
+    p = tmp_path / "minimal.yaml"
+    dump_manifest(m, p)
+    raw = yaml.safe_load(p.read_text())
+    # Required fields present
+    assert raw["channel_id"] == "D07OWNER"
+    assert raw["identity"] == "owner-dm-full"
+    # Defaults are still serialized (we want explicit, not magical)
+    assert raw["status"] == "pending"
+    assert raw["setting_sources"] == ["user"]

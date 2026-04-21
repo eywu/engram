@@ -44,10 +44,15 @@ class EngramConfig:
     anthropic: AnthropicConfig
     paths: PathsConfig = field(default_factory=PathsConfig)
     # M1 test surface: one channel we're allowed to respond in, plus DMs.
-    # M2 will replace this with a manifest-driven allowlist.
+    # M2 keeps this for legacy/fallback mode but prefers manifest-driven
+    # gating when available.
     allowed_channels: list[str] = field(default_factory=list)
     # Soft limits — M3 tightens these. For M1: just a safety cap.
     max_turns_per_message: int = 8
+    # M2: DM channel that gets the owner-DM identity template on auto-
+    # provision. Other DMs get task-assistant. Optional; if unset, every
+    # DM is treated as task-assistant (safer default for first-run).
+    owner_dm_channel_id: str | None = None
 
     @classmethod
     def load(cls, config_path: Path | None = None) -> EngramConfig:
@@ -110,6 +115,10 @@ class EngramConfig:
             paths=paths,
             allowed_channels=list(raw.get("allowed_channels", [])),
             max_turns_per_message=int(raw.get("max_turns_per_message", 8)),
+            owner_dm_channel_id=(
+                raw.get("owner_dm_channel_id")
+                or os.environ.get("ENGRAM_OWNER_DM_CHANNEL_ID")
+            ),
         )
 
     def ensure_dirs(self) -> None:

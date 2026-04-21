@@ -1,0 +1,52 @@
+# Team/topic channel manifest template.
+#
+# Copied into contexts/<channel-id>/.claude/channel-manifest.yaml when a new
+# channel is auto-provisioned. Status starts as `pending` — the operator
+# must approve via `engram channels approve <channel-id>` before the bot
+# responds.
+#
+# Default scope is exclusion-based: inherits the project-level toolkit
+# minus a few write-side tools that are rarely safe in a shared channel.
+# The operator can edit this file to tighten or relax the scope per channel.
+
+channel_id: "{{channel_id}}"
+identity: task-assistant
+label: "{{channel_label}}"
+status: pending        # operator must approve before bot responds
+
+# Team channels use project-level priming, NOT user-level.
+# Prevents the operator's personal MCPs / settings from leaking into a
+# shared channel.
+setting_sources: [project]
+
+# Exclude write-side and shell tools by default. Team channels shouldn't
+# get a shell unless the operator explicitly grants one.
+tools:
+  disallowed:
+    - Bash
+    - BashOutput
+    - KillShell
+    - Write
+    - Edit
+    - NotebookEdit
+
+# By default, team channels inherit all project-level MCPs. If a project-
+# level MCP is too sensitive for this channel, add it to disallowed here.
+mcp_servers: {}
+
+# Skills: inherit all by default. Exclude per-channel as needed.
+skills: {}
+
+behavior:
+  style: concise
+  permission_mode: default
+  max_turns: 6
+
+cost_budget:
+  warn_at_percent: 80
+  # daily_usd: 2.0
+  # monthly_usd: 30.0
+
+ask_user_question:
+  enabled: true
+  fallback: escalate-to-owner
