@@ -30,6 +30,7 @@ from engram.manifest import (
     dump_manifest,
     load_manifest,
 )
+from engram.mcp import resolve_team_mcp_servers, warn_missing_mcp_servers
 
 log = logging.getLogger(__name__)
 
@@ -158,6 +159,24 @@ def provision_channel(
         label=label,
         status_override=status,
     )
+    if not manifest.is_owner_dm():
+        mcp_servers, mcp_allowed, missing_mcp = resolve_team_mcp_servers(manifest)
+        log.info(
+            "channel.mcp_allow_list channel_id=%s strict_mode=true servers=%s",
+            channel_id,
+            list(mcp_servers),
+        )
+        if missing_mcp:
+            log.info(
+                "channel.mcp_allow_list_declared channel_id=%s servers=%s",
+                channel_id,
+                mcp_allowed,
+            )
+        warn_missing_mcp_servers(
+            channel_id,
+            missing_mcp,
+            logger=log,
+        )
     dump_manifest(manifest, manifest_path)
 
     identity_body = _render_identity_md(

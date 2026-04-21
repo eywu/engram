@@ -20,7 +20,8 @@ from engram import __version__
 from engram.cli_channels import app as channels_app
 from engram.config import DEFAULT_CONFIG_PATH, EngramConfig, PathsConfig
 from engram.costs import CostDatabase
-from engram.manifest import ManifestError, load_manifest
+from engram.manifest import ChannelManifest, ManifestError, load_manifest
+from engram.mcp import resolve_team_mcp_servers
 from engram.paths import contexts_dir, engram_home
 from engram.runtime import health_path, pid_path, status_path
 from engram.telemetry import process_exists, read_json
@@ -274,13 +275,24 @@ def _merge_channels(
         )
         channel.setdefault("manifest_status", str(manifest.status))
         channel.setdefault("identity", str(manifest.identity))
+        channel["mcp"] = _manifest_mcp_policy(manifest)
 
     for channel_id, channel in by_channel.items():
         channel.setdefault("rate_limit", cost_db.latest_rate_limit(channel_id))
         channel.setdefault("mcp_status", None)
+        channel.setdefault("mcp", {"strict_mode": None, "servers": []})
         channel.setdefault("context_usage", None)
         channel.setdefault("live", False)
     return sorted(by_channel.values(), key=lambda item: item["channel_id"])
+
+
+def _manifest_mcp_policy(manifest: ChannelManifest) -> dict[str, Any]:
+    strict_mode = not manifest.is_owner_dm()
+    servers: list[str] = []
+    if strict_mode:
+        resolved, _allowed, _missing = resolve_team_mcp_servers(manifest)
+        servers = list(resolved)
+    return {"strict_mode": strict_mode, "servers": servers}
 
 
 def _memory_counts(path: Path) -> dict[str, int]:

@@ -30,9 +30,11 @@ tools:
     - Edit
     - NotebookEdit
 
-# By default, team channels inherit all project-level MCPs. If a project-
-# level MCP is too sensitive for this channel, add it to disallowed here.
-mcp_servers: {}
+# Team channels must explicitly list MCPs. Empty allowed list means zero MCPs.
+# To grant one, add the server name here and define its config in
+# ~/.claude/mcp.json.
+mcp_servers:
+  allowed: []
 
 # Skills: inherit all by default. Exclude per-channel as needed.
 skills: {}
