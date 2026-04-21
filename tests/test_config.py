@@ -82,3 +82,26 @@ def test_yaml_wins_over_env(tmp_path, clean_env, monkeypatch):
     cfg = EngramConfig.load(path)
     assert cfg.slack.bot_token == "xoxb-file"
     assert cfg.anthropic.api_key == "sk-ant-file"
+
+
+def test_budget_config_loaded_from_yaml(tmp_path, clean_env):
+    path = _write_yaml(
+        tmp_path,
+        {
+            "slack": {"bot_token": "xoxb-file", "app_token": "xapp-file"},
+            "anthropic": {"api_key": "sk-ant-file"},
+            "budget": {
+                "monthly_cap_usd": 750.25,
+                "hard_cap_enabled": True,
+                "warn_thresholds": [0.5, 0.9],
+                "timezone": "UTC",
+            },
+        },
+    )
+
+    cfg = EngramConfig.load(path)
+
+    assert str(cfg.budget.monthly_cap_usd) == "750.25"
+    assert cfg.budget.hard_cap_enabled is True
+    assert [str(t) for t in cfg.budget.warn_thresholds] == ["0.5", "0.9"]
+    assert cfg.budget.timezone == "UTC"

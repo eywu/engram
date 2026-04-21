@@ -17,6 +17,7 @@ from slack_bolt.async_app import AsyncApp
 from engram import __version__, paths
 from engram.agent import Agent
 from engram.bootstrap import ensure_project_root
+from engram.budget import Budget
 from engram.config import EngramConfig
 from engram.costs import CostLedger
 from engram.ingress import register_listeners
@@ -140,7 +141,8 @@ async def run() -> int:
         owner_dm_channel_id=config.owner_dm_channel_id,
         template_vars=template_vars,
     )
-    agent = Agent(config)
+    budget = Budget(config.budget, db_path=engram_home / "cost.db")
+    agent = Agent(config, budget=budget)
     cost_ledger = CostLedger(config.paths.log_dir / "costs.jsonl")
     register_listeners(app, config, router, agent, cost_ledger=cost_ledger)
     idle_sweeper_task = router.start_idle_sweeper()
