@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import inspect
 import logging
+import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import MethodType
+from typing import Any
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -24,6 +27,7 @@ from claude_agent_sdk import (
 )
 
 from engram.config import EngramConfig
+from engram.hooks import make_hooks
 from engram.router import SessionState
 from engram.scope import build_scope_decision, build_tool_guard
 
@@ -58,9 +62,11 @@ class Agent:
         config: EngramConfig,
         *,
         client_factory: ClientFactory = ClaudeSDKClient,
+        memory_conn: sqlite3.Connection | None = None,
     ):
         self._config = config
         self._client_factory = client_factory
+        self._memory_conn = memory_conn
 
     async def run_turn(self, session: SessionState, user_text: str) -> AgentTurn:
         """Run one turn for the given channel. Returns aggregated response."""
@@ -130,6 +136,7 @@ class Agent:
             resume=session.agent_session_initialized,
         )
         client = self._client_factory(options)
+        self._install_session_message_reader(client, session)
         try:
             await client.connect()
         except Exception:
@@ -258,4 +265,53 @@ class Agent:
             skills=skills,
             # Scope (runtime — final enforcement)
             can_use_tool=can_use_tool,
+            # M3c memory ingestion hooks.
+            hooks=(
+                make_hooks(session, self._memory_conn)
+                if self._memory_conn is not None
+                else None
+            ),
         )
+
+    def _install_session_message_reader(
+        self,
+        client: ClaudeSDKClient,
+        session: SessionState,
+    ) -> None:
+        """Backfill ClaudeSDKClient.get_session_messages for SDK builds that
+        only expose the official module-level session reader.
+        """
+        if hasattr(client, "get_session_messages"):
+            return
+
+        try:
+            from claude_agent_sdk import get_session_messages
+        except ImportError:
+            log.debug("agent.session_message_reader_unavailable")
+            return
+
+        def reader(
+            _client: ClaudeSDKClient,
+            *,
+            session_id: str,
+            since: str | None = None,
+        ) -> list[Any]:
+            messages = get_session_messages(
+                session_id=session_id,
+                directory=str(session.cwd) if session.cwd else None,
+            )
+            if since is None:
+                return list(messages)
+            for index, message in enumerate(messages):
+                if getattr(message, "uuid", None) == since:
+                    return list(messages[index + 1 :])
+            return list(messages)
+
+        try:
+            client.get_session_messages = MethodType(reader, client)
+        except Exception:
+            log.debug(
+                "agent.session_message_reader_attach_failed session=%s",
+                session.label(),
+                exc_info=True,
+            )

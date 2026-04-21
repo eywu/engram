@@ -84,3 +84,7 @@ def state_dir(home: Path | None = None) -> Path:
 
 def log_dir(home: Path | None = None) -> Path:
     return engram_home(home) / "logs"
+
+
+def memory_db_path(home: Path | None = None) -> Path:
+    return engram_home(home) / "memory.db"

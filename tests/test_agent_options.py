@@ -5,10 +5,12 @@ the agent would construct for various sessions.
 """
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 
+from engram import memory
 from engram.agent import Agent
 from engram.config import AnthropicConfig, EngramConfig, SlackConfig
 from engram.manifest import (
@@ -145,6 +147,19 @@ def test_permission_mode_plumbed():
     a = Agent(_cfg())
     opts = a._build_options(_session(m))
     assert opts.permission_mode == "plan"
+
+
+def test_memory_hooks_plumbed_when_memory_conn_present():
+    conn = sqlite3.connect(":memory:")
+    memory.init_db(conn)
+    a = Agent(_cfg(), memory_conn=conn)
+
+    opts = a._build_options(_session(None))
+
+    assert opts.hooks is not None
+    assert sorted(opts.hooks) == ["PreCompact", "Stop"]
+    assert opts.hooks["Stop"][0].hooks
+    assert opts.hooks["PreCompact"][0].hooks
 
 
 # ── Runtime guard behavior via a full dispatch ─────────────────────────

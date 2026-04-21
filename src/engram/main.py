@@ -14,7 +14,7 @@ import structlog
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
-from engram import __version__, paths
+from engram import __version__, memory, paths
 from engram.agent import Agent
 from engram.bootstrap import ensure_project_root
 from engram.config import EngramConfig
@@ -117,6 +117,7 @@ async def run() -> int:
     # edits to SOUL.md / AGENTS.md / skills/.
     engram_home = paths.engram_home()
     project_root_path = ensure_project_root(home=engram_home)
+    memory_conn = memory.connect(paths.memory_db_path(engram_home))
     log.info(
         "engram.project_root_ready path=%s owner_dm=%s",
         project_root_path,
@@ -140,7 +141,7 @@ async def run() -> int:
         owner_dm_channel_id=config.owner_dm_channel_id,
         template_vars=template_vars,
     )
-    agent = Agent(config)
+    agent = Agent(config, memory_conn=memory_conn)
     cost_ledger = CostLedger(config.paths.log_dir / "costs.jsonl")
     register_listeners(app, config, router, agent, cost_ledger=cost_ledger)
     idle_sweeper_task = router.start_idle_sweeper()
@@ -192,6 +193,7 @@ async def run() -> int:
                 type(e).__name__,
                 e,
             )
+        memory_conn.close()
     log.info("engram.shutdown_complete")
     return 0
 
