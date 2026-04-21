@@ -75,6 +75,16 @@ def build_scope_decision(manifest: ChannelManifest) -> ScopeDecision:
         d.allowed_tools = list(t.allowed)
     d.disallowed_tools = list(t.disallowed)
 
+    # Permission rules (native Claude Code `Tool(specifier)` syntax).
+    # These merge with the tool names above and flow through to the
+    # CLI's --allowedTools / --disallowedTools flags, which natively
+    # handle globbing + path matching. Deny wins per Claude Code docs.
+    p = manifest.permissions
+    if p.deny:
+        d.disallowed_tools.extend(p.deny)
+    if p.allow:
+        d.allowed_tools.extend(p.allow)
+
     # Skills
     s = manifest.skills
     if s.allowed is not None:
@@ -154,16 +164,29 @@ def build_tool_guard(manifest: ChannelManifest) -> CanUseToolFn:
 
 
 def _check_tool(tool_name: str, tools: ScopeList) -> str | None:
-    """Return deny reason or None."""
+    """Return deny reason or None.
+
+    This checks only plain tool NAMES. Specifier-format rules
+    (e.g. `Read(~/.ssh/**)`) belong in `manifest.permissions.deny` and
+    are handled by the SDK's CLI — not here.
+    """
     # Skip MCP names — they're checked in `_check_mcp`.
     if tool_name.startswith("mcp__"):
         return None
-    if tool_name in tools.disallowed:
+    # Only match bare tool names in `tools.disallowed`. Entries with
+    # parens are specifier rules meant for the CLI; ignoring them here
+    # is correct — the CLI side enforces path/arg matching.
+    bare_disallowed = [t for t in tools.disallowed if "(" not in t]
+    if tool_name in bare_disallowed:
         return f"tool '{tool_name}' disallowed by channel manifest"
-    if tools.allowed is not None and tool_name not in tools.allowed:
-        return (
-            f"tool '{tool_name}' not in channel manifest's allowed list"
-        )
+    if tools.allowed is not None:
+        bare_allowed = [t for t in tools.allowed if "(" not in t]
+        # If there are ONLY specifier-format allows, treat as "inherit
+        # all" from this guard's perspective — CLI will filter.
+        if bare_allowed and tool_name not in bare_allowed:
+            return (
+                f"tool '{tool_name}' not in channel manifest's allowed list"
+            )
     return None
 
 
