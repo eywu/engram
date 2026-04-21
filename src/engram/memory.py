@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
+
 VALID_SUMMARY_TRIGGERS = frozenset({"compact", "nightly", "nightly-weekly", "manual"})
 MAX_SEARCH_LIMIT = 100
+RRF_K = 60
 
 
 def open_memory_db(path: Path | None = None) -> sqlite3.Connection:
@@ -35,7 +40,8 @@ def migrate(conn: sqlite3.Connection) -> None:
             role TEXT NOT NULL,
             message_uuid TEXT UNIQUE NOT NULL,
             parent_uuid TEXT,
-            text TEXT NOT NULL
+            text TEXT NOT NULL,
+            embedding BLOB
         );
         CREATE INDEX IF NOT EXISTS idx_transcripts_channel_ts
         ON transcripts(channel_id, ts);
@@ -108,6 +114,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         END;
         """
     )
+    _ensure_column(conn, "transcripts", "embedding", "BLOB")
 
 
 def insert_transcript(
@@ -307,6 +314,163 @@ def search_keyword(
     return results
 
 
+def search_semantic(
+    conn: sqlite3.Connection,
+    *,
+    query_vec: bytes,
+    scope: Literal["this_channel", "all_channels"] = "this_channel",
+    channel_id: str | None = None,
+    kind: Literal["transcripts", "summaries", "both"] = "both",
+    limit: int = 5,
+) -> list[dict]:
+    """Run in-memory cosine search over stored transcript and summary embeddings."""
+    _validate_search_scope(scope, channel_id)
+    if kind not in {"transcripts", "summaries", "both"}:
+        raise ValueError("kind must be 'transcripts', 'summaries', or 'both'")
+
+    clamped_limit = min(limit, MAX_SEARCH_LIMIT)
+    if clamped_limit <= 0 or not query_vec:
+        return []
+
+    query = _vector_from_bytes(query_vec)
+    query_norm = float(np.linalg.norm(query))
+    if query.size == 0 or query_norm == 0.0:
+        return []
+
+    candidates: list[tuple[float, dict]] = []
+    channel_filter = " AND channel_id = ?" if scope == "this_channel" else ""
+
+    if kind in {"transcripts", "both"}:
+        params: list[object] = []
+        if scope == "this_channel":
+            params.append(channel_id)
+        for row in conn.execute(
+            f"""
+            SELECT channel_id, ts, text, message_uuid, embedding
+            FROM transcripts
+            WHERE embedding IS NOT NULL{channel_filter}
+            """,
+            params,
+        ):
+            score = _cosine_similarity(query, query_norm, row[4])
+            if score is None:
+                continue
+            candidates.append(
+                (
+                    score,
+                    {
+                        "kind": "transcript",
+                        "channel_id": row[0],
+                        "ts": _iso_string(row[1]),
+                        "snippet": _semantic_snippet(row[2]),
+                        "message_uuid": row[3],
+                        "summary_id": None,
+                    },
+                )
+            )
+
+    if kind in {"summaries", "both"}:
+        params = []
+        if scope == "this_channel":
+            params.append(channel_id)
+        for row in conn.execute(
+            f"""
+            SELECT channel_id, ts, summary_text, id, embedding
+            FROM summaries
+            WHERE embedding IS NOT NULL{channel_filter}
+            """,
+            params,
+        ):
+            score = _cosine_similarity(query, query_norm, row[4])
+            if score is None:
+                continue
+            candidates.append(
+                (
+                    score,
+                    {
+                        "kind": "summary",
+                        "channel_id": row[0],
+                        "ts": _iso_string(row[1]),
+                        "snippet": _semantic_snippet(row[2]),
+                        "message_uuid": None,
+                        "summary_id": row[3],
+                    },
+                )
+            )
+
+    candidates.sort(key=lambda item: (item[0], item[1]["ts"]), reverse=True)
+    return [row for _score, row in candidates[:clamped_limit]]
+
+
+def search_hybrid(
+    conn: sqlite3.Connection,
+    *,
+    query: str,
+    query_vec: bytes,
+    scope: Literal["this_channel", "all_channels"] = "this_channel",
+    channel_id: str | None = None,
+    kind: Literal["transcripts", "summaries", "both"] = "both",
+    limit: int = 5,
+) -> list[dict]:
+    """Merge FTS5 and semantic recall using reciprocal rank fusion.
+
+    RRF uses ``k=60`` to keep a row that appears in both paths ahead of
+    single-path hits without making small rank differences too sharp.
+    """
+    if not query:
+        return []
+    _validate_search_scope(scope, channel_id)
+    if kind not in {"transcripts", "summaries", "both"}:
+        raise ValueError("kind must be 'transcripts', 'summaries', or 'both'")
+
+    clamped_limit = min(limit, MAX_SEARCH_LIMIT)
+    if clamped_limit <= 0:
+        return []
+
+    db_file = _database_file(conn)
+    if db_file is not None:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            keyword_future = executor.submit(
+                _search_keyword_from_path,
+                db_file,
+                query,
+                scope,
+                channel_id,
+                kind,
+                clamped_limit,
+            )
+            semantic_future = executor.submit(
+                _search_semantic_from_path,
+                db_file,
+                query_vec,
+                scope,
+                channel_id,
+                kind,
+                clamped_limit,
+            )
+            keyword_rows = keyword_future.result()
+            semantic_rows = semantic_future.result()
+    else:
+        keyword_rows = search_keyword(
+            conn,
+            query=query,
+            scope=scope,
+            channel_id=channel_id,
+            kind=kind,
+            limit=clamped_limit,
+        )
+        semantic_rows = search_semantic(
+            conn,
+            query_vec=query_vec,
+            scope=scope,
+            channel_id=channel_id,
+            kind=kind,
+            limit=clamped_limit,
+        )
+
+    return _merge_rrf(keyword_rows, semantic_rows, clamped_limit)
+
+
 def _datetime_to_db(value: datetime) -> str:
     return value.isoformat()
 
@@ -329,3 +493,126 @@ def _iso_string(value: object) -> str:
     if isinstance(value, datetime | date):
         return value.isoformat()
     return str(value)
+
+
+def _ensure_column(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _validate_search_scope(scope: str, channel_id: str | None) -> None:
+    if scope == "this_channel" and channel_id is None:
+        raise ValueError("channel_id is required when scope='this_channel'")
+    if scope not in {"this_channel", "all_channels"}:
+        raise ValueError("scope must be 'this_channel' or 'all_channels'")
+
+
+def _vector_from_bytes(value: bytes) -> np.ndarray:
+    if len(value) % np.dtype(np.float32).itemsize:
+        return np.asarray([], dtype=np.float32)
+    return np.frombuffer(value, dtype=np.float32)
+
+
+def _cosine_similarity(
+    query: np.ndarray,
+    query_norm: float,
+    candidate_blob: bytes,
+) -> float | None:
+    candidate = _vector_from_bytes(candidate_blob)
+    if candidate.size != query.size:
+        return None
+    candidate_norm = float(np.linalg.norm(candidate))
+    if candidate_norm == 0.0:
+        return None
+    return float(np.dot(query, candidate) / (query_norm * candidate_norm))
+
+
+def _semantic_snippet(text: object, max_chars: int = 240) -> str:
+    normalized = " ".join(str(text).split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[: max_chars - 3].rstrip()}..."
+
+
+def _database_file(conn: sqlite3.Connection) -> Path | None:
+    row = conn.execute("PRAGMA database_list").fetchone()
+    if row is None:
+        return None
+    db_file = row[2]
+    return Path(db_file) if db_file else None
+
+
+def _search_keyword_from_path(
+    db_file: Path,
+    query: str,
+    scope: str,
+    channel_id: str | None,
+    kind: str,
+    limit: int,
+) -> list[dict]:
+    with closing(open_memory_db(db_file)) as conn:
+        return search_keyword(
+            conn,
+            query=query,
+            scope=scope,  # type: ignore[arg-type]
+            channel_id=channel_id,
+            kind=kind,  # type: ignore[arg-type]
+            limit=limit,
+        )
+
+
+def _search_semantic_from_path(
+    db_file: Path,
+    query_vec: bytes,
+    scope: str,
+    channel_id: str | None,
+    kind: str,
+    limit: int,
+) -> list[dict]:
+    with closing(open_memory_db(db_file)) as conn:
+        return search_semantic(
+            conn,
+            query_vec=query_vec,
+            scope=scope,  # type: ignore[arg-type]
+            channel_id=channel_id,
+            kind=kind,  # type: ignore[arg-type]
+            limit=limit,
+        )
+
+
+def _merge_rrf(
+    keyword_rows: list[dict],
+    semantic_rows: list[dict],
+    limit: int,
+) -> list[dict]:
+    rows_by_key: dict[tuple[str, object], dict] = {}
+    scores: dict[tuple[str, object], float] = {}
+
+    for rows in (keyword_rows, semantic_rows):
+        for rank, row in enumerate(rows, start=1):
+            key = _result_key(row)
+            if key is None:
+                continue
+            rows_by_key.setdefault(key, row)
+            scores[key] = scores.get(key, 0.0) + (1.0 / (RRF_K + rank))
+
+    ordered_keys = sorted(
+        rows_by_key,
+        key=lambda key: (scores[key], rows_by_key[key].get("ts") or ""),
+        reverse=True,
+    )
+    return [rows_by_key[key] for key in ordered_keys[:limit]]
+
+
+def _result_key(row: dict) -> tuple[str, object] | None:
+    row_kind = row.get("kind")
+    identifier = row.get("message_uuid") or row.get("summary_id")
+    if row_kind is None or identifier is None:
+        return None
+    return str(row_kind), identifier

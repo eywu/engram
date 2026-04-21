@@ -14,7 +14,7 @@ import engram.mcp_tools as mcp_tools
 from engram import paths
 from engram.bootstrap import provision_channel
 from engram.manifest import IdentityTemplate, load_manifest
-from engram.mcp_tools import make_memory_search_server
+from engram.mcp_tools import MEMORY_SEARCH_FULL_TOOL_NAMES, make_memory_search_server
 from engram.memory import insert_summary, insert_transcript, open_memory_db
 
 BASE_TS = datetime(2026, 4, 21, 12, 0, tzinfo=UTC)
@@ -106,7 +106,7 @@ async def test_tool_registered_with_canonical_name(tmp_path: Path):
     server = make_memory_search_server(CHANNEL_A, tmp_path / "memory.db")
 
     assert server["name"] == "engram-memory"
-    assert await _list_tools(server) == ["memory_search"]
+    assert await _list_tools(server) == ["memory_search", "memory_search_semantic"]
 
 
 @pytest.mark.asyncio
@@ -368,6 +368,4 @@ def test_status_json_reports_memory_search_registered(tmp_path: Path, monkeypatc
 
     payload = json.loads(result.output)
     channel = next(c for c in payload["channels"] if c["channel_id"] == "C07TEAM")
-    assert channel["tools"]["registered"] == [
-        "mcp__engram-memory__memory_search"
-    ]
+    assert channel["tools"]["registered"] == MEMORY_SEARCH_FULL_TOOL_NAMES

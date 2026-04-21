@@ -20,11 +20,13 @@ from engram import __version__
 from engram.cli_channels import app as channels_app
 from engram.config import DEFAULT_CONFIG_PATH, EngramConfig, PathsConfig
 from engram.costs import CostDatabase
+from engram.embeddings import embedding_queue_status
 from engram.manifest import ChannelManifest, ManifestError, load_manifest
 from engram.mcp import resolve_team_mcp_servers
 from engram.mcp_tools import (
-    MEMORY_SEARCH_FULL_TOOL_NAME,
+    MEMORY_SEARCH_FULL_TOOL_NAMES,
     MEMORY_SEARCH_SERVER_NAME,
+    memory_tool_metrics,
 )
 from engram.paths import contexts_dir, engram_home
 from engram.runtime import health_path, pid_path, status_path
@@ -115,15 +117,22 @@ def cost(
     if by_channel:
         table = Table(title=f"Cost By Channel ({label})")
         table.add_column("channel")
+        table.add_column("embedding cost")
         table.add_column("turns", justify="right")
         table.add_column("cost", justify="right")
         for channel_id, total in result.per_channel.items():
             table.add_row(
                 channel_id,
+                "gemini free-tier",
                 str(total.turn_count),
                 f"${total.total_cost_usd:.4f}",
             )
-        table.add_row("TOTAL", str(result.turns), f"${result.total_cost_usd:.4f}")
+        table.add_row(
+            "TOTAL",
+            "gemini free-tier",
+            str(result.turns),
+            f"${result.total_cost_usd:.4f}",
+        )
         console.print(table)
         return
     typer.echo(f"{label}: {result.turns} turns ${result.total_cost_usd:.4f}")
@@ -207,6 +216,13 @@ def _build_status_snapshot() -> dict[str, Any]:
         cost_db=cost_db,
         home=home,
     )
+    memory = _memory_counts(home / "memory.db")
+    memory.update(memory_tool_metrics())
+    memory["embedding_queue"] = embedding_queue_status()
+    runtime_memory = runtime.get("memory") if isinstance(runtime, dict) else None
+    if isinstance(runtime_memory, dict):
+        memory.update(runtime_memory)
+
     return {
         "version": __version__,
         "config_file": str(DEFAULT_CONFIG_PATH),
@@ -217,7 +233,7 @@ def _build_status_snapshot() -> dict[str, Any]:
             "health": read_json(health_path(paths.state_dir)),
         },
         "channels": channels,
-        "memory": _memory_counts(home / "memory.db"),
+        "memory": memory,
     }
 
 
@@ -306,12 +322,12 @@ def _manifest_mcp_policy(manifest: ChannelManifest) -> dict[str, Any]:
 
 def _manifest_registered_tools(manifest: ChannelManifest) -> list[str]:
     if manifest.is_owner_dm():
-        return [MEMORY_SEARCH_FULL_TOOL_NAME]
+        return list(MEMORY_SEARCH_FULL_TOOL_NAMES)
     mcp = manifest.mcp_servers
     if MEMORY_SEARCH_SERVER_NAME in mcp.disallowed:
         return []
     if mcp.allowed is not None and MEMORY_SEARCH_SERVER_NAME in mcp.allowed:
-        return [MEMORY_SEARCH_FULL_TOOL_NAME]
+        return list(MEMORY_SEARCH_FULL_TOOL_NAMES)
     return []
 
 

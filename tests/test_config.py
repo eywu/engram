@@ -22,6 +22,7 @@ def clean_env(monkeypatch):
         "SLACK_APP_TOKEN",
         "SLACK_SIGNING_SECRET",
         "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -105,3 +106,31 @@ def test_budget_config_loaded_from_yaml(tmp_path, clean_env):
     assert cfg.budget.hard_cap_enabled is True
     assert [str(t) for t in cfg.budget.warn_thresholds] == ["0.5", "0.9"]
     assert cfg.budget.timezone == "UTC"
+
+
+def test_embeddings_config_loaded_from_yaml_and_env(tmp_path, clean_env, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-env")
+    path = _write_yaml(
+        tmp_path,
+        {
+            "slack": {"bot_token": "xoxb-file", "app_token": "xapp-file"},
+            "anthropic": {"api_key": "sk-ant-file"},
+            "embeddings": {
+                "enabled": True,
+                "provider": "gemini",
+                "model": "text-embedding-004",
+                "dimensions": 768,
+                "sample_rate_transcripts": 0.25,
+                "min_transcript_tokens": 12,
+                "api_timeout_s": 1.5,
+            },
+        },
+    )
+
+    cfg = EngramConfig.load(path)
+
+    assert cfg.embeddings.enabled is True
+    assert cfg.embeddings.api_key == "gemini-env"
+    assert cfg.embeddings.sample_rate_transcripts == 0.25
+    assert cfg.embeddings.min_transcript_tokens == 12
+    assert cfg.embeddings.api_timeout_s == 1.5

@@ -37,14 +37,15 @@ from claude_agent_sdk import (
 from engram.budget import BUDGET_PAUSE_MESSAGE, Budget, CheckResult
 from engram.config import EngramConfig
 from engram.costs import CostDatabase, RateLimitRecord
+from engram.embeddings import EmbeddingQueue
 from engram.hooks import build_hooks
 from engram.mcp import resolve_team_mcp_servers, warn_missing_mcp_servers
 from engram.mcp_tools import (
-    MEMORY_SEARCH_FULL_TOOL_NAME,
+    MEMORY_SEARCH_FULL_TOOL_NAMES,
     MEMORY_SEARCH_SERVER_NAME,
     make_memory_search_server,
 )
-from engram.memory_hooks import make_memory_hooks
+from engram.memory_hooks import make_memory_hooks_with_embeddings
 from engram.router import Router, SessionState
 from engram.scope import build_scope_decision, build_tool_guard
 from engram.telemetry import cli_stderr_logger
@@ -88,6 +89,8 @@ class Agent:
         owner_alert: OwnerAlert | None = None,
         cost_db: CostDatabase | None = None,
         router: Router | None = None,
+        embedder: object | None = None,
+        embedding_queue: EmbeddingQueue | None = None,
         retry_base_delay_seconds: float = 0.5,
     ):
         self._config = config
@@ -96,6 +99,8 @@ class Agent:
         self._owner_alert = owner_alert
         self._cost_db = cost_db
         self._router = router
+        self._embedder = embedder
+        self._embedding_queue = embedding_queue
         self._retry_base_delay_seconds = retry_base_delay_seconds
 
     async def run_turn(
@@ -476,7 +481,8 @@ class Agent:
             if not manifest.is_owner_dm():
                 strict_mcp_config = True
                 mcp_servers, _mcp_allowed, missing_mcp = resolve_team_mcp_servers(
-                    manifest
+                    manifest,
+                    embedder=self._embedder,
                 )
                 warn_missing_mcp_servers(
                     manifest.channel_id,
@@ -486,14 +492,16 @@ class Agent:
                 extra_args["strict-mcp-config"] = None
             else:
                 mcp_servers[MEMORY_SEARCH_SERVER_NAME] = make_memory_search_server(
-                    session.channel_id
+                    session.channel_id,
+                    embedder=self._embedder,
                 )
 
             if (
                 MEMORY_SEARCH_SERVER_NAME in mcp_servers
-                and MEMORY_SEARCH_FULL_TOOL_NAME not in allowed_tools
             ):
-                allowed_tools.append(MEMORY_SEARCH_FULL_TOOL_NAME)
+                for full_tool_name in MEMORY_SEARCH_FULL_TOOL_NAMES:
+                    if full_tool_name not in allowed_tools:
+                        allowed_tools.append(full_tool_name)
 
             if strict_mcp_config and not mcp_servers:
                 extra_args["mcp-config"] = json.dumps({"mcpServers": {}})
@@ -535,7 +543,10 @@ class Agent:
         if self._router is None:
             return hooks
 
-        stop_hook, precompact_hook = make_memory_hooks(self._router)
+        stop_hook, precompact_hook = make_memory_hooks_with_embeddings(
+            self._router,
+            embedding_queue=self._embedding_queue,
+        )
         hooks.setdefault("Stop", []).append(stop_hook)
         hooks.setdefault("PreCompact", []).append(precompact_hook)
         return hooks
