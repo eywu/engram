@@ -1,6 +1,7 @@
 """Tests for bootstrap / provisioning."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from engram.manifest import (
     ChannelManifest,
     ChannelStatus,
     IdentityTemplate,
+    ScopeList,
     load_manifest,
 )
 
@@ -106,8 +108,8 @@ def test_provision_task_assistant_defaults_pending(tmp_path: Path):
     assert "Bash" in m.tools.disallowed
     assert "Write" in m.tools.disallowed
     assert "Edit" in m.tools.disallowed
-    # MCPs + skills inherit
-    assert m.mcp_servers.is_unrestricted()
+    # Team channels start strict with zero MCPs until explicitly allowed.
+    assert m.mcp_servers.allowed == []
     assert m.skills.is_unrestricted()
 
 
@@ -194,6 +196,38 @@ def test_provision_creates_memory_dir(tmp_path: Path):
         home=tmp_path,
     )
     assert paths.channel_memory_dir("C07TEAM", tmp_path).is_dir()
+
+
+def test_unknown_mcp_in_manifest_warns_but_allows_boot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    def fake_render_manifest(**_kwargs):
+        return ChannelManifest(
+            channel_id="C07TEAM",
+            identity=IdentityTemplate.TASK_ASSISTANT,
+            status=ChannelStatus.PENDING,
+            mcp_servers=ScopeList(allowed=["nonexistent-mcp"]),
+        )
+
+    monkeypatch.setattr(
+        "engram.bootstrap._render_manifest",
+        fake_render_manifest,
+    )
+    caplog.set_level(logging.WARNING)
+
+    result = provision_channel(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#growth",
+        home=tmp_path,
+    )
+
+    assert result.created
+    assert result.manifest.mcp_servers.allowed == ["nonexistent-mcp"]
+    assert "channel.mcp_server_missing" in caplog.text
+    assert "nonexistent-mcp" in caplog.text
 
 
 # ── Path helpers sanity ─────────────────────────────────────────────────

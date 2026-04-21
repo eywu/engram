@@ -5,6 +5,7 @@ the agent would construct for various sessions.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,15 @@ def _session(manifest: ChannelManifest | None, cwd: Path | None = None) -> Sessi
     )
 
 
+def _write_mcp_config(tmp_path: Path, servers: dict) -> None:
+    mcp_dir = tmp_path / ".claude"
+    mcp_dir.mkdir()
+    (mcp_dir / "mcp.json").write_text(
+        json.dumps({"mcpServers": servers}),
+        encoding="utf-8",
+    )
+
+
 # ── Legacy mode (no manifest) ──────────────────────────────────────────
 
 
@@ -66,6 +76,8 @@ def test_owner_dm_manifest_full_inheritance():
     assert opts.setting_sources == ["user"]
     assert opts.disallowed_tools == []
     assert opts.allowed_tools == []
+    assert getattr(opts, "strict_mcp_config", False) is False
+    assert "strict-mcp-config" not in opts.extra_args
     # Runtime guard is always wired when a manifest is present — even
     # for full-inheritance. It's a no-op in that case.
     assert opts.can_use_tool is not None
@@ -89,6 +101,8 @@ def test_team_channel_manifest_excludes_tools():
     assert opts.disallowed_tools == ["Bash", "Write", "Edit"]
     assert opts.max_turns == 6
     assert opts.can_use_tool is not None
+    assert getattr(opts, "strict_mcp_config", False) is True
+    assert opts.extra_args["strict-mcp-config"] is None
 
 
 def test_team_channel_escape_hatch_allow_list():
@@ -102,6 +116,58 @@ def test_team_channel_escape_hatch_allow_list():
     opts = a._build_options(_session(m))
     assert opts.allowed_tools == ["Read", "Grep"]
     assert opts.disallowed_tools == []
+
+
+def test_team_channel_gets_strict_mcp_flag():
+    m = ChannelManifest(
+        channel_id="C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        status=ChannelStatus.ACTIVE,
+    )
+    a = Agent(_cfg())
+    opts = a._build_options(_session(m))
+    assert getattr(opts, "strict_mcp_config", False) is True
+    assert opts.extra_args["strict-mcp-config"] is None
+    assert opts.mcp_servers == {}
+    assert json.loads(opts.extra_args["mcp-config"]) == {"mcpServers": {}}
+
+
+def test_team_channel_mcp_servers_matches_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_mcp_config(
+        tmp_path,
+        {
+            "linear": {"type": "http", "url": "https://linear.example/mcp"},
+            "slack-internal": {"command": "slack-mcp"},
+            "figma": {"type": "http", "url": "https://figma.example/mcp"},
+        },
+    )
+    m = ChannelManifest(
+        channel_id="C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        status=ChannelStatus.ACTIVE,
+        mcp_servers=ScopeList(allowed=["linear", "slack-internal"]),
+    )
+    a = Agent(_cfg())
+    opts = a._build_options(_session(m))
+    assert set(opts.mcp_servers) == {"linear", "slack-internal"}
+    assert "mcp-config" not in opts.extra_args
+
+
+def test_owner_dm_does_not_use_strict_mode():
+    m = ChannelManifest(
+        channel_id="D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        status=ChannelStatus.ACTIVE,
+        setting_sources=["user"],
+    )
+    a = Agent(_cfg())
+    opts = a._build_options(_session(m))
+    assert getattr(opts, "strict_mcp_config", False) is False
+    assert "strict-mcp-config" not in opts.extra_args
 
 
 # ── Behavior overrides ─────────────────────────────────────────────────

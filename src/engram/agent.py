@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import inspect
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -36,6 +37,7 @@ from engram.budget import BUDGET_PAUSE_MESSAGE, Budget, CheckResult
 from engram.config import EngramConfig
 from engram.costs import CostDatabase, RateLimitRecord
 from engram.hooks import build_hooks
+from engram.mcp import resolve_team_mcp_servers, warn_missing_mcp_servers
 from engram.router import SessionState
 from engram.scope import build_scope_decision, build_tool_guard
 from engram.telemetry import cli_stderr_logger
@@ -437,6 +439,9 @@ class Agent:
         disallowed_tools: list[str] = []
         skills: list[str] | str | None = "all"
         can_use_tool = None
+        mcp_servers = {}
+        extra_args: dict[str, str | None] = {}
+        strict_mcp_config = False
 
         if manifest is not None:
             # setting_sources: cost-significant. Team channels should use
@@ -459,17 +464,33 @@ class Agent:
             # can't always enumerate).
             can_use_tool = build_tool_guard(manifest)
 
+            if not manifest.is_owner_dm():
+                strict_mcp_config = True
+                mcp_servers, _mcp_allowed, missing_mcp = resolve_team_mcp_servers(
+                    manifest
+                )
+                warn_missing_mcp_servers(
+                    manifest.channel_id,
+                    missing_mcp,
+                    logger=log,
+                )
+                extra_args["strict-mcp-config"] = None
+                if not mcp_servers:
+                    extra_args["mcp-config"] = json.dumps({"mcpServers": {}})
+
         session_kwargs = (
             {"resume": session.session_id}
             if resume
             else {"session_id": session.session_id}
         )
 
-        return ClaudeAgentOptions(
+        options = ClaudeAgentOptions(
             # Identity & discovery
             setting_sources=setting_sources,
             cwd=str(session.cwd) if session.cwd else None,
             model=self._config.anthropic.model,
+            mcp_servers=mcp_servers,
+            extra_args=extra_args,
             **session_kwargs,
             # Runtime limits
             max_turns=max_turns,
@@ -484,6 +505,10 @@ class Agent:
             hooks=build_hooks(channel_id=session.channel_id, cost_db=self._cost_db),
             stderr=cli_stderr_logger(session.channel_id),
         )
+        # SDK 0.1.x exposes --strict-mcp-config through extra_args. Keep a
+        # plain attribute so diagnostics and tests can inspect the policy.
+        options.strict_mcp_config = strict_mcp_config
+        return options
 
     def _check_budget(self, channel_id: str) -> CheckResult | None:
         if self._budget is None:
