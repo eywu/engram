@@ -77,11 +77,16 @@ class Router:
         *,
         home: Path | None = None,
         owner_dm_channel_id: str | None = None,
+        template_vars: dict[str, str] | None = None,
     ):
         self._sessions: dict[str, SessionState] = {}
         self._shared_cwd = shared_cwd
         self._home = home
         self._owner_dm_channel_id = owner_dm_channel_id
+        # Substitutions applied when provisioning a channel's CLAUDE.md (e.g.
+        # owner_display_name="Eric", slack_workspace_name="growthgauge").
+        # Discovered at boot from Slack auth.test / users.info.
+        self._template_vars = dict(template_vars) if template_vars else {}
         self._create_lock = asyncio.Lock()
 
     async def get(
@@ -140,6 +145,7 @@ class Router:
                     identity=identity,
                     label=label,
                     home=self._home,
+                    template_vars=self._template_vars or None,
                 )
                 manifest = result.manifest
                 log.info(
