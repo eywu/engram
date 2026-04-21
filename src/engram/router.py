@@ -120,6 +120,7 @@ class Router:
         template_vars: dict[str, str] | None = None,
     ):
         self._sessions: dict[str, SessionState] = {}
+        self._session_id_to_channel_id: dict[str, str] = {}
         self._shared_cwd = shared_cwd
         self._home = home
         self._owner_dm_channel_id = owner_dm_channel_id
@@ -146,6 +147,7 @@ class Router:
                 channel_id, channel_name=channel_name, is_dm=is_dm
             )
             self._sessions[channel_id] = session
+            self._session_id_to_channel_id[session.session_id] = channel_id
             return session
 
     async def _create_session(
@@ -226,6 +228,10 @@ class Router:
 
     def session_count(self) -> int:
         return len(self._sessions)
+
+    def get_channel_by_session_id(self, session_id: str) -> str | None:
+        """Return the Slack channel ID for a known Claude session ID."""
+        return self._session_id_to_channel_id.get(session_id)
 
     # ──────────────────────────────────────────────────────────────
     # Agent client lifecycle
