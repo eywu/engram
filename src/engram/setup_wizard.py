@@ -213,6 +213,13 @@ def _write_config(*, slack: dict[str, str], anthropic_key: str) -> None:
         },
         "allowed_channels": [],  # DMs always allowed; team channels opt-in
         "max_turns_per_message": 8,
+        "embeddings": {
+            "enabled": True,
+            "provider": "gemini",
+            "model": "text-embedding-004",
+            "dimensions": 768,
+            "sample_rate_transcripts": 0.3,
+        },
     }
 
     DEFAULT_CONFIG_PATH.write_text(yaml.safe_dump(config, sort_keys=False))

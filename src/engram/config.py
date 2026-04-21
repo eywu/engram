@@ -41,6 +41,37 @@ class PathsConfig:
 
 
 @dataclass
+class EmbeddingsConfig:
+    enabled: bool = True
+    provider: str = "gemini"
+    model: str = "text-embedding-004"
+    dimensions: int = 768
+    sample_rate_transcripts: float = 0.3
+    queue_size: int = 100
+    timeout_seconds: float = 2.0
+
+    @classmethod
+    def from_mapping(cls, raw: dict | None = None) -> EmbeddingsConfig:
+        raw = raw or {}
+        sample_rate = (
+            os.environ.get("ENGRAM_EMBED_TRANSCRIPTS_SAMPLE_RATE")
+            or os.environ.get("EMBED_TRANSCRIPTS_SAMPLE_RATE")
+            or raw.get("sample_rate_transcripts")
+            or 0.3
+        )
+        enabled_raw = os.environ.get("ENGRAM_EMBEDDINGS_ENABLED", raw.get("enabled", True))
+        return cls(
+            enabled=_parse_bool(enabled_raw),
+            provider=str(raw.get("provider") or "gemini"),
+            model=str(raw.get("model") or "text-embedding-004"),
+            dimensions=int(raw.get("dimensions") or 768),
+            sample_rate_transcripts=_clamp_float(float(sample_rate), 0.0, 1.0),
+            queue_size=max(1, int(raw.get("queue_size") or 100)),
+            timeout_seconds=max(0.1, float(raw.get("timeout_seconds") or 2.0)),
+        )
+
+
+@dataclass
 class EngramConfig:
     slack: SlackConfig
     anthropic: AnthropicConfig
@@ -57,6 +88,8 @@ class EngramConfig:
     owner_dm_channel_id: str | None = None
     # M3: monthly budget tracking / warning ladder.
     budget: BudgetConfig = field(default_factory=BudgetConfig)
+    # M3g: Gemini embeddings for semantic recall.
+    embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
 
     @classmethod
     def load(cls, config_path: Path | None = None) -> EngramConfig:
@@ -124,6 +157,7 @@ class EngramConfig:
                 or os.environ.get("ENGRAM_OWNER_DM_CHANNEL_ID")
             ),
             budget=BudgetConfig.from_mapping(raw.get("budget")),
+            embeddings=EmbeddingsConfig.from_mapping(raw.get("embeddings")),
         )
 
     def ensure_dirs(self) -> None:
@@ -163,3 +197,15 @@ def _resolve_optional(value: str | None, *env_keys: str) -> str | None:
         if val := os.environ.get(key):
             return val
     return None
+
+
+def _parse_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _clamp_float(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))

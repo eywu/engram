@@ -21,6 +21,7 @@ from engram.budget import Budget
 from engram.config import EngramConfig
 from engram.costs import CostLedger
 from engram.ingress import register_listeners
+from engram.memory import configure_embeddings, shutdown_embeddings
 from engram.router import Router
 
 READY_LOG_LINE = "engram.ready"  # stable string for health probes / test harnesses
@@ -106,6 +107,7 @@ async def run() -> int:
         return 2
 
     config.ensure_dirs()
+    configure_embeddings(config.embeddings)
     log.info(
         "engram.config_loaded model=%s allowed_channels=%d state_dir=%s",
         config.anthropic.model,
@@ -194,6 +196,7 @@ async def run() -> int:
                 type(e).__name__,
                 e,
             )
+        await shutdown_embeddings()
     log.info("engram.shutdown_complete")
     return 0
 

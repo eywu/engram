@@ -12,7 +12,7 @@ from rich import print as rprint
 from rich.console import Console
 from rich.table import Table
 
-from engram import __version__
+from engram import __version__, memory
 from engram.cli_channels import app as channels_app
 from engram.config import DEFAULT_CONFIG_PATH, EngramConfig
 from engram.costs import CostLedger
@@ -118,6 +118,36 @@ def status() -> None:
         rprint(f"  [green]✓[/green] running (pid {pid})")
     else:
         rprint("  [dim](not running — start with `engram run` or via launchd)[/dim]")
+    rprint()
+
+
+@app.command()
+def cost(
+    by_channel: bool = typer.Option(
+        False,
+        "--by-channel",
+        help="Show monthly embedding projection grouped by channel.",
+    ),
+) -> None:
+    """Show cost-oriented runtime summaries."""
+    if not by_channel:
+        rprint("Use [cyan]engram cost --by-channel[/cyan] for channel projections.")
+        return
+
+    with memory.connect() as conn:
+        counts = memory.monthly_embedding_counts_by_channel(conn)
+
+    table = Table(show_header=True)
+    table.add_column("Channel")
+    table.add_column("Embedded rows", justify="right")
+    table.add_column("Projected monthly embedding cost", justify="right")
+    for channel_id, count in sorted(counts.items()):
+        table.add_row(channel_id, str(count), "$0.00")
+    if not counts:
+        table.add_row("(none)", "0", "$0.00")
+    console.print(table)
+    rprint("[dim]Gemini text embeddings are projected at $0.00 at current usage.[/dim]")
+    rprint("[dim]Alert threshold: $5.00/month.[/dim]")
     rprint()
 
 

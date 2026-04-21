@@ -28,6 +28,7 @@ from engram.budget import BUDGET_PAUSE_MESSAGE, Budget, CheckResult
 from engram.config import EngramConfig
 from engram.router import SessionState
 from engram.scope import build_scope_decision, build_tool_guard
+from engram.tools import build_memory_mcp_server
 
 log = logging.getLogger(__name__)
 
@@ -262,6 +263,11 @@ class Agent:
         disallowed_tools: list[str] = []
         skills: list[str] | str | None = "all"
         can_use_tool = None
+        mcp_servers = {
+            "engram_memory": build_memory_mcp_server(
+                default_channel_id=session.channel_id,
+            )
+        }
 
         if manifest is not None:
             # setting_sources: cost-significant. Team channels should use
@@ -303,6 +309,7 @@ class Agent:
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
             skills=skills,
+            mcp_servers=mcp_servers,
             # Scope (runtime — final enforcement)
             can_use_tool=can_use_tool,
             max_budget_usd=self._max_budget_usd_for_options(),
