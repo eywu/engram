@@ -8,6 +8,7 @@ from typing import Any
 
 from claude_agent_sdk import HookInput, HookJSONOutput, HookMatcher, get_session_messages
 
+from engram.embeddings import EmbeddingQueue
 from engram.memory import (
     get_watermark,
     insert_summary,
@@ -32,6 +33,14 @@ _COMPACTION_SUMMARY_PREFIXES = (
 
 def make_memory_hooks(router: Any) -> list[HookMatcher]:
     """Return Stop and PreCompact hook matchers bound to the bridge router."""
+    return make_memory_hooks_with_embeddings(router)
+
+
+def make_memory_hooks_with_embeddings(
+    router: Any,
+    embedding_queue: EmbeddingQueue | None = None,
+) -> list[HookMatcher]:
+    """Return memory hooks, optionally enqueueing embedding work after inserts."""
 
     async def stop_hook(
         hook_input: HookInput,
@@ -39,7 +48,7 @@ def make_memory_hooks(router: Any) -> list[HookMatcher]:
         _context: dict[str, Any],
     ) -> HookJSONOutput:
         try:
-            _handle_stop_hook(router, hook_input)
+            await _handle_stop_hook(router, hook_input, embedding_queue=embedding_queue)
         except Exception:
             log.error(
                 "memory.stop_failed session_id=%s",
@@ -87,7 +96,12 @@ def _handle_precompact_hook(hook_input: HookInput) -> None:
     )
 
 
-def _handle_stop_hook(router: Any, hook_input: HookInput) -> None:
+async def _handle_stop_hook(
+    router: Any,
+    hook_input: HookInput,
+    *,
+    embedding_queue: EmbeddingQueue | None = None,
+) -> None:
     session_id = str(hook_input.get("session_id") or "")
     if not session_id:
         log.warning("memory.stop_missing_session")
@@ -122,6 +136,7 @@ def _handle_stop_hook(router: Any, hook_input: HookInput) -> None:
             metadata = metadata_by_uuid.get(message_uuid, {})
             ts = _metadata_ts(metadata)
             message_timestamps[message_uuid] = ts
+            text = _extract_text(message)
             if insert_transcript(
                 conn,
                 session_id=session_id,
@@ -130,9 +145,19 @@ def _handle_stop_hook(router: Any, hook_input: HookInput) -> None:
                 role=_extract_role(message),
                 message_uuid=message_uuid,
                 parent_uuid=_metadata_parent_uuid(metadata),
-                text=_extract_text(message),
+                text=text,
             ):
                 rows_inserted += 1
+                if embedding_queue is not None:
+                    row = conn.execute(
+                        "SELECT id FROM transcripts WHERE message_uuid = ?",
+                        (message_uuid,),
+                    ).fetchone()
+                    if row is not None:
+                        await embedding_queue.enqueue_transcript_if_sampled(
+                            int(row["id"]),
+                            text,
+                        )
 
         if rows_inserted and new_messages:
             last_message = new_messages[-1]
@@ -145,11 +170,12 @@ def _handle_stop_hook(router: Any, hook_input: HookInput) -> None:
                     message_timestamps.get(last_uuid, datetime.now(UTC)),
                 )
 
-        _promote_pending_compaction(
+        await _promote_pending_compaction(
             conn,
             session_id=session_id,
             channel_id=channel_id,
             new_messages=new_messages,
+            embedding_queue=embedding_queue,
         )
         log.info(
             "memory.stop_ingested session_id=%s channel_id=%s rows=%d",
@@ -181,12 +207,13 @@ def _messages_after_watermark(
     return messages
 
 
-def _promote_pending_compaction(
+async def _promote_pending_compaction(
     conn: Any,
     *,
     session_id: str,
     channel_id: str,
     new_messages: list[Any],
+    embedding_queue: EmbeddingQueue | None = None,
 ) -> None:
     pending = pending_compactions.get(session_id)
     if pending is None:
@@ -195,7 +222,7 @@ def _promote_pending_compaction(
     for message in new_messages:
         text = _extract_text(message).strip()
         if text and _is_compaction_summary_message(message, text):
-            insert_summary(
+            summary_id = insert_summary(
                 conn,
                 session_id=session_id,
                 channel_id=channel_id,
@@ -204,6 +231,8 @@ def _promote_pending_compaction(
                 custom_instructions=pending.get("custom_instructions"),
                 summary_text=text,
             )
+            if embedding_queue is not None:
+                await embedding_queue.enqueue_summary(summary_id, text)
             del pending_compactions[session_id]
             log.info("memory.compaction_summary_inserted session_id=%s", session_id)
             return

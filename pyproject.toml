@@ -25,6 +25,8 @@ dependencies = [
     "rich>=13.0",
     "structlog>=24.0",
     "pydantic>=2.10",
+    "google-genai>=1.73.1",
+    "numpy>=2.4.4",
 ]
 
 [project.optional-dependencies]

@@ -19,6 +19,7 @@ from engram.bootstrap import ensure_project_root
 from engram.budget import Budget
 from engram.config import EngramConfig
 from engram.costs import CostLedger
+from engram.embeddings import EmbeddingQueue, GeminiEmbedder, set_active_embedding_queue
 from engram.ingress import register_listeners
 from engram.router import Router
 from engram.runtime import write_runtime_snapshot
@@ -137,6 +138,20 @@ async def run() -> int:
         config.paths.log_dir / "costs.jsonl",
         db_path=budget.db_path,
     )
+    embedder = GeminiEmbedder(config.embeddings)
+    embedding_queue = EmbeddingQueue(
+        embedder,
+        db_path=engram_home / "memory.db",
+    )
+    set_active_embedding_queue(embedding_queue)
+    embedding_worker_task = (
+        asyncio.create_task(
+            embedding_queue.run(),
+            name="engram-embedding-queue",
+        )
+        if embedder.enabled
+        else None
+    )
 
     async def _owner_alert(text: str) -> None:
         if not config.owner_dm_channel_id:
@@ -156,6 +171,8 @@ async def run() -> int:
         owner_alert=_owner_alert,
         cost_db=cost_ledger.db,
         router=router,
+        embedder=embedder,
+        embedding_queue=embedding_queue,
     )
     register_listeners(app, config, router, agent, cost_ledger=cost_ledger)
     idle_sweeper_task = router.start_idle_sweeper()
@@ -210,10 +227,16 @@ async def run() -> int:
     finally:
         idle_sweeper_task.cancel()
         runtime_snapshot_task.cancel()
+        if embedding_worker_task is not None:
+            await embedding_queue.drain()
+            embedding_worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await idle_sweeper_task
         with contextlib.suppress(asyncio.CancelledError):
             await runtime_snapshot_task
+        if embedding_worker_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await embedding_worker_task
 
         try:
             await router.close_all_agent_clients()
@@ -223,6 +246,7 @@ async def run() -> int:
                 type(e).__name__,
                 e,
             )
+        set_active_embedding_queue(None)
     log.info("engram.shutdown_complete")
     return 0
 

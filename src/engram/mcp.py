@@ -49,6 +49,7 @@ def resolve_team_mcp_servers(
     manifest: ChannelManifest,
     *,
     configured_servers: dict[str, dict[str, Any]] | None = None,
+    embedder: Any | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str], list[str]]:
     """Resolve a team-channel manifest to an explicit MCP config map.
 
@@ -70,7 +71,10 @@ def resolve_team_mcp_servers(
     missing: list[str] = []
     for name in effective_names:
         if name == MEMORY_SEARCH_SERVER_NAME:
-            servers[name] = make_memory_search_server(manifest.channel_id)
+            servers[name] = make_memory_search_server(
+                manifest.channel_id,
+                embedder=embedder,
+            )
             continue
         config = configured.get(name)
         if config is None:

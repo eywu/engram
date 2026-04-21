@@ -40,6 +40,49 @@ class PathsConfig:
     log_dir: Path = field(default_factory=lambda: DEFAULT_LOG_DIR)
 
 
+@dataclass(frozen=True)
+class EmbeddingsConfig:
+    enabled: bool = True
+    provider: str = "gemini"
+    model: str = "text-embedding-004"
+    dimensions: int = 768
+    sample_rate_transcripts: float = 0.3
+    min_transcript_tokens: int = 30
+    api_timeout_s: float = 2.0
+    api_key: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "enabled", _bool(self.enabled))
+        object.__setattr__(self, "provider", str(self.provider or "gemini").lower())
+        object.__setattr__(self, "model", str(self.model or "text-embedding-004"))
+        object.__setattr__(self, "dimensions", max(1, int(self.dimensions or 768)))
+        object.__setattr__(
+            self,
+            "sample_rate_transcripts",
+            min(1.0, max(0.0, float(self.sample_rate_transcripts))),
+        )
+        object.__setattr__(
+            self,
+            "min_transcript_tokens",
+            max(0, int(self.min_transcript_tokens or 0)),
+        )
+        object.__setattr__(self, "api_timeout_s", max(0.01, float(self.api_timeout_s)))
+
+    @classmethod
+    def from_mapping(cls, raw: dict | None) -> EmbeddingsConfig:
+        raw = raw or {}
+        return cls(
+            enabled=raw.get("enabled", True),
+            provider=raw.get("provider", "gemini"),
+            model=raw.get("model", "text-embedding-004"),
+            dimensions=raw.get("dimensions", 768),
+            sample_rate_transcripts=raw.get("sample_rate_transcripts", 0.3),
+            min_transcript_tokens=raw.get("min_transcript_tokens", 30),
+            api_timeout_s=raw.get("api_timeout_s", 2.0),
+            api_key=os.environ.get("GEMINI_API_KEY"),
+        )
+
+
 @dataclass
 class EngramConfig:
     slack: SlackConfig
@@ -57,6 +100,8 @@ class EngramConfig:
     owner_dm_channel_id: str | None = None
     # M3: monthly budget tracking / warning ladder.
     budget: BudgetConfig = field(default_factory=BudgetConfig)
+    # M3b: asynchronous Gemini embeddings for semantic memory recall.
+    embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
 
     @classmethod
     def load(cls, config_path: Path | None = None) -> EngramConfig:
@@ -124,6 +169,7 @@ class EngramConfig:
                 or os.environ.get("ENGRAM_OWNER_DM_CHANNEL_ID")
             ),
             budget=BudgetConfig.from_mapping(raw.get("budget")),
+            embeddings=EmbeddingsConfig.from_mapping(raw.get("embeddings")),
         )
 
     def ensure_dirs(self) -> None:
@@ -163,3 +209,11 @@ def _resolve_optional(value: str | None, *env_keys: str) -> str | None:
         if val := os.environ.get(key):
             return val
     return None
+
+
+def _bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)

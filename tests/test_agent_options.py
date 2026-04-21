@@ -19,6 +19,7 @@ from engram.manifest import (
     IdentityTemplate,
     ScopeList,
 )
+from engram.mcp_tools import MEMORY_SEARCH_FULL_TOOL_NAMES
 from engram.router import SessionState
 
 
@@ -75,7 +76,7 @@ def test_owner_dm_manifest_full_inheritance():
     opts = a._build_options(_session(m))
     assert opts.setting_sources == ["user"]
     assert opts.disallowed_tools == []
-    assert opts.allowed_tools == ["mcp__engram-memory__memory_search"]
+    assert opts.allowed_tools == MEMORY_SEARCH_FULL_TOOL_NAMES
     assert set(opts.mcp_servers) == {"engram-memory"}
     assert getattr(opts, "strict_mcp_config", False) is False
     assert "strict-mcp-config" not in opts.extra_args
@@ -181,7 +182,7 @@ def test_team_channel_memory_mcp_server_matches_manifest():
     a = Agent(_cfg())
     opts = a._build_options(_session(m))
     assert set(opts.mcp_servers) == {"engram-memory"}
-    assert opts.allowed_tools == ["mcp__engram-memory__memory_search"]
+    assert opts.allowed_tools == MEMORY_SEARCH_FULL_TOOL_NAMES
     assert "mcp-config" not in opts.extra_args
 
 
