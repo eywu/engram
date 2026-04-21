@@ -123,16 +123,16 @@ async def test_template_vars_flow_into_claude_md(tmp_path: Path):
     """owner_display_name + slack_workspace_name must reach the rendered CLAUDE.md."""
     r = Router(
         home=tmp_path,
-        owner_dm_channel_id="D07ERIC",
+        owner_dm_channel_id="D07OWNER",
         template_vars={
-            "owner_display_name": "Eric",
-            "slack_workspace_name": "growthgauge",
+            "owner_display_name": "Alice",
+            "slack_workspace_name": "acme-corp",
         },
     )
-    await r.get("D07ERIC", is_dm=True)
-    body = paths.channel_claude_md_path("D07ERIC", tmp_path).read_text()
-    assert "Eric" in body
-    assert "growthgauge" in body
+    await r.get("D07OWNER", is_dm=True)
+    body = paths.channel_claude_md_path("D07OWNER", tmp_path).read_text()
+    assert "Alice" in body
+    assert "acme-corp" in body
     # The workspace default (which is ONLY used in the workspace slot) must
     # not appear when we've supplied a real workspace name.
     assert "this workspace" not in body

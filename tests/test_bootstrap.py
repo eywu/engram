@@ -71,16 +71,16 @@ def test_owner_dm_claude_md_substitutes_vars(tmp_path: Path):
     provision_channel(
         "D07OWNER",
         identity=IdentityTemplate.OWNER_DM_FULL,
-        label="Eric (DM)",
+        label="Alice (DM)",
         home=tmp_path,
         template_vars={
-            "owner_display_name": "Eric",
-            "slack_workspace_name": "growthgauge",
+            "owner_display_name": "Alice",
+            "slack_workspace_name": "acme-corp",
         },
     )
     claude_md = paths.channel_claude_md_path("D07OWNER", tmp_path).read_text()
-    assert "Eric" in claude_md
-    assert "growthgauge" in claude_md
+    assert "Alice" in claude_md
+    assert "acme-corp" in claude_md
     assert "D07OWNER" in claude_md
     # No unsubstituted template variables should leak through.
     assert "{{owner_display_name}}" not in claude_md

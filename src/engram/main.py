@@ -124,10 +124,11 @@ async def run() -> int:
 
     app = AsyncApp(token=config.slack.bot_token)
 
-    # Discover workspace + owner display name so CLAUDE.md templates render
-    # with real identity ("Eric" / "growthgauge") instead of the generic
-    # fallbacks ("the operator" / "this workspace"). Best-effort: any Slack
-    # API failure here falls back to the defaults in bootstrap._render_identity_md.
+    # Discover workspace + owner display name from Slack so CLAUDE.md
+    # templates render with real identity (name / workspace) instead of the
+    # generic fallbacks ("the operator" / "this workspace"). Best-effort:
+    # any Slack API failure falls back to the defaults in
+    # bootstrap._render_identity_md.
     template_vars = await _discover_template_vars(
         app, config.owner_dm_channel_id, log
     )

@@ -166,7 +166,7 @@ def test_load_manifest_owner_dm(tmp_path: Path):
         """
 channel_id: D07OWNER
 identity: owner-dm-full
-label: Eric (DM)
+label: Alice (DM)
 status: active
 setting_sources: [user]
 """

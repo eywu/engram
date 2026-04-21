@@ -83,8 +83,8 @@ class Router:
         self._shared_cwd = shared_cwd
         self._home = home
         self._owner_dm_channel_id = owner_dm_channel_id
-        # Substitutions applied when provisioning a channel's CLAUDE.md (e.g.
-        # owner_display_name="Eric", slack_workspace_name="growthgauge").
+        # Substitutions applied when provisioning a channel's CLAUDE.md, e.g.
+        # owner_display_name="Alice", slack_workspace_name="acme-corp".
         # Discovered at boot from Slack auth.test / users.info.
         self._template_vars = dict(template_vars) if template_vars else {}
         self._create_lock = asyncio.Lock()
