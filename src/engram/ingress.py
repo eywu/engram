@@ -113,6 +113,7 @@ def register_listeners(
                 TurnCost(
                     timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
                     session_label=session.label(),
+                    session_id=session.session_id,
                     channel_id=session.channel_id,
                     is_dm=session.is_dm,
                     cost_usd=turn.cost_usd,

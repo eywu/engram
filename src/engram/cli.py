@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
+import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich import print as rprint
@@ -14,8 +18,12 @@ from rich.table import Table
 
 from engram import __version__
 from engram.cli_channels import app as channels_app
-from engram.config import DEFAULT_CONFIG_PATH, EngramConfig
-from engram.costs import CostLedger
+from engram.config import DEFAULT_CONFIG_PATH, EngramConfig, PathsConfig
+from engram.costs import CostDatabase
+from engram.manifest import ManifestError, load_manifest
+from engram.paths import contexts_dir, engram_home
+from engram.runtime import health_path, pid_path, status_path
+from engram.telemetry import process_exists, read_json
 
 app = typer.Typer(
     name="engram",
@@ -38,87 +46,130 @@ def version() -> None:
 
 
 @app.command()
-def status() -> None:
-    """Show runtime + config status and MCP inventory."""
+def status(
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Show bridge health, live channels, memory counts, and rate limits."""
+    snapshot = _build_status_snapshot()
+    if json_output:
+        typer.echo(json.dumps(snapshot, sort_keys=True))
+        return
+
     rprint(f"[bold]Engram[/bold] version {__version__}")
+    bridge = snapshot["bridge"]
+    if bridge["up"]:
+        rprint(f"[bold]Bridge[/bold] running (pid {bridge['pid']})")
+    else:
+        rprint("[bold]Bridge[/bold] not running")
+    if snapshot.get("config_error"):
+        rprint(f"[yellow]Config[/yellow] {snapshot['config_error']}")
     rprint()
 
-    # --- Config ---
-    rprint("[bold]Config[/bold]")
-    try:
-        cfg = EngramConfig.load()
-    except RuntimeError as e:
-        rprint(f"  [red]✗[/red] config incomplete: {e}")
-        cfg = None
+    memory = snapshot["memory"]
+    rprint("[bold]Memory[/bold]")
+    rprint(
+        f"  transcripts={memory['transcripts_count']} "
+        f"summaries={memory['summaries_count']}"
+    )
+    rprint()
 
-    if cfg:
-        table = Table(show_header=False, box=None, padding=(0, 1))
-        table.add_column()
-        table.add_column()
-        table.add_row("  config file:", str(DEFAULT_CONFIG_PATH))
-        table.add_row("  model:", cfg.anthropic.model)
+    table = Table(title="Channels")
+    table.add_column("channel")
+    table.add_column("live")
+    table.add_column("rate limit")
+    table.add_column("context")
+    table.add_column("mcp")
+    for channel in snapshot["channels"]:
+        context = channel.get("context_usage") or {}
+        mcp = channel.get("mcp_status") or {}
+        total_tokens = context.get("totalTokens")
+        mcp_servers = mcp.get("mcpServers") if isinstance(mcp, dict) else None
         table.add_row(
-            "  slack:",
-            f"bot={_mask(cfg.slack.bot_token)}, app={_mask(cfg.slack.app_token)}",
+            channel["channel_id"],
+            "yes" if channel.get("live") else "no",
+            str(channel.get("rate_limit", {}).get("status", "allowed")),
+            str(total_tokens if total_tokens is not None else "-"),
+            str(len(mcp_servers) if isinstance(mcp_servers, list) else "-"),
         )
-        table.add_row("  state_dir:", str(cfg.paths.state_dir))
-        table.add_row("  allowed_channels:", ", ".join(cfg.allowed_channels) or "(none)")
+    console.print(table)
+
+
+@app.command()
+def cost(
+    month: bool = typer.Option(False, "--month", help="Show month-to-date spend."),
+    today: bool = typer.Option(False, "--today", help="Show today's spend."),
+    by_channel: bool = typer.Option(False, "--by-channel", help="Break spend down by channel."),
+    since: str | None = typer.Option(None, "--since", help="Show spend since YYYY-MM-DD."),
+) -> None:
+    """Query the SQLite cost ledger."""
+    cfg, _ = _load_config_optional()
+    paths = cfg.paths if cfg else _fallback_paths()
+    db = CostDatabase(_cost_db_path(paths))
+    start, label = _cost_window(month=month, today=today, since=since)
+    result = db.query(since=start, by_channel=by_channel)
+    if by_channel:
+        table = Table(title=f"Cost By Channel ({label})")
+        table.add_column("channel")
+        table.add_column("turns", justify="right")
+        table.add_column("cost", justify="right")
+        for channel_id, total in result.per_channel.items():
+            table.add_row(
+                channel_id,
+                str(total.turn_count),
+                f"${total.total_cost_usd:.4f}",
+            )
+        table.add_row("TOTAL", str(result.turns), f"${result.total_cost_usd:.4f}")
         console.print(table)
-    rprint()
+        return
+    typer.echo(f"{label}: {result.turns} turns ${result.total_cost_usd:.4f}")
 
-    # --- Claude CLI presence (SDK requirement, M0-F1) ---
-    rprint("[bold]Claude CLI[/bold] (SDK subprocess dependency)")
-    claude = _which("claude")
-    if claude:
-        ver = _safe_run([claude, "--version"]).strip()
-        rprint(f"  [green]✓[/green] {claude}  [dim]{ver}[/dim]")
-    else:
-        rprint(
-            "  [red]✗[/red] claude CLI not found on PATH. "
-            "Install with: [cyan]npm i -g @anthropic-ai/claude-code[/cyan]"
-        )
-    rprint()
 
-    # --- MCP inventory (M1 done criterion) ---
-    rprint("[bold]MCP Inventory[/bold]")
-    mcps = _discover_mcps()
-    if not mcps:
-        rprint("  (no MCP servers configured — zero-MCP setup is supported)")
-    else:
-        for name, src in mcps.items():
-            rprint(f"  [green]•[/green] {name}  [dim]from {src}[/dim]")
-    rprint()
+@app.command()
+def logs(
+    tail: int = typer.Option(100, "--tail", "-n", help="Number of matching log lines to print."),
+    channel: str | None = typer.Option(None, "--channel", help="Filter by channel id."),
+    level: str | None = typer.Option(None, "--level", help="Filter by level, e.g. err."),
+) -> None:
+    """Tail the most recent structured log file."""
+    cfg, _ = _load_config_optional()
+    paths = cfg.paths if cfg else _fallback_paths()
+    log_file = _latest_log_file(paths.log_dir)
+    if log_file is None:
+        typer.echo("No Engram log files found.")
+        return
+    matches = []
+    for line in log_file.read_text(encoding="utf-8").splitlines():
+        if _log_line_matches(line, channel=channel, level=level):
+            matches.append(line)
+    for line in matches[-tail:]:
+        typer.echo(line)
 
-    # --- Cost ledger (M1 promoted from M3) ---
-    rprint("[bold]Costs[/bold] (from JSONL ledger)")
-    if cfg:
-        ledger = CostLedger(cfg.paths.log_dir / "costs.jsonl")
-        summary = ledger.summarize()
-        if summary.total_turns == 0:
-            rprint("  [dim](no turns recorded yet)[/dim]")
-        else:
-            ctable = Table(show_header=False, box=None, padding=(0, 1))
-            ctable.add_column()
-            ctable.add_column(justify="right")
-            ctable.add_column(justify="right")
-            ctable.add_row("  period", "turns", "spend")
-            ctable.add_row("  today", str(summary.today_turns), f"${summary.today_cost_usd:.4f}")
-            ctable.add_row("  month-to-date", str(summary.month_turns), f"${summary.month_cost_usd:.4f}")
-            ctable.add_row("  all-time", str(summary.total_turns), f"${summary.total_cost_usd:.4f}")
-            console.print(ctable)
-            if summary.total_turns > 0:
-                avg = summary.total_cost_usd / summary.total_turns
-                rprint(f"  [dim]avg/turn: ${avg:.4f}[/dim]")
-    rprint()
 
-    # --- Bridge process ---
-    rprint("[bold]Bridge[/bold]")
-    pid = _bridge_pid()
-    if pid:
-        rprint(f"  [green]✓[/green] running (pid {pid})")
-    else:
-        rprint("  [dim](not running — start with `engram run` or via launchd)[/dim]")
-    rprint()
+@app.command()
+def health(
+    max_age_seconds: int = typer.Option(
+        120,
+        "--max-age-seconds",
+        help="Maximum health marker age.",
+    ),
+) -> None:
+    """Health check for launchd watchdogs."""
+    cfg, _ = _load_config_optional()
+    paths = cfg.paths if cfg else _fallback_paths()
+    pid = _pid_from_file(paths.state_dir)
+    marker = read_json(health_path(paths.state_dir)) or {}
+    now = time.time()
+    marker_ts = _parse_iso_ts(marker.get("ts"))
+    healthy = (
+        pid is not None
+        and process_exists(pid)
+        and marker_ts is not None
+        and now - marker_ts <= max_age_seconds
+    )
+    if not healthy:
+        typer.echo("unhealthy", err=True)
+        raise typer.Exit(1)
+    typer.echo("ok")
 
 
 @app.command()
@@ -137,18 +188,192 @@ def setup() -> None:
     run_wizard()
 
 
-def _mask(token: str | None) -> str:
-    if not token:
-        return "(unset)"
-    if len(token) <= 10:
-        return "***"
-    return f"{token[:6]}…{token[-4:]}"
+def _build_status_snapshot() -> dict[str, Any]:
+    cfg, config_error = _load_config_optional()
+    paths = cfg.paths if cfg else _fallback_paths()
+    home = engram_home()
+    cost_db = CostDatabase(_cost_db_path(paths))
+    runtime = read_json(status_path(paths.state_dir)) or {}
+    pid = _pid_from_file(paths.state_dir) or _bridge_pid()
+    bridge_up = bool(pid and process_exists(pid))
+
+    channels = _merge_channels(
+        runtime_channels=runtime.get("channels") or [],
+        cost_db=cost_db,
+        home=home,
+    )
+    return {
+        "version": __version__,
+        "config_file": str(DEFAULT_CONFIG_PATH),
+        "config_error": config_error,
+        "bridge": {
+            "up": bridge_up,
+            "pid": pid,
+            "health": read_json(health_path(paths.state_dir)),
+        },
+        "channels": channels,
+        "memory": _memory_counts(home / "memory.db"),
+    }
 
 
-def _which(cmd: str) -> str | None:
-    from shutil import which
+def _load_config_optional() -> tuple[EngramConfig | None, str | None]:
+    try:
+        return EngramConfig.load(), None
+    except RuntimeError as e:
+        return None, str(e)
 
-    return which(cmd)
+
+def _fallback_paths() -> PathsConfig:
+    home = Path.home() / ".engram"
+    return PathsConfig(
+        state_dir=home / "state",
+        contexts_dir=home / "contexts",
+        log_dir=home / "logs",
+    )
+
+
+def _cost_db_path(paths: PathsConfig) -> Path:
+    if paths.log_dir.name == "logs":
+        return paths.log_dir.parent / "cost.db"
+    return paths.state_dir.parent / "cost.db"
+
+
+def _merge_channels(
+    *,
+    runtime_channels: list[Any],
+    cost_db: CostDatabase,
+    home: Path,
+) -> list[dict[str, Any]]:
+    by_channel: dict[str, dict[str, Any]] = {}
+    for raw in runtime_channels:
+        if not isinstance(raw, dict):
+            continue
+        channel_id = raw.get("channel_id")
+        if not channel_id:
+            continue
+        channel = dict(raw)
+        channel.setdefault("rate_limit", cost_db.latest_rate_limit(channel_id))
+        by_channel[channel_id] = channel
+
+    for manifest_path in sorted(contexts_dir(home).glob("*/.claude/channel-manifest.yaml")):
+        try:
+            manifest = load_manifest(manifest_path)
+        except ManifestError:
+            continue
+        channel = by_channel.setdefault(
+            manifest.channel_id,
+            {
+                "channel_id": manifest.channel_id,
+                "label": manifest.label,
+                "live": False,
+                "turn_count": 0,
+                "mcp_status": None,
+                "context_usage": None,
+                "rate_limit": cost_db.latest_rate_limit(manifest.channel_id),
+            },
+        )
+        channel.setdefault("manifest_status", str(manifest.status))
+        channel.setdefault("identity", str(manifest.identity))
+
+    for channel_id, channel in by_channel.items():
+        channel.setdefault("rate_limit", cost_db.latest_rate_limit(channel_id))
+        channel.setdefault("mcp_status", None)
+        channel.setdefault("context_usage", None)
+        channel.setdefault("live", False)
+    return sorted(by_channel.values(), key=lambda item: item["channel_id"])
+
+
+def _memory_counts(path: Path) -> dict[str, int]:
+    counts = {"transcripts_count": 0, "summaries_count": 0}
+    if not path.exists():
+        return counts
+    try:
+        with sqlite3.connect(path) as conn:
+            for table, key in (
+                ("transcripts", "transcripts_count"),
+                ("summaries", "summaries_count"),
+            ):
+                try:
+                    counts[key] = int(
+                        conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    )
+                except sqlite3.Error:
+                    counts[key] = 0
+    except sqlite3.Error:
+        return counts
+    return counts
+
+
+def _cost_window(
+    *,
+    month: bool,
+    today: bool,
+    since: str | None,
+) -> tuple[datetime.datetime, str]:
+    now = datetime.datetime.now(datetime.UTC)
+    if since:
+        date = datetime.date.fromisoformat(since)
+        start = datetime.datetime.combine(date, datetime.time.min, tzinfo=datetime.UTC)
+        return start, f"since {since}"
+    if today:
+        start = datetime.datetime.combine(now.date(), datetime.time.min, tzinfo=datetime.UTC)
+        return start, "today"
+    # Default and --month both mean month-to-date.
+    start = datetime.datetime(
+        year=now.year,
+        month=now.month,
+        day=1,
+        tzinfo=datetime.UTC,
+    )
+    return start, "month"
+
+
+def _latest_log_file(log_dir: Path) -> Path | None:
+    files = sorted(log_dir.glob("engram-*.jsonl"))
+    return files[-1] if files else None
+
+
+def _log_line_matches(
+    line: str,
+    *,
+    channel: str | None,
+    level: str | None,
+) -> bool:
+    if not channel and not level:
+        return True
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return False
+    if channel and payload.get("channel_id") != channel:
+        return False
+    if level:
+        wanted = level.lower()
+        actual = str(payload.get("level", "")).lower()
+        if wanted in {"err", "error"}:
+            return actual in {"error", "critical"}
+        if actual != wanted:
+            return False
+    return True
+
+
+def _pid_from_file(state_dir: Path) -> int | None:
+    path = pid_path(state_dir)
+    if not path.exists():
+        return None
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _parse_iso_ts(raw: object) -> float | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.datetime.fromisoformat(raw).timestamp()
+    except ValueError:
+        return None
 
 
 def _safe_run(argv: list[str], timeout: float = 10.0) -> str:
@@ -164,54 +389,6 @@ def _safe_run(argv: list[str], timeout: float = 10.0) -> str:
         return (out.stdout or out.stderr).strip()
     except Exception:
         return ""
-
-
-def _discover_mcps() -> dict[str, str]:
-    """Discover MCPs from Claude Code config.
-
-    M0-F5: the SDK reads more than just ~/.claude/mcp.json. We union a few
-    likely sources to give the user a realistic preview.
-    """
-    found: dict[str, str] = {}
-
-    # Primary: ~/.claude/mcp.json (the documented location)
-    mcp_json = Path.home() / ".claude" / "mcp.json"
-    if mcp_json.exists():
-        try:
-            data = json.loads(mcp_json.read_text())
-            for name in (data.get("mcpServers") or {}):
-                found[name] = "~/.claude/mcp.json"
-        except json.JSONDecodeError:
-            pass
-
-    # Secondary: ~/.claude.json top-level user config
-    claude_json = Path.home() / ".claude.json"
-    if claude_json.exists():
-        try:
-            data = json.loads(claude_json.read_text())
-            for name in (data.get("mcpServers") or {}):
-                found.setdefault(name, "~/.claude.json")
-        except json.JSONDecodeError:
-            pass
-
-    # Tertiary: `claude mcp list` if available.
-    # Output format (Claude CLI 2.1.x):
-    #   <name>: <url-or-path> [args...] - <status>
-    # Plus header lines like "Checking MCP server health...".
-    if _which("claude"):
-        raw = _safe_run(["claude", "mcp", "list"])
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line or line.startswith("Checking ") or line.startswith("#"):
-                continue
-            if ": " not in line:
-                continue  # not a server row
-            name_part, _, _rest = line.partition(": ")
-            name = name_part.strip()
-            if name and name not in found:
-                found[name] = "claude mcp list"
-
-    return found
 
 
 def _bridge_pid() -> int | None:

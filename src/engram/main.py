@@ -10,7 +10,6 @@ import logging
 import signal
 import sys
 
-import structlog
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
@@ -22,23 +21,14 @@ from engram.config import EngramConfig
 from engram.costs import CostLedger
 from engram.ingress import register_listeners
 from engram.router import Router
+from engram.runtime import write_runtime_snapshot
+from engram.telemetry import configure_logging
 
 READY_LOG_LINE = "engram.ready"  # stable string for health probes / test harnesses
 
 
 def _configure_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        stream=sys.stderr,
-    )
-    structlog.configure(
-        processors=[
-            structlog.stdlib.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.JSONRenderer(),
-        ]
-    )
+    configure_logging()
 
 
 async def _discover_template_vars(
@@ -106,6 +96,7 @@ async def run() -> int:
         return 2
 
     config.ensure_dirs()
+    configure_logging(config.paths.log_dir, force=True)
     log.info(
         "engram.config_loaded model=%s allowed_channels=%d state_dir=%s",
         config.anthropic.model,
@@ -142,8 +133,29 @@ async def run() -> int:
         template_vars=template_vars,
     )
     budget = Budget(config.budget, db_path=engram_home / "cost.db")
-    agent = Agent(config, budget=budget)
-    cost_ledger = CostLedger(config.paths.log_dir / "costs.jsonl")
+    cost_ledger = CostLedger(
+        config.paths.log_dir / "costs.jsonl",
+        db_path=budget.db_path,
+    )
+
+    async def _owner_alert(text: str) -> None:
+        if not config.owner_dm_channel_id:
+            log.warning("engram.owner_alert_dropped reason=no_owner_dm text=%s", text)
+            return
+        try:
+            await app.client.chat_postMessage(
+                channel=config.owner_dm_channel_id,
+                text=text,
+            )
+        except Exception:
+            log.warning("engram.owner_alert_failed", exc_info=True)
+
+    agent = Agent(
+        config,
+        budget=budget,
+        owner_alert=_owner_alert,
+        cost_db=cost_ledger.db,
+    )
     register_listeners(app, config, router, agent, cost_ledger=cost_ledger)
     idle_sweeper_task = router.start_idle_sweeper()
 
@@ -170,6 +182,19 @@ async def run() -> int:
     # keeps us alive until a signal arrives.
     await handler.connect_async()
     log.info("engram.ready")
+    await write_runtime_snapshot(
+        state_dir=config.paths.state_dir,
+        router=router,
+        cost_db=cost_ledger.db,
+    )
+    runtime_snapshot_task = asyncio.create_task(
+        _runtime_snapshot_loop(
+            state_dir=config.paths.state_dir,
+            router=router,
+            cost_db=cost_ledger.db,
+        ),
+        name="engram-runtime-snapshot",
+    )
 
     # Block until SIGTERM / SIGINT.
     await stop_event.wait()
@@ -183,8 +208,11 @@ async def run() -> int:
         log.warning("engram.shutdown_close_failed %s: %s", type(e).__name__, e)
     finally:
         idle_sweeper_task.cancel()
+        runtime_snapshot_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await idle_sweeper_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await runtime_snapshot_task
 
         try:
             await router.close_all_agent_clients()
@@ -196,6 +224,28 @@ async def run() -> int:
             )
     log.info("engram.shutdown_complete")
     return 0
+
+
+async def _runtime_snapshot_loop(
+    *,
+    state_dir,
+    router: Router,
+    cost_db,
+    interval_seconds: float = 15.0,
+) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await write_runtime_snapshot(
+                state_dir=state_dir,
+                router=router,
+                cost_db=cost_db,
+            )
+        except Exception:
+            logging.getLogger("engram.main").warning(
+                "engram.runtime_snapshot_failed",
+                exc_info=True,
+            )
 
 
 def main() -> None:
