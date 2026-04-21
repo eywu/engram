@@ -39,6 +39,11 @@ from engram.config import EngramConfig
 from engram.costs import CostDatabase, RateLimitRecord
 from engram.hooks import build_hooks
 from engram.mcp import resolve_team_mcp_servers, warn_missing_mcp_servers
+from engram.mcp_tools import (
+    MEMORY_SEARCH_FULL_TOOL_NAME,
+    MEMORY_SEARCH_SERVER_NAME,
+    make_memory_search_server,
+)
 from engram.memory_hooks import make_memory_hooks
 from engram.router import Router, SessionState
 from engram.scope import build_scope_decision, build_tool_guard
@@ -479,8 +484,19 @@ class Agent:
                     logger=log,
                 )
                 extra_args["strict-mcp-config"] = None
-                if not mcp_servers:
-                    extra_args["mcp-config"] = json.dumps({"mcpServers": {}})
+            else:
+                mcp_servers[MEMORY_SEARCH_SERVER_NAME] = make_memory_search_server(
+                    session.channel_id
+                )
+
+            if (
+                MEMORY_SEARCH_SERVER_NAME in mcp_servers
+                and MEMORY_SEARCH_FULL_TOOL_NAME not in allowed_tools
+            ):
+                allowed_tools.append(MEMORY_SEARCH_FULL_TOOL_NAME)
+
+            if strict_mcp_config and not mcp_servers:
+                extra_args["mcp-config"] = json.dumps({"mcpServers": {}})
 
         session_kwargs = (
             {"resume": session.session_id}

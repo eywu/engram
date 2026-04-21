@@ -108,8 +108,8 @@ def test_provision_task_assistant_defaults_pending(tmp_path: Path):
     assert "Bash" in m.tools.disallowed
     assert "Write" in m.tools.disallowed
     assert "Edit" in m.tools.disallowed
-    # Team channels start strict with zero MCPs until explicitly allowed.
-    assert m.mcp_servers.allowed == []
+    # Team channels start strict; Engram's own memory recall is allowed by default.
+    assert m.mcp_servers.allowed == ["engram-memory"]
     assert m.skills.is_unrestricted()
 
 
