@@ -155,6 +155,7 @@ async def run() -> int:
         budget=budget,
         owner_alert=_owner_alert,
         cost_db=cost_ledger.db,
+        router=router,
     )
     register_listeners(app, config, router, agent, cost_ledger=cost_ledger)
     idle_sweeper_task = router.start_idle_sweeper()

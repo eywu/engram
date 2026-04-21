@@ -14,6 +14,7 @@ from typing import Any
 import structlog
 
 _CONFIGURED = False
+logger = logging.getLogger("engram.telemetry")
 
 
 class DailyJSONLogHandler(logging.Handler):

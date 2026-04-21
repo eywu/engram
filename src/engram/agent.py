@@ -26,6 +26,7 @@ from claude_agent_sdk import (
     CLIConnectionError,
     CLIJSONDecodeError,
     CLINotFoundError,
+    HookMatcher,
     ProcessError,
     RateLimitEvent,
     RateLimitStatus,
@@ -38,7 +39,8 @@ from engram.config import EngramConfig
 from engram.costs import CostDatabase, RateLimitRecord
 from engram.hooks import build_hooks
 from engram.mcp import resolve_team_mcp_servers, warn_missing_mcp_servers
-from engram.router import SessionState
+from engram.memory_hooks import make_memory_hooks
+from engram.router import Router, SessionState
 from engram.scope import build_scope_decision, build_tool_guard
 from engram.telemetry import cli_stderr_logger
 
@@ -80,6 +82,7 @@ class Agent:
         budget: Budget | None = None,
         owner_alert: OwnerAlert | None = None,
         cost_db: CostDatabase | None = None,
+        router: Router | None = None,
         retry_base_delay_seconds: float = 0.5,
     ):
         self._config = config
@@ -87,6 +90,7 @@ class Agent:
         self._budget = budget
         self._owner_alert = owner_alert
         self._cost_db = cost_db
+        self._router = router
         self._retry_base_delay_seconds = retry_base_delay_seconds
 
     async def run_turn(
@@ -502,13 +506,23 @@ class Agent:
             # Scope (runtime — final enforcement)
             can_use_tool=can_use_tool,
             max_budget_usd=self._max_budget_usd_for_options(),
-            hooks=build_hooks(channel_id=session.channel_id, cost_db=self._cost_db),
+            hooks=self._build_hooks(session),
             stderr=cli_stderr_logger(session.channel_id),
         )
         # SDK 0.1.x exposes --strict-mcp-config through extra_args. Keep a
         # plain attribute so diagnostics and tests can inspect the policy.
         options.strict_mcp_config = strict_mcp_config
         return options
+
+    def _build_hooks(self, session: SessionState) -> dict[str, list[HookMatcher]]:
+        hooks = build_hooks(channel_id=session.channel_id, cost_db=self._cost_db)
+        if self._router is None:
+            return hooks
+
+        stop_hook, precompact_hook = make_memory_hooks(self._router)
+        hooks.setdefault("Stop", []).append(stop_hook)
+        hooks.setdefault("PreCompact", []).append(precompact_hook)
+        return hooks
 
     def _check_budget(self, channel_id: str) -> CheckResult | None:
         if self._budget is None:
