@@ -146,6 +146,8 @@ def build_tool_guard(manifest: ChannelManifest) -> CanUseToolFn:
         _input: dict[str, Any],
         _ctx: ToolPermissionContext,
     ) -> PermissionResultAllow | PermissionResultDeny:
+        if manifest.is_owner_dm() and tool_name == "mcp__engram__memory_search":
+            return PermissionResultAllow()
         deny = _check_tool(tool_name, tools) or _check_mcp(tool_name, mcp)
         if deny:
             log.info(
@@ -204,6 +206,8 @@ def _check_mcp(tool_name: str, mcp: ScopeList) -> str | None:
     server = parts[1]
     if server in mcp.disallowed:
         return f"MCP server '{server}' disallowed by channel manifest"
+    if tool_name == "mcp__engram__memory_search":
+        return None
     if mcp.allowed is not None and server not in mcp.allowed:
         return (
             f"MCP server '{server}' not in channel manifest's allowed list"

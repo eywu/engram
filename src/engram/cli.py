@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import json as jsonlib
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +16,7 @@ from engram import __version__
 from engram.cli_channels import app as channels_app
 from engram.config import DEFAULT_CONFIG_PATH, EngramConfig
 from engram.costs import CostLedger
+from engram.tools import registered_tool_names
 
 app = typer.Typer(
     name="engram",
@@ -38,8 +39,18 @@ def version() -> None:
 
 
 @app.command()
-def status() -> None:
+def status(
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Print machine-readable status JSON.",
+    )
+) -> None:
     """Show runtime + config status and MCP inventory."""
+    if json_output:
+        typer.echo(jsonlib.dumps(_status_payload(), indent=2, sort_keys=True))
+        return
+
     rprint(f"[bold]Engram[/bold] version {__version__}")
     rprint()
 
@@ -178,20 +189,20 @@ def _discover_mcps() -> dict[str, str]:
     mcp_json = Path.home() / ".claude" / "mcp.json"
     if mcp_json.exists():
         try:
-            data = json.loads(mcp_json.read_text())
+            data = jsonlib.loads(mcp_json.read_text())
             for name in (data.get("mcpServers") or {}):
                 found[name] = "~/.claude/mcp.json"
-        except json.JSONDecodeError:
+        except jsonlib.JSONDecodeError:
             pass
 
     # Secondary: ~/.claude.json top-level user config
     claude_json = Path.home() / ".claude.json"
     if claude_json.exists():
         try:
-            data = json.loads(claude_json.read_text())
+            data = jsonlib.loads(claude_json.read_text())
             for name in (data.get("mcpServers") or {}):
                 found.setdefault(name, "~/.claude.json")
-        except json.JSONDecodeError:
+        except jsonlib.JSONDecodeError:
             pass
 
     # Tertiary: `claude mcp list` if available.
@@ -223,6 +234,39 @@ def _bridge_pid() -> int | None:
         return int(out.splitlines()[0])
     except (ValueError, IndexError):
         return None
+
+
+def _status_payload() -> dict:
+    """Machine-readable status used by `engram status --json`."""
+    try:
+        cfg = EngramConfig.load()
+    except RuntimeError as e:
+        cfg = None
+        config_error = str(e)
+    else:
+        config_error = None
+
+    payload = {
+        "version": __version__,
+        "config": {
+            "ok": cfg is not None,
+            "path": str(DEFAULT_CONFIG_PATH),
+        },
+        "tools": {
+            "registered": registered_tool_names(),
+        },
+    }
+    if config_error:
+        payload["config"]["error"] = config_error
+    if cfg is not None:
+        payload["config"].update(
+            {
+                "model": cfg.anthropic.model,
+                "state_dir": str(cfg.paths.state_dir),
+                "allowed_channels": list(cfg.allowed_channels),
+            }
+        )
+    return payload
 
 
 if __name__ == "__main__":

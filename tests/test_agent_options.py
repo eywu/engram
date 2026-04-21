@@ -19,6 +19,7 @@ from engram.manifest import (
     ScopeList,
 )
 from engram.router import SessionState
+from engram.tools import ENGRAM_MCP_SERVER_NAME, MEMORY_SEARCH_CANONICAL_NAME
 
 
 def _cfg() -> EngramConfig:
@@ -46,8 +47,9 @@ def test_legacy_mode_uses_user_setting_source():
     opts = a._build_options(_session(None))
     assert opts.setting_sources == ["user"]
     assert opts.max_turns == 8
-    assert opts.allowed_tools == []
+    assert opts.allowed_tools == [MEMORY_SEARCH_CANONICAL_NAME]
     assert opts.disallowed_tools == []
+    assert ENGRAM_MCP_SERVER_NAME in opts.mcp_servers
     assert opts.can_use_tool is None
 
 
@@ -65,7 +67,8 @@ def test_owner_dm_manifest_full_inheritance():
     opts = a._build_options(_session(m))
     assert opts.setting_sources == ["user"]
     assert opts.disallowed_tools == []
-    assert opts.allowed_tools == []
+    assert opts.allowed_tools == [MEMORY_SEARCH_CANONICAL_NAME]
+    assert ENGRAM_MCP_SERVER_NAME in opts.mcp_servers
     # Runtime guard is always wired when a manifest is present — even
     # for full-inheritance. It's a no-op in that case.
     assert opts.can_use_tool is not None
@@ -100,8 +103,21 @@ def test_team_channel_escape_hatch_allow_list():
     )
     a = Agent(_cfg())
     opts = a._build_options(_session(m))
-    assert opts.allowed_tools == ["Read", "Grep"]
+    assert opts.allowed_tools == ["Read", "Grep", MEMORY_SEARCH_CANONICAL_NAME]
     assert opts.disallowed_tools == []
+
+
+def test_memory_search_can_be_denied_by_mcp_manifest():
+    m = ChannelManifest(
+        channel_id="C07LOCKED",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        status=ChannelStatus.ACTIVE,
+        mcp_servers=ScopeList(disallowed=[ENGRAM_MCP_SERVER_NAME]),
+    )
+    a = Agent(_cfg())
+    opts = a._build_options(_session(m))
+    assert MEMORY_SEARCH_CANONICAL_NAME not in opts.allowed_tools
+    assert ENGRAM_MCP_SERVER_NAME not in opts.mcp_servers
 
 
 # ── Behavior overrides ─────────────────────────────────────────────────

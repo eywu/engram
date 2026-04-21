@@ -23,7 +23,9 @@ from claude_agent_sdk import (
     tag_session,
 )
 
+from engram import tools as engram_tools
 from engram.config import EngramConfig
+from engram.manifest import ChannelManifest
 from engram.router import SessionState
 from engram.scope import build_scope_decision, build_tool_guard
 
@@ -214,6 +216,7 @@ class Agent:
         allowed_tools: list[str] = []
         disallowed_tools: list[str] = []
         skills: list[str] | str | None = "all"
+        mcp_servers = {}
         can_use_tool = None
 
         if manifest is not None:
@@ -237,6 +240,15 @@ class Agent:
             # can't always enumerate).
             can_use_tool = build_tool_guard(manifest)
 
+        if _memory_search_allowed(manifest):
+            mcp_servers[engram_tools.ENGRAM_MCP_SERVER_NAME] = (
+                engram_tools.create_sdk_mcp_server(
+                    channel_id=session.channel_id,
+                )
+            )
+            if engram_tools.MEMORY_SEARCH_CANONICAL_NAME not in allowed_tools:
+                allowed_tools.append(engram_tools.MEMORY_SEARCH_CANONICAL_NAME)
+
         session_kwargs = (
             {"resume": session.session_id}
             if resume
@@ -255,7 +267,15 @@ class Agent:
             # Scope (static — helps SDK skip priming denied entries)
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
+            mcp_servers=mcp_servers,
             skills=skills,
             # Scope (runtime — final enforcement)
             can_use_tool=can_use_tool,
         )
+
+
+def _memory_search_allowed(manifest: ChannelManifest | None) -> bool:
+    """Memory search is available unless a non-owner channel denies Engram."""
+    if manifest is None or manifest.is_owner_dm():
+        return True
+    return engram_tools.ENGRAM_MCP_SERVER_NAME not in manifest.mcp_servers.disallowed

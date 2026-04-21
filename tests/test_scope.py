@@ -163,6 +163,17 @@ async def test_guard_denies_mcp_not_in_allowed_list():
 
 
 @pytest.mark.asyncio
+async def test_guard_allows_memory_search_unless_explicitly_denied():
+    guard = build_tool_guard(_manifest(mcp=ScopeList(allowed=["linear"])))
+    r = await _ask(guard, "mcp__engram__memory_search", {})
+    assert isinstance(r, PermissionResultAllow)
+
+    guard = build_tool_guard(_manifest(mcp=ScopeList(disallowed=["engram"])))
+    r = await _ask(guard, "mcp__engram__memory_search", {})
+    assert isinstance(r, PermissionResultDeny)
+
+
+@pytest.mark.asyncio
 async def test_guard_allows_mcp_in_allowed_list():
     guard = build_tool_guard(
         _manifest(mcp=ScopeList(allowed=["linear"]))
