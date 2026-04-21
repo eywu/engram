@@ -19,6 +19,7 @@ for M3/M4 to consume without revisiting the schema.
 """
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -145,6 +146,85 @@ class AskUserQuestion(BaseModel):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Permission rules (native Claude Code `Tool(specifier)` syntax)
+# ──────────────────────────────────────────────────────────────────────────
+
+# A permission rule is either a bare tool name ("Bash", "Read") or a
+# tool with a specifier ("Read(~/.ssh/**)", "Bash(git commit*)").
+# We validate shape at load time to catch typos early (e.g. missing paren)
+# rather than silently forwarding garbage to the CLI.
+#
+# Note: we do NOT evaluate the glob ourselves. That's the CLI's job, and
+# doing it twice would risk semantic drift. We just sanity-check syntax.
+_RULE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\([^)]*\))?$")
+
+
+def _validate_rule(rule: str) -> str:
+    rule = rule.strip()
+    if not rule:
+        raise ValueError("permission rule cannot be empty")
+    if not _RULE_RE.match(rule):
+        raise ValueError(
+            f"invalid permission rule {rule!r}: expected "
+            f"'ToolName' or 'ToolName(specifier)' "
+            f"(e.g. 'Bash', 'Read(~/.ssh/**)', 'Bash(git status*)')"
+        )
+    # Commas inside rules would break the SDK's comma-joined CLI flag.
+    # Real file paths and common bash patterns don't contain commas, so
+    # this is a safe guardrail.
+    if "," in rule:
+        raise ValueError(
+            f"invalid permission rule {rule!r}: commas are not "
+            f"supported (the SDK comma-joins rules into a single CLI flag)"
+        )
+    return rule
+
+
+class PermissionsRules(BaseModel):
+    """Native Claude Code permission rules, flowed into SDK options.
+
+    Uses the same `Tool(specifier)` syntax as Claude Code's
+    `~/.claude/settings.json` — operators can copy-paste rules directly.
+
+    Evaluation order (enforced by the CLI, not us): deny → allow.
+    Deny always wins. We intentionally do NOT expose `ask` — Slack has
+    no interactive prompt surface, so asking would just stall.
+
+    Globs: `*` = single level, `**` = recursive. Path prefixes:
+    - `./rel` or `rel`   → relative to cwd
+    - `/rel`              → relative to project root
+    - `~/path`            → operator's home
+    - `//abs/path`        → absolute (note the double slash)
+
+    Examples:
+        deny:  ["Read(~/.ssh/**)", "Read(**/.env*)", "Bash(curl *)"]
+        allow: ["Edit(./src/**)", "Bash(npm *)"]
+    """
+
+    deny: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Rules that block matching tool calls. Always wins over allow."
+        ),
+    )
+    allow: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Rules that auto-approve matching tool calls. Optional; when "
+            "empty, the default permission mode applies."
+        ),
+    )
+
+    @field_validator("deny", "allow")
+    @classmethod
+    def _validate_rules(cls, rules: list[str]) -> list[str]:
+        return [_validate_rule(r) for r in rules]
+
+    def is_empty(self) -> bool:
+        return not self.deny and not self.allow
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Top-level manifest
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -178,6 +258,14 @@ class ChannelManifest(BaseModel):
     tools: ScopeList = Field(default_factory=ScopeList)
     mcp_servers: ScopeList = Field(default_factory=ScopeList)
     skills: ScopeList = Field(default_factory=ScopeList)
+    permissions: PermissionsRules = Field(
+        default_factory=PermissionsRules,
+        description=(
+            "Native Claude Code permission rules (Tool(specifier) syntax). "
+            "Deny rules always win; allow rules auto-approve. Passed through "
+            "to SDK's allowed_tools/disallowed_tools."
+        ),
+    )
 
     # ── Behavior, budget, ask-user (stored, not enforced in M2) ──
     behavior: Behavior = Field(default_factory=Behavior)

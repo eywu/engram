@@ -19,6 +19,17 @@ tools: {}
 mcp_servers: {}
 skills: {}
 
+# Permission rules (native Claude Code `Tool(specifier)` syntax).
+# Even on your own machine, a small deny list protects against accidental
+# secret exfiltration if Claude decides to grep for config files.
+# These are suggestions — edit freely to match your layout.
+permissions:
+  deny:
+    - "Read(~/.ssh/**)"
+    - "Read(~/.aws/**)"
+    - "Read(~/.gnupg/**)"
+    - "Read(**/.env*)"
+
 behavior:
   style: balanced
   permission_mode: default

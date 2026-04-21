@@ -37,6 +37,35 @@ mcp_servers: {}
 # Skills: inherit all by default. Exclude per-channel as needed.
 skills: {}
 
+# Permission rules (native Claude Code `Tool(specifier)` syntax).
+# Aggressive deny list for shared channels — a coworker could innocently
+# ask the bot to read a config file that contains secrets, and Slack would
+# broadcast the answer to the whole channel. This list blocks the most
+# common leak paths. Add more entries as your environment demands.
+permissions:
+  deny:
+    # Personal credentials
+    - "Read(~/.ssh/**)"
+    - "Read(~/.aws/**)"
+    - "Read(~/.gnupg/**)"
+    - "Read(~/.config/**)"
+    # Environment / dotenv files anywhere
+    - "Read(**/.env*)"
+    # Common secret directories
+    - "Read(~/code/_secret/**)"
+    # Shell history / keychain-like files
+    - "Read(~/.zsh_history)"
+    - "Read(~/.bash_history)"
+    - "Read(~/Library/Keychains/**)"
+    # Same patterns for Grep / Glob — searching inside secrets is as bad
+    # as reading them directly.
+    - "Grep(~/.ssh/**)"
+    - "Grep(~/.aws/**)"
+    - "Grep(**/.env*)"
+    - "Glob(~/.ssh/**)"
+    - "Glob(~/.aws/**)"
+    - "Glob(**/.env*)"
+
 behavior:
   style: concise
   permission_mode: default
