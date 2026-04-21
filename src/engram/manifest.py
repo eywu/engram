@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
+from claude_agent_sdk import PermissionMode, SettingSource
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -102,7 +103,7 @@ class Behavior(BaseModel):
         description="Override config.max_turns_per_message for this channel.",
     )
     style: Literal["concise", "balanced", "thorough"] = "balanced"
-    permission_mode: Literal["default", "plan", "acceptEdits"] = "default"
+    permission_mode: PermissionMode = "default"
 
     @field_validator("max_turns")
     @classmethod
@@ -247,7 +248,7 @@ class ChannelManifest(BaseModel):
     status: ChannelStatus = ChannelStatus.PENDING
 
     # ── Scope (exclusion-first; M2-enforced) ─────────────────────
-    setting_sources: list[Literal["user", "project", "local"]] = Field(
+    setting_sources: list[SettingSource] = Field(
         default_factory=lambda: ["project"],
         description=(
             "Which settings layers Claude SDK loads. Owner-DM uses "

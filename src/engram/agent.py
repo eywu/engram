@@ -9,10 +9,12 @@ M4 will add AskUserQuestion stream-watching.
 """
 from __future__ import annotations
 
+import asyncio
+import datetime
 import inspect
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -20,14 +22,23 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    CLIConnectionError,
+    CLIJSONDecodeError,
+    CLINotFoundError,
+    ProcessError,
+    RateLimitEvent,
+    RateLimitStatus,
     ResultMessage,
     tag_session,
 )
 
 from engram.budget import BUDGET_PAUSE_MESSAGE, Budget, CheckResult
 from engram.config import EngramConfig
+from engram.costs import CostDatabase, RateLimitRecord
+from engram.hooks import build_hooks
 from engram.router import SessionState
 from engram.scope import build_scope_decision, build_tool_guard
+from engram.telemetry import cli_stderr_logger
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +59,7 @@ class AgentTurn:
 
 
 ClientFactory = Callable[[ClaudeAgentOptions], ClaudeSDKClient]
+OwnerAlert = Callable[[str], Awaitable[None] | None]
 
 
 class Agent:
@@ -64,10 +76,16 @@ class Agent:
         *,
         client_factory: ClientFactory = ClaudeSDKClient,
         budget: Budget | None = None,
+        owner_alert: OwnerAlert | None = None,
+        cost_db: CostDatabase | None = None,
+        retry_base_delay_seconds: float = 0.5,
     ):
         self._config = config
         self._client_factory = client_factory
         self._budget = budget
+        self._owner_alert = owner_alert
+        self._cost_db = cost_db
+        self._retry_base_delay_seconds = retry_base_delay_seconds
 
     async def run_turn(
         self,
@@ -84,7 +102,22 @@ class Agent:
 
         await session.agent_lock.acquire()
         try:
-            session.turn_count += 1
+            if self._is_rate_limited(session):
+                reset = _format_reset_at(session.rate_limit_reset_at)
+                log.info(
+                    "agent.rate_limit_skip session=%s status=%s reset_at=%s",
+                    session.label(),
+                    session.rate_limit_status,
+                    session.rate_limit_reset_at,
+                )
+                return AgentTurn(
+                    text=f"Claude rate limit is active for this channel until {reset}.",
+                    cost_usd=None,
+                    duration_ms=None,
+                    num_turns=None,
+                    is_error=False,
+                )
+
             budget_check = self._check_budget(session.channel_id)
             if budget_check is not None:
                 budget_checks.append(budget_check)
@@ -100,18 +133,45 @@ class Agent:
                         budget_monthly_cap_usd=budget_check.monthly_cap_usd,
                     )
 
-            client = await self._ensure_client(session)
-            self._refresh_client_budget_limit(client)
-
-            await client.query(user_text, session_id=session.session_id)
-            async for message in client.receive_response():
-                if isinstance(message, AssistantMessage):
-                    for block in getattr(message, "content", []) or []:
-                        text = getattr(block, "text", None)
-                        if text:
-                            text_chunks.append(text)
-                elif isinstance(message, ResultMessage):
-                    result = message
+            session.turn_count += 1
+            attempt = 0
+            while True:
+                try:
+                    text_chunks, result = await self._run_sdk_turn_once(
+                        session,
+                        user_text,
+                    )
+                    break
+                except (CLINotFoundError, CLIConnectionError) as e:
+                    error_message = f"{type(e).__name__}: {e}"
+                    log.error(
+                        "agent.cli_error session=%s error_class=%s",
+                        session.label(),
+                        type(e).__name__,
+                        exc_info=True,
+                    )
+                    await self._drop_client(session)
+                    await self._alert_owner(
+                        f"Engram bridge SDK error in {session.label()}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    break
+                except (ProcessError, CLIJSONDecodeError) as e:
+                    log.error(
+                        "agent.retryable_cli_error session=%s error_class=%s attempt=%d",
+                        session.label(),
+                        type(e).__name__,
+                        attempt + 1,
+                        exc_info=True,
+                    )
+                    if attempt >= 1:
+                        error_message = f"{type(e).__name__}: {e}"
+                        break
+                    attempt += 1
+                    await self._drop_client(session)
+                    await asyncio.sleep(
+                        self._retry_base_delay_seconds * (2 ** (attempt - 1))
+                    )
             if result is not None and self._budget is not None:
                 try:
                     self._budget.record(session.channel_id, user_id, result)
@@ -124,7 +184,8 @@ class Agent:
                     )
             if not session.agent_session_tagged:
                 session.agent_session_tagged = await self._tag_session(
-                    session, client
+                    session,
+                    session.agent_client,
                 )
         except Exception as e:
             error_message = f"{type(e).__name__}: {e}"
@@ -158,6 +219,29 @@ class Agent:
             budget_month_to_date_usd=budget_mtd,
             budget_monthly_cap_usd=budget_cap,
         )
+
+    async def _run_sdk_turn_once(
+        self,
+        session: SessionState,
+        user_text: str,
+    ) -> tuple[list[str], ResultMessage | None]:
+        """Run one SDK attempt. Caller must hold session.agent_lock."""
+        text_chunks: list[str] = []
+        result: ResultMessage | None = None
+        client = await self._ensure_client(session)
+
+        await client.query(user_text, session_id=session.session_id)
+        async for message in client.receive_response():
+            if isinstance(message, AssistantMessage):
+                for block in getattr(message, "content", []) or []:
+                    text = getattr(block, "text", None)
+                    if text:
+                        text_chunks.append(text)
+            elif isinstance(message, ResultMessage):
+                result = message
+            elif isinstance(message, RateLimitEvent):
+                await self._handle_rate_limit_event(session, message)
+        return text_chunks, result
 
     # ──────────────────────────────────────────────────────────────
     # Option construction
@@ -196,12 +280,28 @@ class Agent:
         log.info("agent.client_connected session=%s", session.label())
         return client
 
+    async def _drop_client(self, session: SessionState) -> None:
+        if session.agent_client is None:
+            return
+        try:
+            await session.agent_client.disconnect()
+        except Exception:
+            log.debug(
+                "agent.client_disconnect_before_retry_failed session=%s",
+                session.label(),
+                exc_info=True,
+            )
+        finally:
+            session.agent_client = None
+
     async def _tag_session(
         self,
         session: SessionState,
-        client: ClaudeSDKClient,
+        client: ClaudeSDKClient | None,
     ) -> bool:
         """Tag the Claude session with the Slack channel id when possible."""
+        if client is None:
+            return False
         method = getattr(client, "tag_session", None)
         if method is not None:
             try:
@@ -244,6 +344,81 @@ class Agent:
             )
             return False
         return True
+
+    async def _handle_rate_limit_event(
+        self,
+        session: SessionState,
+        event: RateLimitEvent,
+    ) -> None:
+        info = event.rate_limit_info
+        status: RateLimitStatus = info.status
+        session.rate_limit_status = status
+        session.rate_limit_reset_at = info.resets_at
+        session.rate_limit_updated_at = datetime.datetime.now(
+            datetime.UTC
+        ).isoformat()
+
+        if self._cost_db is not None:
+            self._cost_db.record_rate_limit(
+                RateLimitRecord(
+                    timestamp=session.rate_limit_updated_at,
+                    channel_id=session.channel_id,
+                    session_id=session.session_id,
+                    status=status,
+                    reset_at=info.resets_at,
+                    rate_limit_type=info.rate_limit_type,
+                    utilization=info.utilization,
+                    raw=info.raw,
+                )
+            )
+
+        reset = _format_reset_at(info.resets_at)
+        if status == "allowed_warning":
+            log.warning(
+                "agent.rate_limit_warning session=%s reset_at=%s",
+                session.label(),
+                info.resets_at,
+            )
+            await self._alert_owner(f"Rate limit warning, resets at {reset}")
+        elif status == "rejected":
+            log.error(
+                "agent.rate_limit_rejected session=%s reset_at=%s",
+                session.label(),
+                info.resets_at,
+            )
+            await self._alert_owner(
+                f"Rate limit rejected for {session.label()}, resets at {reset}"
+            )
+
+    def _is_rate_limited(self, session: SessionState) -> bool:
+        if session.rate_limit_status != "rejected" and self._cost_db is not None:
+            latest = self._cost_db.latest_rate_limit(session.channel_id)
+            reset_at = latest.get("reset_at")
+            if latest.get("status") == "rejected" and (
+                reset_at is None or time.time() < int(reset_at)
+            ):
+                session.rate_limit_status = "rejected"
+                session.rate_limit_reset_at = int(reset_at) if reset_at else None
+                session.rate_limit_updated_at = latest.get("ts")
+        if session.rate_limit_status != "rejected":
+            return False
+        if session.rate_limit_reset_at is None:
+            return True
+        if time.time() < session.rate_limit_reset_at:
+            return True
+        session.rate_limit_status = "allowed"
+        session.rate_limit_reset_at = None
+        session.rate_limit_updated_at = datetime.datetime.now(
+            datetime.UTC
+        ).isoformat()
+        return False
+
+    async def _alert_owner(self, message: str) -> None:
+        if self._owner_alert is None:
+            return
+        maybe_awaitable = self._owner_alert(message)
+        if inspect.isawaitable(maybe_awaitable):
+            await maybe_awaitable
 
     def _build_options(
         self,
@@ -306,6 +481,8 @@ class Agent:
             # Scope (runtime — final enforcement)
             can_use_tool=can_use_tool,
             max_budget_usd=self._max_budget_usd_for_options(),
+            hooks=build_hooks(channel_id=session.channel_id, cost_db=self._cost_db),
+            stderr=cli_stderr_logger(session.channel_id),
         )
 
     def _check_budget(self, channel_id: str) -> CheckResult | None:
@@ -334,6 +511,15 @@ class Agent:
         if options is None:
             return
         options.max_budget_usd = self._max_budget_usd_for_options()
+
+
+def _format_reset_at(reset_at: int | None) -> str:
+    if reset_at is None:
+        return "an unknown reset time"
+    return datetime.datetime.fromtimestamp(
+        reset_at,
+        tz=datetime.UTC,
+    ).isoformat()
 
 
 def _summarize_budget_checks(

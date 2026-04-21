@@ -65,6 +65,9 @@ class SessionState:
     agent_last_active_at: float = field(default_factory=time.monotonic)
     turn_count: int = 0
     manifest: ChannelManifest | None = None
+    rate_limit_status: str = "allowed"
+    rate_limit_reset_at: int | None = None
+    rate_limit_updated_at: str | None = None
 
     def __post_init__(self) -> None:
         if not self.session_id:
@@ -87,6 +90,13 @@ class SessionState:
         if self.manifest is None:
             return True
         return self.manifest.status == ChannelStatus.ACTIVE
+
+    def rate_limit_state(self) -> dict[str, object]:
+        return {
+            "status": self.rate_limit_status,
+            "reset_at": self.rate_limit_reset_at,
+            "updated_at": self.rate_limit_updated_at,
+        }
 
 
 class Router:
