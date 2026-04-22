@@ -512,6 +512,7 @@ class Agent:
                 mcp_servers[MEMORY_SEARCH_SERVER_NAME] = make_memory_search_server(
                     session.channel_id,
                     embedder=self._embedder,
+                    excluded_channels=manifest.memory.excluded_channels,
                 )
 
             if (

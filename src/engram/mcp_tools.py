@@ -108,9 +108,18 @@ def make_memory_search_server(
     caller_channel_id: str,
     memory_db_path: Path | None = None,
     embedder: Any | None = None,
+    *,
+    excluded_channels: list[str] | None = None,
 ) -> McpSdkServerConfig:
-    """Return a per-channel SDK MCP server exposing Engram memory search tools."""
+    """Return a per-channel SDK MCP server exposing Engram memory search tools.
+
+    ``excluded_channels`` is a deny-list applied to every search scope. When
+    present, rows from those Slack channel IDs are omitted from
+    ``scope='all_channels'`` and also from ``scope='this_channel'`` if the
+    caller channel itself is excluded.
+    """
     active_embedder = embedder or _DisabledEmbedder()
+    excluded_channel_ids = _normalize_channel_ids(excluded_channels)
 
     @tool(
         name=MEMORY_SEARCH_TOOL_NAME,
@@ -142,6 +151,7 @@ def make_memory_search_server(
                             query=query,
                             scope=scope,  # type: ignore[arg-type]
                             channel_id=effective_channel,
+                            excluded_channels=excluded_channel_ids,
                             kind="both",
                             limit=limit,
                         )
@@ -152,6 +162,7 @@ def make_memory_search_server(
                         query_vec=query_vec,
                         scope=scope,
                         channel_id=effective_channel,
+                        excluded_channels=excluded_channel_ids,
                         limit=limit,
                     )
             else:
@@ -161,6 +172,7 @@ def make_memory_search_server(
                         query=query,
                         scope=scope,  # type: ignore[arg-type]
                         channel_id=effective_channel,
+                        excluded_channels=excluded_channel_ids,
                         kind=kind,  # type: ignore[arg-type]
                         limit=limit,
                     )
@@ -190,6 +202,7 @@ def make_memory_search_server(
                 "scope": scope,
                 "kind": kind,
                 "limit": limit,
+                "excluded_channel_count": len(excluded_channel_ids),
                 "result_count": len(normalized_rows),
                 "empty_result": not normalized_rows,
                 "latency_ms": int((time.monotonic() - started_at) * 1000),
@@ -228,6 +241,7 @@ def make_memory_search_server(
                     query_vec=query_vec,
                     scope=scope,
                     channel_id=caller_channel_id if scope == "this_channel" else None,
+                    excluded_channels=excluded_channel_ids,
                     limit=limit,
                 )
             except Exception as exc:
@@ -253,6 +267,7 @@ def make_memory_search_server(
                 "query_len": len(query),
                 "scope": scope,
                 "limit": limit,
+                "excluded_channel_count": len(excluded_channel_ids),
                 "result_count": len(normalized_rows),
                 "empty_result": not normalized_rows,
                 "latency_ms": int((time.monotonic() - started_at) * 1000),
@@ -308,6 +323,21 @@ def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _normalize_channel_ids(channel_ids: list[str] | None) -> list[str]:
+    if not channel_ids:
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in channel_ids:
+        channel_id = str(raw).strip()
+        if not channel_id or channel_id in seen:
+            continue
+        normalized.append(channel_id)
+        seen.add(channel_id)
+    return normalized
+
+
 async def _embed_query(embedder: Any, query: str) -> tuple[bytes | None, int | None]:
     started_at = time.monotonic()
     query_vec = await embedder.embed_one(query)
@@ -320,6 +350,7 @@ async def _run_semantic_search(
     query_vec: bytes,
     scope: str,
     channel_id: str | None,
+    excluded_channels: list[str],
     limit: int,
 ) -> list[dict[str, Any]]:
     def _run() -> list[dict[str, Any]]:
@@ -329,6 +360,7 @@ async def _run_semantic_search(
                 query_vec=query_vec,
                 scope=scope,  # type: ignore[arg-type]
                 channel_id=channel_id,
+                excluded_channels=excluded_channels,
                 kind="both",
                 limit=limit,
             )
@@ -343,6 +375,7 @@ async def _run_hybrid_search(
     query_vec: bytes,
     scope: str,
     channel_id: str | None,
+    excluded_channels: list[str],
     limit: int,
 ) -> list[dict[str, Any]]:
     def _run() -> list[dict[str, Any]]:
@@ -353,6 +386,7 @@ async def _run_hybrid_search(
                 query_vec=query_vec,
                 scope=scope,  # type: ignore[arg-type]
                 channel_id=channel_id,
+                excluded_channels=excluded_channels,
                 kind="both",
                 limit=limit,
             )

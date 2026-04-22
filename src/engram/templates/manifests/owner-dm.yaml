@@ -46,6 +46,11 @@ hitl:
   timeout_s: 300
   max_per_day: 5
 
+memory:
+  # Channel IDs listed here are hidden from memory_search in every scope.
+  # M5.6 will populate this for OQ31 opt-outs; empty is valid.
+  excluded_channels: []
+
 ask_user_question:
   enabled: true
   fallback: answer-as-self

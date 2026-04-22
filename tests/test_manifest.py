@@ -16,6 +16,7 @@ from engram.manifest import (
     CostBudget,
     IdentityTemplate,
     ManifestError,
+    MemoryScope,
     ScopeList,
     dump_manifest,
     load_manifest,
@@ -193,6 +194,18 @@ def test_subagents_default_empty():
     assert m.subagents == []
 
 
+def test_memory_scope_defaults_to_no_exclusions():
+    m = ChannelManifest(
+        channel_id="C07ABC", identity=IdentityTemplate.TASK_ASSISTANT
+    )
+    assert m.memory.excluded_channels == []
+
+
+def test_memory_scope_normalizes_excluded_channels():
+    scope = MemoryScope(excluded_channels=[" C07A ", "C07B", "C07A"])
+    assert scope.excluded_channels == ["C07A", "C07B"]
+
+
 # ── YAML I/O round-trip ─────────────────────────────────────────────────
 
 
@@ -228,6 +241,8 @@ tools:
   disallowed: [Bash, Write, Edit]
 mcp_servers:
   disallowed: [personal-notes]
+memory:
+  excluded_channels: [C07OPTEDOUT]
 behavior:
   style: concise
   max_turns: 6
@@ -239,6 +254,7 @@ cost_budget:
     m = load_manifest(p)
     assert m.tools.disallowed == ["Bash", "Write", "Edit"]
     assert m.mcp_servers.disallowed == ["personal-notes"]
+    assert m.memory.excluded_channels == ["C07OPTEDOUT"]
     assert m.behavior.style == "concise"
     assert m.behavior.max_turns == 6
     assert m.cost_budget.daily_usd == 5.0

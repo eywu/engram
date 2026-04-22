@@ -19,8 +19,10 @@ from engram.manifest import (
     ChannelManifest,
     ChannelStatus,
     IdentityTemplate,
+    MemoryScope,
     ScopeList,
 )
+from engram.mcp import resolve_team_mcp_servers
 from engram.mcp_tools import MEMORY_SEARCH_FULL_TOOL_NAMES
 from engram.router import Router, SessionState
 
@@ -210,6 +212,44 @@ def test_owner_dm_does_not_use_strict_mode():
     assert "strict-mcp-config" not in opts.extra_args
 
 
+def test_owner_dm_memory_exclusions_flow_to_mcp_server(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, object] = {}
+
+    def fake_make_memory_search_server(
+        caller_channel_id: str,
+        memory_db_path: Path | None = None,
+        embedder: object | None = None,
+        *,
+        excluded_channels: list[str] | None = None,
+    ) -> dict[str, object]:
+        captured["caller_channel_id"] = caller_channel_id
+        captured["memory_db_path"] = memory_db_path
+        captured["embedder"] = embedder
+        captured["excluded_channels"] = excluded_channels
+        return {"name": "engram-memory"}
+
+    monkeypatch.setattr(
+        "engram.agent.make_memory_search_server",
+        fake_make_memory_search_server,
+    )
+    manifest = ChannelManifest(
+        channel_id="D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        status=ChannelStatus.ACTIVE,
+        setting_sources=["user"],
+        memory=MemoryScope(excluded_channels=["C07DENIED"]),
+    )
+    a = Agent(_cfg())
+
+    opts = a._build_options(_session(manifest))
+
+    assert set(opts.mcp_servers) == {"engram-memory"}
+    assert captured["caller_channel_id"] == "C1"
+    assert captured["excluded_channels"] == ["C07DENIED"]
+
+
 def test_team_channel_memory_mcp_server_matches_manifest():
     m = ChannelManifest(
         channel_id="C07TEAM",
@@ -222,6 +262,48 @@ def test_team_channel_memory_mcp_server_matches_manifest():
     assert set(opts.mcp_servers) == {"engram-memory"}
     assert opts.allowed_tools == MEMORY_SEARCH_FULL_TOOL_NAMES
     assert "mcp-config" not in opts.extra_args
+
+
+def test_team_channel_memory_exclusions_flow_to_mcp_server(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, object] = {}
+
+    def fake_make_memory_search_server(
+        caller_channel_id: str,
+        memory_db_path: Path | None = None,
+        embedder: object | None = None,
+        *,
+        excluded_channels: list[str] | None = None,
+    ) -> dict[str, object]:
+        captured["caller_channel_id"] = caller_channel_id
+        captured["memory_db_path"] = memory_db_path
+        captured["embedder"] = embedder
+        captured["excluded_channels"] = excluded_channels
+        return {"name": "engram-memory"}
+
+    monkeypatch.setattr(
+        "engram.mcp.make_memory_search_server",
+        fake_make_memory_search_server,
+    )
+    manifest = ChannelManifest(
+        channel_id="C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        status=ChannelStatus.ACTIVE,
+        mcp_servers=ScopeList(allowed=["engram-memory"]),
+        memory=MemoryScope(excluded_channels=["C07DENIED"]),
+    )
+
+    servers, allowed, missing = resolve_team_mcp_servers(
+        manifest,
+        configured_servers={},
+    )
+
+    assert servers == {"engram-memory": {"name": "engram-memory"}}
+    assert allowed == ["engram-memory"]
+    assert missing == []
+    assert captured["caller_channel_id"] == "C07TEAM"
+    assert captured["excluded_channels"] == ["C07DENIED"]
 
 
 # ── Behavior overrides ─────────────────────────────────────────────────

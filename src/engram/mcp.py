@@ -74,6 +74,7 @@ def resolve_team_mcp_servers(
             servers[name] = make_memory_search_server(
                 manifest.channel_id,
                 embedder=embedder,
+                excluded_channels=manifest.memory.excluded_channels,
             )
             continue
         config = configured.get(name)

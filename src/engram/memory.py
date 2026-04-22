@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import date, datetime
@@ -227,16 +228,14 @@ def search_keyword(
     query: str,
     scope: Literal["this_channel", "all_channels"] = "this_channel",
     channel_id: str | None = None,
+    excluded_channels: Sequence[str] | None = None,
     kind: Literal["transcripts", "summaries", "both"] = "both",
     limit: int = 5,
 ) -> list[dict]:
     """Run an FTS5 keyword search over transcript and summary memory."""
     if not query:
         return []
-    if scope == "this_channel" and channel_id is None:
-        raise ValueError("channel_id is required when scope='this_channel'")
-    if scope not in {"this_channel", "all_channels"}:
-        raise ValueError("scope must be 'this_channel' or 'all_channels'")
+    _validate_search_scope(scope, channel_id)
     if kind not in {"transcripts", "summaries", "both"}:
         raise ValueError("kind must be 'transcripts', 'summaries', or 'both'")
 
@@ -246,9 +245,14 @@ def search_keyword(
 
     selects: list[str] = []
     params: list[object] = []
-    channel_filter = " AND {table}.channel_id = ?" if scope == "this_channel" else ""
 
     if kind in {"transcripts", "both"}:
+        channel_filter, channel_params = _channel_filter_sql(
+            "transcripts",
+            scope=scope,
+            channel_id=channel_id,
+            excluded_channels=excluded_channels,
+        )
         selects.append(
             f"""
             SELECT
@@ -260,14 +264,19 @@ def search_keyword(
                 NULL AS summary_id
             FROM transcripts_fts
             JOIN transcripts ON transcripts_fts.rowid = transcripts.id
-            WHERE transcripts_fts MATCH ?{channel_filter.format(table="transcripts")}
+            WHERE transcripts_fts MATCH ?{channel_filter}
             """
         )
         params.append(query)
-        if scope == "this_channel":
-            params.append(channel_id)
+        params.extend(channel_params)
 
     if kind in {"summaries", "both"}:
+        channel_filter, channel_params = _channel_filter_sql(
+            "summaries",
+            scope=scope,
+            channel_id=channel_id,
+            excluded_channels=excluded_channels,
+        )
         selects.append(
             f"""
             SELECT
@@ -279,12 +288,11 @@ def search_keyword(
                 summaries.id AS summary_id
             FROM summaries_fts
             JOIN summaries ON summaries_fts.rowid = summaries.id
-            WHERE summaries_fts MATCH ?{channel_filter.format(table="summaries")}
+            WHERE summaries_fts MATCH ?{channel_filter}
             """
         )
         params.append(query)
-        if scope == "this_channel":
-            params.append(channel_id)
+        params.extend(channel_params)
 
     sql = f"""
         SELECT kind, channel_id, ts, snippet, message_uuid, summary_id
@@ -320,6 +328,7 @@ def search_semantic(
     query_vec: bytes,
     scope: Literal["this_channel", "all_channels"] = "this_channel",
     channel_id: str | None = None,
+    excluded_channels: Sequence[str] | None = None,
     kind: Literal["transcripts", "summaries", "both"] = "both",
     limit: int = 5,
 ) -> list[dict]:
@@ -338,12 +347,15 @@ def search_semantic(
         return []
 
     candidates: list[tuple[float, dict]] = []
-    channel_filter = " AND channel_id = ?" if scope == "this_channel" else ""
+    channel_filter, channel_params = _channel_filter_sql(
+        None,
+        scope=scope,
+        channel_id=channel_id,
+        excluded_channels=excluded_channels,
+    )
 
     if kind in {"transcripts", "both"}:
-        params: list[object] = []
-        if scope == "this_channel":
-            params.append(channel_id)
+        params: list[object] = list(channel_params)
         for row in conn.execute(
             f"""
             SELECT channel_id, ts, text, message_uuid, embedding
@@ -370,9 +382,7 @@ def search_semantic(
             )
 
     if kind in {"summaries", "both"}:
-        params = []
-        if scope == "this_channel":
-            params.append(channel_id)
+        params = list(channel_params)
         for row in conn.execute(
             f"""
             SELECT channel_id, ts, summary_text, id, embedding
@@ -409,6 +419,7 @@ def search_hybrid(
     query_vec: bytes,
     scope: Literal["this_channel", "all_channels"] = "this_channel",
     channel_id: str | None = None,
+    excluded_channels: Sequence[str] | None = None,
     kind: Literal["transcripts", "summaries", "both"] = "both",
     limit: int = 5,
 ) -> list[dict]:
@@ -436,6 +447,7 @@ def search_hybrid(
                 query,
                 scope,
                 channel_id,
+                excluded_channels,
                 kind,
                 clamped_limit,
             )
@@ -445,6 +457,7 @@ def search_hybrid(
                 query_vec,
                 scope,
                 channel_id,
+                excluded_channels,
                 kind,
                 clamped_limit,
             )
@@ -456,6 +469,7 @@ def search_hybrid(
             query=query,
             scope=scope,
             channel_id=channel_id,
+            excluded_channels=excluded_channels,
             kind=kind,
             limit=clamped_limit,
         )
@@ -464,6 +478,7 @@ def search_hybrid(
             query_vec=query_vec,
             scope=scope,
             channel_id=channel_id,
+            excluded_channels=excluded_channels,
             kind=kind,
             limit=clamped_limit,
         )
@@ -513,6 +528,45 @@ def _validate_search_scope(scope: str, channel_id: str | None) -> None:
         raise ValueError("scope must be 'this_channel' or 'all_channels'")
 
 
+def _channel_filter_sql(
+    table: str | None,
+    *,
+    scope: str,
+    channel_id: str | None,
+    excluded_channels: Sequence[str] | None,
+) -> tuple[str, list[object]]:
+    column = f"{table}.channel_id" if table else "channel_id"
+    clauses: list[str] = []
+    params: list[object] = []
+
+    if scope == "this_channel":
+        clauses.append(f" AND {column} = ?")
+        params.append(channel_id)
+
+    exclusions = _normalize_channel_ids(excluded_channels)
+    if exclusions:
+        placeholders = ", ".join("?" for _ in exclusions)
+        clauses.append(f" AND {column} NOT IN ({placeholders})")
+        params.extend(exclusions)
+
+    return "".join(clauses), params
+
+
+def _normalize_channel_ids(channel_ids: Sequence[str] | None) -> list[str]:
+    if not channel_ids:
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in channel_ids:
+        channel_id = str(raw).strip()
+        if not channel_id or channel_id in seen:
+            continue
+        normalized.append(channel_id)
+        seen.add(channel_id)
+    return normalized
+
+
 def _vector_from_bytes(value: bytes) -> np.ndarray:
     if len(value) % np.dtype(np.float32).itemsize:
         return np.asarray([], dtype=np.float32)
@@ -553,6 +607,7 @@ def _search_keyword_from_path(
     query: str,
     scope: str,
     channel_id: str | None,
+    excluded_channels: Sequence[str] | None,
     kind: str,
     limit: int,
 ) -> list[dict]:
@@ -562,6 +617,7 @@ def _search_keyword_from_path(
             query=query,
             scope=scope,  # type: ignore[arg-type]
             channel_id=channel_id,
+            excluded_channels=excluded_channels,
             kind=kind,  # type: ignore[arg-type]
             limit=limit,
         )
@@ -572,6 +628,7 @@ def _search_semantic_from_path(
     query_vec: bytes,
     scope: str,
     channel_id: str | None,
+    excluded_channels: Sequence[str] | None,
     kind: str,
     limit: int,
 ) -> list[dict]:
@@ -581,6 +638,7 @@ def _search_semantic_from_path(
             query_vec=query_vec,
             scope=scope,  # type: ignore[arg-type]
             channel_id=channel_id,
+            excluded_channels=excluded_channels,
             kind=kind,  # type: ignore[arg-type]
             limit=limit,
         )

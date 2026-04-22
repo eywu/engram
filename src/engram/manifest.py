@@ -148,6 +148,32 @@ class AskUserQuestion(BaseModel):
     )
 
 
+class MemoryScope(BaseModel):
+    """Memory search visibility controls for this channel."""
+
+    excluded_channels: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Slack channel IDs that memory_search must never return, even "
+            "when the caller requests scope='all_channels'."
+        ),
+    )
+
+    @field_validator("excluded_channels")
+    @classmethod
+    def _normalize_excluded_channels(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in values:
+            channel_id = raw.strip()
+            if not channel_id:
+                raise ValueError("excluded channel IDs cannot be empty")
+            if channel_id not in seen:
+                normalized.append(channel_id)
+                seen.add(channel_id)
+        return normalized
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Permission rules (native Claude Code `Tool(specifier)` syntax)
 # ──────────────────────────────────────────────────────────────────────────
@@ -275,6 +301,7 @@ class ChannelManifest(BaseModel):
     cost_budget: CostBudget = Field(default_factory=CostBudget)
     ask_user_question: AskUserQuestion = Field(default_factory=AskUserQuestion)
     hitl: HITLConfig = Field(default_factory=HITLConfig)
+    memory: MemoryScope = Field(default_factory=MemoryScope)
 
     # ── Sub-agents (stored only — M-future) ──────────────────────
     subagents: list[str] = Field(

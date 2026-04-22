@@ -184,6 +184,44 @@ async def test_scope_all_channels_aggregates(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_excluded_channels_apply_to_every_scope(tmp_path: Path):
+    db_path = tmp_path / "memory.db"
+    excluded_channel = "C07DENIED"
+    _seed_transcript(
+        db_path,
+        channel_id=excluded_channel,
+        message_uuid="excluded-hit",
+        text="isolationtoken from excluded channel",
+    )
+    _seed_transcript(
+        db_path,
+        channel_id=CHANNEL_A,
+        message_uuid="allowed-hit",
+        text="isolationtoken from allowed channel",
+        ts=BASE_TS + timedelta(seconds=1),
+    )
+    server = make_memory_search_server(
+        excluded_channel,
+        db_path,
+        excluded_channels=[excluded_channel],
+    )
+
+    this_channel = await _call_memory_search(
+        server,
+        {"query": "isolationtoken", "scope": "this_channel"},
+    )
+    all_channels = await _call_memory_search(
+        server,
+        {"query": "isolationtoken", "scope": "all_channels"},
+    )
+
+    assert _rows_from_response(this_channel) == []
+    rows = _rows_from_response(all_channels)
+    assert {row["channel_id"] for row in rows} == {CHANNEL_A}
+    assert [row["message_uuid"] for row in rows] == ["allowed-hit"]
+
+
+@pytest.mark.asyncio
 async def test_kind_filter_transcripts_only(tmp_path: Path):
     db_path = tmp_path / "memory.db"
     _seed_transcript(db_path, message_uuid="transcript-mixed", text="mixedtoken transcript")

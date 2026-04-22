@@ -351,6 +351,22 @@ def test_search_semantic_scope_filters(tmp_path: Path):
     assert {row["channel_id"] for row in results} == {CHANNEL_A}
 
 
+def test_search_semantic_excludes_channels(tmp_path: Path):
+    with closing(open_memory_db(tmp_path / "memory.db")) as conn:
+        _seed_summary(conn, channel_id=CHANNEL_A, text="channel a", embedding=_pack([1.0, 0.0]))
+        _seed_summary(conn, channel_id=CHANNEL_B, text="channel b", embedding=_pack([1.0, 0.0]))
+
+        results = search_semantic(
+            conn,
+            query_vec=_pack([1.0, 0.0]),
+            scope="all_channels",
+            excluded_channels=[CHANNEL_B],
+            limit=10,
+        )
+
+    assert {row["channel_id"] for row in results} == {CHANNEL_A}
+
+
 def test_search_hybrid_merges_fts_and_semantic_hits(tmp_path: Path):
     with closing(open_memory_db(tmp_path / "memory.db")) as conn:
         keyword_id = _seed_summary(conn, text="exacttoken keyword row")
@@ -365,6 +381,34 @@ def test_search_hybrid_merges_fts_and_semantic_hits(tmp_path: Path):
         )
 
     assert {row["summary_id"] for row in results} == {keyword_id, semantic_id}
+
+
+def test_search_hybrid_excludes_channels(tmp_path: Path):
+    with closing(open_memory_db(tmp_path / "memory.db")) as conn:
+        _seed_summary(
+            conn,
+            channel_id=CHANNEL_A,
+            text="hybridtoken allowed",
+            embedding=_pack([1.0, 0.0]),
+        )
+        _seed_summary(
+            conn,
+            channel_id=CHANNEL_B,
+            text="hybridtoken excluded",
+            embedding=_pack([1.0, 0.0]),
+            ts=BASE_TS + timedelta(seconds=1),
+        )
+
+        results = search_hybrid(
+            conn,
+            query="hybridtoken",
+            query_vec=_pack([1.0, 0.0]),
+            scope="all_channels",
+            excluded_channels=[CHANNEL_B],
+            limit=5,
+        )
+
+    assert {row["channel_id"] for row in results} == {CHANNEL_A}
 
 
 def test_search_hybrid_ranks_high_overlap_first(tmp_path: Path):
