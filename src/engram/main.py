@@ -287,6 +287,17 @@ async def _runtime_snapshot_loop(
             )
 
 
+def _schedule_timeout_update(q: PendingQuestion, slack_client) -> None:
+    def update_if_timed_out(future: asyncio.Future[object]) -> None:
+        if not future.cancelled():
+            return
+        task = asyncio.create_task(update_question_timeout(q, slack_client))
+        _TIMEOUT_UPDATE_TASKS.add(task)
+        task.add_done_callback(_TIMEOUT_UPDATE_TASKS.discard)
+
+    q.future.add_done_callback(update_if_timed_out)
+
+
 def main() -> None:
     raise SystemExit(asyncio.run(run()))
 

@@ -170,18 +170,21 @@ async def test_timeout_triggers_interrupt_and_deny():
 
 @pytest.mark.asyncio
 async def test_production_timeout_callback_updates_slack():
-    harness = HITLHarness(update_on_timeout=False)
+    harness = HITLHarness(default_timeout_s=1)
 
-    task = asyncio.create_task(
+    output_task = asyncio.create_task(
         harness.hook(permission_request_input(), "tool-1", {})
     )
     q = await wait_for_question(harness)
     _schedule_timeout_update(q, harness.slack)
 
-    q.future.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    output = await asyncio.wait_for(output_task, timeout=2)
 
+    assert hook_decision(output) == {
+        "behavior": "deny",
+        "message": "question timed out after 1s",
+        "interrupt": True,
+    }
     await wait_until(lambda: len(harness.slack.update_calls) == 1)
     assert harness.slack.update_calls[0]["text"] == "Timed out"
 

@@ -67,6 +67,8 @@ SLACK_APP_MANIFEST = dedent(
           - message.im
           - message.mpim
       interactivity:
+        # Block Kit button actions arrive over Socket Mode when interactivity is enabled.
+        # They are not event_subscriptions and do not use an "actions" bot scope.
         is_enabled: true
       org_deploy_enabled: false
       socket_mode_enabled: true
