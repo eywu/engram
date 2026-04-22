@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from engram.agent import Agent
-from engram.config import AnthropicConfig, EngramConfig, SlackConfig
+from engram.config import AnthropicConfig, EngramConfig, HITLConfig, SlackConfig
 from engram.manifest import (
     Behavior,
     ChannelManifest,
@@ -20,7 +20,7 @@ from engram.manifest import (
     ScopeList,
 )
 from engram.mcp_tools import MEMORY_SEARCH_FULL_TOOL_NAMES
-from engram.router import SessionState
+from engram.router import Router, SessionState
 
 
 def _cfg() -> EngramConfig:
@@ -49,6 +49,18 @@ def _write_mcp_config(tmp_path: Path, servers: dict) -> None:
     )
 
 
+def _permission_request_input() -> dict:
+    return {
+        "hook_event_name": "PermissionRequest",
+        "session_id": "session-1",
+        "transcript_path": "/tmp/transcript.jsonl",
+        "cwd": "/tmp",
+        "tool_name": "Bash",
+        "tool_input": {"cmd": "pytest"},
+        "permission_suggestions": [],
+    }
+
+
 # ── Legacy mode (no manifest) ──────────────────────────────────────────
 
 
@@ -60,6 +72,38 @@ def test_legacy_mode_uses_user_setting_source():
     assert opts.allowed_tools == []
     assert opts.disallowed_tools == []
     assert opts.can_use_tool is None
+
+
+@pytest.mark.asyncio
+async def test_permission_hook_uses_router_hitl_timeout():
+    router = Router(hitl=HITLConfig(timeout_s=0))
+    session = _session(None)
+    questions = []
+    a = Agent(_cfg(), router=router)
+
+    async def on_new_question(q):
+        questions.append(q)
+
+    a._on_new_question = on_new_question
+    hook = a._build_options(session).hooks["PermissionRequest"][0].hooks[0]
+
+    output = await hook(_permission_request_input(), "tool-1", {})
+
+    assert questions[0].timeout_s == 0
+    assert output["hookSpecificOutput"]["decision"] == {
+        "behavior": "deny",
+        "message": "question timed out after 0s",
+        "interrupt": True,
+    }
+
+
+def test_hitl_disabled_skips_permission_request_hook():
+    router = Router(hitl=HITLConfig(enabled=False))
+    a = Agent(_cfg(), router=router)
+
+    opts = a._build_options(_session(None))
+
+    assert "PermissionRequest" not in opts.hooks
 
 
 # ── Owner-DM manifest ──────────────────────────────────────────────────

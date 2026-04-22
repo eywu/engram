@@ -14,8 +14,8 @@ Inheritance model (decided 2026-04-20):
 
 Schema is the FULL §05 spec, but only `tools`, `mcp_servers`, `skills`, and
 `setting_sources` are enforced in M2. The rest (`subagents`,
-`ask_user_question`, `cost_budget`, `behavior`) are validated and stored
-for M3/M4 to consume without revisiting the schema.
+`ask_user_question`, `cost_budget`, `behavior`, `hitl`) are validated and
+stored for M3/M4 to consume without revisiting the schema.
 """
 from __future__ import annotations
 
@@ -27,6 +27,8 @@ from typing import Literal
 import yaml
 from claude_agent_sdk import PermissionMode, SettingSource
 from pydantic import BaseModel, Field, ValidationError, field_validator
+
+from engram.config import HITLConfig
 
 # ──────────────────────────────────────────────────────────────────────────
 # Identity & status
@@ -272,6 +274,7 @@ class ChannelManifest(BaseModel):
     behavior: Behavior = Field(default_factory=Behavior)
     cost_budget: CostBudget = Field(default_factory=CostBudget)
     ask_user_question: AskUserQuestion = Field(default_factory=AskUserQuestion)
+    hitl: HITLConfig = Field(default_factory=HITLConfig)
 
     # ── Sub-agents (stored only — M-future) ──────────────────────
     subagents: list[str] = Field(

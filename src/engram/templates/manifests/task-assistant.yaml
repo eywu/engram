@@ -81,6 +81,11 @@ cost_budget:
   # daily_usd: 2.0
   # monthly_usd: 30.0
 
+hitl:
+  enabled: true
+  timeout_s: 300
+  max_per_day: 3
+
 ask_user_question:
   enabled: true
   fallback: escalate-to-owner

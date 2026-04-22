@@ -41,6 +41,11 @@ cost_budget:
   warn_at_percent: 80
   # monthly_usd: 100.0
 
+hitl:
+  enabled: true
+  timeout_s: 300
+  max_per_day: 5
+
 ask_user_question:
   enabled: true
   fallback: answer-as-self

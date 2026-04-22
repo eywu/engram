@@ -41,6 +41,27 @@ class PathsConfig:
 
 
 @dataclass(frozen=True)
+class HITLConfig:
+    enabled: bool = True
+    timeout_s: int = 300
+    max_per_day: int = 5
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "enabled", _bool(self.enabled))
+        object.__setattr__(self, "timeout_s", max(0, int(self.timeout_s)))
+        object.__setattr__(self, "max_per_day", max(0, int(self.max_per_day)))
+
+    @classmethod
+    def from_mapping(cls, raw: dict | None) -> HITLConfig:
+        raw = raw or {}
+        return cls(
+            enabled=raw.get("enabled", True),
+            timeout_s=raw.get("timeout_s", 300),
+            max_per_day=raw.get("max_per_day", 5),
+        )
+
+
+@dataclass(frozen=True)
 class EmbeddingsConfig:
     enabled: bool = True
     provider: str = "gemini"
@@ -100,6 +121,8 @@ class EngramConfig:
     owner_dm_channel_id: str | None = None
     # M3: monthly budget tracking / warning ladder.
     budget: BudgetConfig = field(default_factory=BudgetConfig)
+    # M4: human-in-the-loop defaults for permission prompts.
+    hitl: HITLConfig = field(default_factory=HITLConfig)
     # M3b: asynchronous Gemini embeddings for semantic memory recall.
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
 
@@ -169,6 +192,7 @@ class EngramConfig:
                 or os.environ.get("ENGRAM_OWNER_DM_CHANNEL_ID")
             ),
             budget=BudgetConfig.from_mapping(raw.get("budget")),
+            hitl=HITLConfig.from_mapping(raw.get("hitl")),
             embeddings=EmbeddingsConfig.from_mapping(raw.get("embeddings")),
         )
 
