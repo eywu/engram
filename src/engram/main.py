@@ -19,7 +19,7 @@ from engram.bootstrap import ensure_project_root
 from engram.budget import Budget
 from engram.config import EngramConfig
 from engram.costs import CostLedger
-from engram.egress import post_question
+from engram.egress import post_question, update_question_timeout
 from engram.embeddings import EmbeddingQueue, GeminiEmbedder
 from engram.hitl import PendingQuestion
 from engram.ingress import register_listeners
@@ -28,6 +28,7 @@ from engram.runtime import write_runtime_snapshot
 from engram.telemetry import configure_logging
 
 READY_LOG_LINE = "engram.ready"  # stable string for health probes / test harnesses
+_TIMEOUT_UPDATE_TASKS: set[asyncio.Task[None]] = set()
 
 
 def _configure_logging() -> None:
@@ -182,6 +183,7 @@ async def run() -> int:
             channel_ts, thread_ts = await post_question(q, app.client)
             q.slack_channel_ts = channel_ts
             q.slack_thread_ts = thread_ts
+            _schedule_timeout_update(q, app.client)
         except Exception as e:
             log.exception("Failed to post HITL question: %s", e)
             raise
@@ -283,6 +285,17 @@ async def _runtime_snapshot_loop(
                 "engram.runtime_snapshot_failed",
                 exc_info=True,
             )
+
+
+def _schedule_timeout_update(q: PendingQuestion, slack_client) -> None:
+    def update_if_timed_out(future: asyncio.Future[object]) -> None:
+        if not future.cancelled():
+            return
+        task = asyncio.create_task(update_question_timeout(q, slack_client))
+        _TIMEOUT_UPDATE_TASKS.add(task)
+        task.add_done_callback(_TIMEOUT_UPDATE_TASKS.discard)
+
+    q.future.add_done_callback(update_if_timed_out)
 
 
 def main() -> None:
