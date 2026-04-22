@@ -1,12 +1,21 @@
 """HITL foundation tests."""
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 import pytest
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+from claude_agent_sdk.types import PermissionRuleValue, PermissionUpdate
 
-from engram.hitl import HITLRateLimiter, HITLRegistry, PendingQuestion
+from engram.hitl import (
+    HITLRateLimiter,
+    HITLRegistry,
+    PendingQuestion,
+    _permission_result_to_hook_output,
+    build_permission_request_hook,
+)
+from engram.router import Router
 
 
 def make_question(
@@ -26,6 +35,25 @@ def make_question(
         posted_at=datetime(2026, 4, 21, tzinfo=UTC),
         timeout_s=300,
     )
+
+
+def permission_request_input() -> dict:
+    return {
+        "hook_event_name": "PermissionRequest",
+        "session_id": "session-1",
+        "transcript_path": "/tmp/transcript.jsonl",
+        "cwd": "/tmp",
+        "tool_name": "Bash",
+        "tool_input": {"cmd": "pytest"},
+        "permission_suggestions": [
+            PermissionUpdate(
+                type="addRules",
+                rules=[PermissionRuleValue(tool_name="Bash", rule_content="pytest")],
+                behavior="allow",
+                destination="session",
+            )
+        ],
+    }
 
 
 def test_registry_register_and_get():
@@ -142,3 +170,225 @@ def test_limiter_midnight_reset():
 
     assert limiter.check("C07TEST123", now=day_one)[0] is False
     assert limiter.check("C07TEST123", now=day_two) == (True, "")
+
+
+async def _next_question(questions: list[PendingQuestion]) -> PendingQuestion:
+    while not questions:
+        await asyncio.sleep(0)
+    return questions[0]
+
+
+@pytest.mark.asyncio
+async def test_hook_posts_question_and_awaits():
+    router = Router()
+    questions: list[PendingQuestion] = []
+
+    async def on_new_question(q: PendingQuestion) -> None:
+        questions.append(q)
+
+    hook = build_permission_request_hook(
+        router=router,
+        channel_id="C07TEST123",
+        client_provider=lambda: None,
+        on_new_question=on_new_question,
+    )
+
+    task = asyncio.create_task(hook(permission_request_input(), "tool-1", {}))
+    q = await asyncio.wait_for(_next_question(questions), timeout=1)
+
+    assert router.hitl.get_by_id(q.permission_request_id) is q
+    assert q.session_id == "session-1"
+    assert q.tool_name == "Bash"
+    assert q.tool_input == {"cmd": "pytest"}
+    assert q.suggestions == permission_request_input()["permission_suggestions"]
+
+    router.hitl.resolve(q.permission_request_id, PermissionResultAllow())
+
+    assert await task == {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {"behavior": "allow"},
+        }
+    }
+    assert router.hitl.get_by_id(q.permission_request_id) is None
+
+
+@pytest.mark.asyncio
+async def test_hook_timeout_calls_interrupt_and_denies():
+    class FakeClient:
+        def __init__(self) -> None:
+            self.interrupted = False
+
+        async def interrupt(self) -> None:
+            self.interrupted = True
+
+    client = FakeClient()
+
+    async def on_new_question(_q: PendingQuestion) -> None:
+        return None
+
+    hook = build_permission_request_hook(
+        router=Router(),
+        channel_id="C07TEST123",
+        client_provider=lambda: client,
+        on_new_question=on_new_question,
+        default_timeout_s=0,
+    )
+
+    assert await hook(permission_request_input(), "tool-1", {}) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {
+                "behavior": "deny",
+                "message": "question timed out after 0s",
+                "interrupt": True,
+            },
+        }
+    }
+    assert client.interrupted is True
+
+
+@pytest.mark.asyncio
+async def test_hook_rate_limit_auto_denies():
+    router = Router()
+    router.hitl.register(make_question())
+    called = False
+
+    async def on_new_question(_q: PendingQuestion) -> None:
+        nonlocal called
+        called = True
+
+    hook = build_permission_request_hook(
+        router=router,
+        channel_id="C07TEST123",
+        client_provider=lambda: None,
+        on_new_question=on_new_question,
+    )
+
+    assert await hook(permission_request_input(), "tool-1", {}) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {
+                "behavior": "deny",
+                "message": (
+                    "HITL rate-limited: another question already pending "
+                    "in this channel"
+                ),
+            },
+        }
+    }
+    assert called is False
+    assert len(router.hitl.pending_for_channel("C07TEST123")) == 1
+
+
+@pytest.mark.asyncio
+async def test_hook_daily_cap_auto_denies():
+    router = Router()
+    for _ in range(5):
+        router.hitl_limiter.reserve("C07TEST123")
+    called = False
+
+    async def on_new_question(_q: PendingQuestion) -> None:
+        nonlocal called
+        called = True
+
+    hook = build_permission_request_hook(
+        router=router,
+        channel_id="C07TEST123",
+        client_provider=lambda: None,
+        on_new_question=on_new_question,
+    )
+
+    assert await hook(permission_request_input(), "tool-1", {}) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {
+                "behavior": "deny",
+                "message": "HITL rate-limited: daily question budget exhausted (5/day)",
+            },
+        }
+    }
+    assert called is False
+    assert router.hitl.pending_for_channel("C07TEST123") == []
+
+
+@pytest.mark.asyncio
+async def test_hook_on_new_question_failure_denies_fast():
+    async def on_new_question(_q: PendingQuestion) -> None:
+        raise RuntimeError("slack failed")
+
+    router = Router()
+    hook = build_permission_request_hook(
+        router=router,
+        channel_id="C07TEST123",
+        client_provider=lambda: None,
+        on_new_question=on_new_question,
+    )
+
+    assert await hook(permission_request_input(), "tool-1", {}) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {
+                "behavior": "deny",
+                "message": "failed to post question",
+            },
+        }
+    }
+    assert router.hitl.pending_for_channel("C07TEST123") == []
+
+
+def test_hook_output_shape_allow():
+    assert _permission_result_to_hook_output(PermissionResultAllow()) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {"behavior": "allow"},
+        }
+    }
+
+
+def test_hook_output_shape_deny():
+    assert _permission_result_to_hook_output(
+        PermissionResultDeny(message="no", interrupt=True)
+    ) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {
+                "behavior": "deny",
+                "message": "no",
+                "interrupt": True,
+            },
+        }
+    }
+
+
+def test_hook_output_shape_allow_with_updated_permissions():
+    update = PermissionUpdate(
+        type="addRules",
+        rules=[PermissionRuleValue(tool_name="Bash", rule_content="pytest")],
+        behavior="allow",
+        destination="session",
+    )
+
+    assert _permission_result_to_hook_output(
+        PermissionResultAllow(updated_permissions=[update])
+    ) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {
+                "behavior": "allow",
+                "updatedPermissions": [
+                    {
+                        "type": "addRules",
+                        "destination": "session",
+                        "rules": [
+                            {
+                                "toolName": "Bash",
+                                "ruleContent": "pytest",
+                            }
+                        ],
+                        "behavior": "allow",
+                    }
+                ],
+            },
+        }
+    }

@@ -2,11 +2,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+from claude_agent_sdk.types import (
+    HookCallback,
+    PermissionRequestHookInput,
+    PermissionRequestHookSpecificOutput,
+    SyncHookJSONOutput,
+)
 
 PermissionResult = PermissionResultAllow | PermissionResultDeny
 
@@ -114,3 +123,97 @@ class HITLRateLimiter:
         if day != today:
             count = 0
         self._daily_counts[channel_id] = (today, count + 1)
+
+
+def build_permission_request_hook(
+    router: Any,
+    channel_id: str,
+    client_provider: Callable[[], Any | None],
+    on_new_question: Callable[[PendingQuestion], Awaitable[None]],
+    default_timeout_s: int = 300,
+) -> HookCallback:
+    """Build a PermissionRequest hook that round-trips through HITL."""
+
+    async def hook(
+        input_data: PermissionRequestHookInput,
+        _tool_use_id: str | None,
+        _context: dict[str, Any],
+    ) -> SyncHookJSONOutput:
+        allowed, reason = router.hitl_limiter.check(channel_id)
+        if not allowed:
+            return _permission_result_to_hook_output(
+                PermissionResultDeny(message=f"HITL rate-limited: {reason}")
+            )
+
+        permission_request_id = str(uuid.uuid4())
+        q = PendingQuestion(
+            permission_request_id=permission_request_id,
+            channel_id=channel_id,
+            session_id=input_data["session_id"],
+            turn_id=str(uuid.uuid4()),
+            tool_name=input_data["tool_name"],
+            tool_input=input_data["tool_input"],
+            suggestions=list(input_data.get("permission_suggestions") or []),
+            who_can_answer=None,
+            posted_at=datetime.now(UTC),
+            timeout_s=default_timeout_s,
+        )
+
+        router.hitl.register(q)
+        router.hitl_limiter.reserve(channel_id)
+
+        try:
+            await on_new_question(q)
+        except Exception:
+            router.hitl.resolve(
+                permission_request_id,
+                PermissionResultDeny(message="failed to post question"),
+            )
+
+        try:
+            result = await asyncio.wait_for(q.future, timeout=q.timeout_s)
+        except TimeoutError:
+            client = client_provider()
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await client.interrupt()
+            result = PermissionResultDeny(
+                interrupt=True,
+                message=f"question timed out after {q.timeout_s}s",
+            )
+        finally:
+            router.hitl.cleanup_resolved()
+
+        return _permission_result_to_hook_output(result)
+
+    return hook
+
+
+def _permission_result_to_hook_output(
+    result: PermissionResult,
+) -> SyncHookJSONOutput:
+    if isinstance(result, PermissionResultAllow):
+        decision: dict[str, Any] = {"behavior": "allow"}
+        if result.updated_input is not None:
+            decision["updatedInput"] = result.updated_input
+        if result.updated_permissions is not None:
+            decision["updatedPermissions"] = [
+                permission.to_dict() for permission in result.updated_permissions
+            ]
+        return _permission_request_output(decision)
+
+    if isinstance(result, PermissionResultDeny):
+        decision = {"behavior": "deny", "message": result.message}
+        if result.interrupt:
+            decision["interrupt"] = True
+        return _permission_request_output(decision)
+
+    raise TypeError(f"Unknown PermissionResult type: {type(result)}")
+
+
+def _permission_request_output(decision: dict[str, Any]) -> SyncHookJSONOutput:
+    hook_specific: PermissionRequestHookSpecificOutput = {
+        "hookEventName": "PermissionRequest",
+        "decision": decision,
+    }
+    return {"hookSpecificOutput": hook_specific}
