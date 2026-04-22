@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from engram import paths
+from engram.config import HITLConfig
 from engram.manifest import ChannelStatus, IdentityTemplate, dump_manifest
 from engram.router import Router
 
@@ -150,3 +151,25 @@ async def test_template_vars_optional(tmp_path: Path):
     # Generic defaults are used in the slots — workspace slot shows "this workspace".
     assert "this workspace" in body
     assert "{{owner_display_name}}" not in body
+
+
+def test_hitl_config_sets_limiter_daily_cap():
+    r = Router(hitl=HITLConfig(max_per_day=2))
+    for _ in range(2):
+        r.hitl_limiter.reserve("C07TEST123")
+
+    allowed, reason = r.hitl_limiter.check("C07TEST123")
+
+    assert allowed is False
+    assert reason == "daily question budget exhausted (2/day)"
+
+
+@pytest.mark.asyncio
+async def test_manifest_hitl_overrides_router_default(tmp_path: Path):
+    r = Router(home=tmp_path, hitl=HITLConfig(max_per_day=9))
+    await r.get("C07TEAM", is_dm=False)
+
+    cfg = r.hitl_config_for_channel("C07TEAM")
+
+    assert cfg.max_per_day == 3
+    assert cfg.timeout_s == 300

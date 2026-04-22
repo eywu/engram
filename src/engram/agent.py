@@ -551,6 +551,13 @@ class Agent:
         hooks.setdefault("Stop", []).append(stop_hook)
         hooks.setdefault("PreCompact", []).append(precompact_hook)
 
+        hitl_config = self._router.hitl_config_for_channel(
+            session.channel_id,
+            manifest=session.manifest,
+        )
+        if not hitl_config.enabled:
+            return hooks
+
         async def _noop_on_new_question(q) -> None:
             log.warning(
                 "HITL question fired but no egress wired: pid=%s tool=%s",
@@ -567,6 +574,8 @@ class Agent:
                 "_on_new_question",
                 _noop_on_new_question,
             ),
+            default_timeout_s=hitl_config.timeout_s,
+            max_per_day=hitl_config.max_per_day,
         )
         hooks.setdefault("PermissionRequest", []).append(
             HookMatcher(matcher=".*", hooks=[permission_hook])

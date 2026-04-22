@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from engram import paths
 from engram.bootstrap import provision_channel
+from engram.config import HITLConfig
 from engram.hitl import HITLRateLimiter, HITLRegistry
 from engram.manifest import (
     ChannelManifest,
@@ -119,12 +120,14 @@ class Router:
         home: Path | None = None,
         owner_dm_channel_id: str | None = None,
         template_vars: dict[str, str] | None = None,
+        hitl: HITLConfig | None = None,
     ):
         self._sessions: dict[str, SessionState] = {}
         self._session_id_to_channel_id: dict[str, str] = {}
         self._shared_cwd = shared_cwd
         self._home = home
         self._owner_dm_channel_id = owner_dm_channel_id
+        self._hitl_config = hitl or HITLConfig()
         # Substitutions applied when provisioning a channel's CLAUDE.md, e.g.
         # owner_display_name="Alice", slack_workspace_name="acme-corp".
         # Discovered at boot from Slack auth.test / users.info.
@@ -132,7 +135,10 @@ class Router:
         self._create_lock = asyncio.Lock()
         self._idle_sweeper_task: asyncio.Task[None] | None = None
         self.hitl = HITLRegistry()
-        self.hitl_limiter = HITLRateLimiter(self.hitl)
+        self.hitl_limiter = HITLRateLimiter(
+            self.hitl,
+            max_per_day=self._hitl_config.max_per_day,
+        )
 
     async def get(
         self,
@@ -235,6 +241,24 @@ class Router:
     def get_channel_by_session_id(self, session_id: str) -> str | None:
         """Return the Slack channel ID for a known Claude session ID."""
         return self._session_id_to_channel_id.get(session_id)
+
+    def hitl_config_for_channel(
+        self,
+        channel_id: str,
+        *,
+        manifest: ChannelManifest | None = None,
+    ) -> HITLConfig:
+        """Return channel-specific HITL settings, falling back to global config."""
+        if manifest is None:
+            session = self._sessions.get(channel_id)
+            manifest = session.manifest if session is not None else None
+
+        if (
+            manifest is not None
+            and "hitl" in getattr(manifest, "model_fields_set", set())
+        ):
+            return manifest.hitl
+        return self._hitl_config
 
     # ──────────────────────────────────────────────────────────────
     # Agent client lifecycle

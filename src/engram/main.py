@@ -134,6 +134,7 @@ async def run() -> int:
         home=engram_home,
         owner_dm_channel_id=config.owner_dm_channel_id,
         template_vars=template_vars,
+        hitl=config.hitl,
     )
     budget = Budget(config.budget, db_path=engram_home / "cost.db")
     cost_ledger = CostLedger(

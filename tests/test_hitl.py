@@ -313,6 +313,38 @@ async def test_hook_daily_cap_auto_denies():
 
 
 @pytest.mark.asyncio
+async def test_hook_uses_manifest_hitl_daily_cap(tmp_path):
+    router = Router(home=tmp_path)
+    await router.get("C07TEST123", is_dm=False)
+    for _ in range(3):
+        router.hitl_limiter.reserve("C07TEST123")
+    called = False
+
+    async def on_new_question(_q: PendingQuestion) -> None:
+        nonlocal called
+        called = True
+
+    hook = build_permission_request_hook(
+        router=router,
+        channel_id="C07TEST123",
+        client_provider=lambda: None,
+        on_new_question=on_new_question,
+    )
+
+    assert await hook(permission_request_input(), "tool-1", {}) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {
+                "behavior": "deny",
+                "message": "HITL rate-limited: daily question budget exhausted (3/day)",
+            },
+        }
+    }
+    assert called is False
+    assert router.hitl.pending_for_channel("C07TEST123") == []
+
+
+@pytest.mark.asyncio
 async def test_hook_on_new_question_failure_denies_fast():
     async def on_new_question(_q: PendingQuestion) -> None:
         raise RuntimeError("slack failed")

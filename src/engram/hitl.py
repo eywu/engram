@@ -97,10 +97,14 @@ class HITLRateLimiter:
         self._daily_counts: dict[str, tuple[date, int]] = {}
 
     def check(
-        self, channel_id: str, now: datetime | None = None
+        self,
+        channel_id: str,
+        now: datetime | None = None,
+        max_per_day: int | None = None,
     ) -> tuple[bool, str]:
         """Check if a new question is allowed. Does not reserve capacity."""
         now = now or datetime.now(UTC)
+        daily_limit = self._max_per_day if max_per_day is None else max_per_day
         if self._registry.pending_for_channel(channel_id):
             return (False, "another question already pending in this channel")
 
@@ -108,10 +112,10 @@ class HITLRateLimiter:
         day, count = self._daily_counts.get(channel_id, (today, 0))
         if day != today:
             count = 0
-        if count >= self._max_per_day:
+        if count >= daily_limit:
             return (
                 False,
-                f"daily question budget exhausted ({self._max_per_day}/day)",
+                f"daily question budget exhausted ({daily_limit}/day)",
             )
         return (True, "")
 
@@ -131,6 +135,7 @@ def build_permission_request_hook(
     client_provider: Callable[[], Any | None],
     on_new_question: Callable[[PendingQuestion], Awaitable[None]],
     default_timeout_s: int = 300,
+    max_per_day: int | None = None,
 ) -> HookCallback:
     """Build a PermissionRequest hook that round-trips through HITL."""
 
@@ -139,7 +144,13 @@ def build_permission_request_hook(
         _tool_use_id: str | None,
         _context: dict[str, Any],
     ) -> SyncHookJSONOutput:
-        allowed, reason = router.hitl_limiter.check(channel_id)
+        daily_limit = max_per_day
+        if daily_limit is None:
+            daily_limit = router.hitl_config_for_channel(channel_id).max_per_day
+        allowed, reason = router.hitl_limiter.check(
+            channel_id,
+            max_per_day=daily_limit,
+        )
         if not allowed:
             return _permission_result_to_hook_output(
                 PermissionResultDeny(message=f"HITL rate-limited: {reason}")
