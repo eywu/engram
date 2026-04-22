@@ -19,7 +19,7 @@ from engram.bootstrap import ensure_project_root
 from engram.budget import Budget
 from engram.config import EngramConfig
 from engram.costs import CostLedger
-from engram.embeddings import EmbeddingQueue, GeminiEmbedder, set_active_embedding_queue
+from engram.embeddings import EmbeddingQueue, GeminiEmbedder
 from engram.ingress import register_listeners
 from engram.router import Router
 from engram.runtime import write_runtime_snapshot
@@ -143,7 +143,6 @@ async def run() -> int:
         embedder,
         db_path=engram_home / "memory.db",
     )
-    set_active_embedding_queue(embedding_queue)
     embedding_worker_task = (
         asyncio.create_task(
             embedding_queue.run(),
@@ -246,7 +245,6 @@ async def run() -> int:
                 type(e).__name__,
                 e,
             )
-        set_active_embedding_queue(None)
     log.info("engram.shutdown_complete")
     return 0
 

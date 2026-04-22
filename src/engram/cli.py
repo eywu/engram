@@ -20,7 +20,6 @@ from engram import __version__
 from engram.cli_channels import app as channels_app
 from engram.config import DEFAULT_CONFIG_PATH, EngramConfig, PathsConfig
 from engram.costs import CostDatabase
-from engram.embeddings import embedding_queue_status
 from engram.manifest import ChannelManifest, ManifestError, load_manifest
 from engram.mcp import resolve_team_mcp_servers
 from engram.mcp_tools import (
@@ -117,19 +116,16 @@ def cost(
     if by_channel:
         table = Table(title=f"Cost By Channel ({label})")
         table.add_column("channel")
-        table.add_column("embedding cost")
         table.add_column("turns", justify="right")
         table.add_column("cost", justify="right")
         for channel_id, total in result.per_channel.items():
             table.add_row(
                 channel_id,
-                "gemini free-tier",
                 str(total.turn_count),
                 f"${total.total_cost_usd:.4f}",
             )
         table.add_row(
             "TOTAL",
-            "gemini free-tier",
             str(result.turns),
             f"${result.total_cost_usd:.4f}",
         )
@@ -218,10 +214,10 @@ def _build_status_snapshot() -> dict[str, Any]:
     )
     memory = _memory_counts(home / "memory.db")
     memory.update(memory_tool_metrics())
-    memory["embedding_queue"] = embedding_queue_status()
     runtime_memory = runtime.get("memory") if isinstance(runtime, dict) else None
     if isinstance(runtime_memory, dict):
         memory.update(runtime_memory)
+    memory.pop("embedding_queue", None)
 
     return {
         "version": __version__,

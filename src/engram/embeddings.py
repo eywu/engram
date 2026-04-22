@@ -127,7 +127,6 @@ class EmbeddingQueue:
         self._rng = rng
         self._running = False
         self.drop_count = 0
-        self.embedded_count = 0
 
     @property
     def depth(self) -> int:
@@ -181,14 +180,6 @@ class EmbeddingQueue:
             finally:
                 self._queue.task_done()
 
-    def status(self) -> dict[str, Any]:
-        return {
-            "enabled": self.embedder.enabled,
-            "depth": self.depth,
-            "drop_count": self.drop_count,
-            "embedded_count": self.embedded_count,
-        }
-
     def _enqueue(self, item: _EmbeddingWorkItem) -> None:
         try:
             self._queue.put_nowait(item)
@@ -206,7 +197,6 @@ class EmbeddingQueue:
         if embedding is None:
             return
         await asyncio.to_thread(self._store_embedding, item, embedding)
-        self.embedded_count += 1
 
     def _store_embedding(self, item: _EmbeddingWorkItem, embedding: bytes) -> None:
         if item.table not in {"summaries", "transcripts"}:
@@ -216,20 +206,6 @@ class EmbeddingQueue:
                 f"UPDATE {item.table} SET embedding = ? WHERE id = ?",
                 (embedding, item.row_id),
             )
-
-
-_ACTIVE_QUEUE: EmbeddingQueue | None = None
-
-
-def set_active_embedding_queue(queue: EmbeddingQueue | None) -> None:
-    global _ACTIVE_QUEUE
-    _ACTIVE_QUEUE = queue
-
-
-def embedding_queue_status() -> dict[str, Any]:
-    if _ACTIVE_QUEUE is None:
-        return {"enabled": False, "depth": 0, "drop_count": 0, "embedded_count": 0}
-    return _ACTIVE_QUEUE.status()
 
 
 def _extract_embedding_values(response: Any) -> list[float]:

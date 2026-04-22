@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 from engram.costs import CostDatabase
-from engram.embeddings import embedding_queue_status
 from engram.mcp_tools import memory_tool_metrics
 from engram.router import Router, SessionState
 from engram.telemetry import write_json
@@ -50,10 +49,7 @@ async def write_runtime_snapshot(
     snapshot = {
         "bridge": {"up": True, "pid": pid, "ts": now},
         "channels": channels,
-        "memory": {
-            **memory_tool_metrics(),
-            "embedding_queue": embedding_queue_status(),
-        },
+        "memory": memory_tool_metrics(),
     }
     write_json(status_path(state_dir), snapshot)
     return snapshot
