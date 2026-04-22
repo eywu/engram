@@ -8,9 +8,35 @@ import pytest
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import PermissionRuleValue, PermissionUpdate
 
+from engram.config import AnthropicConfig, EngramConfig, SlackConfig
 from engram.hitl import PendingQuestion
-from engram.ingress import handle_block_action, handle_thread_reply
+from engram.ingress import (
+    HITL_ACTION_ID_PATTERN,
+    handle_block_action,
+    handle_thread_reply,
+    register_listeners,
+)
 from engram.router import Router
+
+
+class DecoratorApp:
+    def __init__(self) -> None:
+        self.actions = []
+        self.events = []
+
+    def action(self, pattern):
+        def decorator(func):
+            self.actions.append((pattern, func))
+            return func
+
+        return decorator
+
+    def event(self, event_name):
+        def decorator(func):
+            self.events.append((event_name, func))
+            return func
+
+        return decorator
 
 
 class FakeSlackClient:
@@ -46,9 +72,16 @@ def make_question(
 
 
 def block_action_payload(value: str, *, user_id: str = "U123") -> dict:
+    choice_key = value.split("|", 1)[1] if "|" in value else "0"
     return {
         "type": "block_actions",
-        "actions": [{"value": value}],
+        "actions": [
+            {
+                "action_id": f"hitl_choice_{choice_key}",
+                "block_id": "hitl_actions",
+                "value": value,
+            }
+        ],
         "user": {"id": user_id},
     }
 
@@ -62,6 +95,13 @@ def permission_update() -> PermissionUpdate:
     )
 
 
+def make_config() -> EngramConfig:
+    return EngramConfig(
+        slack=SlackConfig(bot_token="xoxb-test", app_token="xapp-test"),
+        anthropic=AnthropicConfig(api_key="sk-ant-test"),
+    )
+
+
 async def wait_until(predicate) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + 1
@@ -69,6 +109,51 @@ async def wait_until(predicate) -> None:
         if loop.time() > deadline:
             pytest.fail("condition was not met before timeout")
         await asyncio.sleep(0)
+
+
+def test_register_listeners_attaches_hitl_action_handler():
+    app = DecoratorApp()
+
+    register_listeners(app, make_config(), Router(), agent=object())
+
+    assert len(app.actions) == 1
+    pattern, _handler = app.actions[0]
+    assert pattern is HITL_ACTION_ID_PATTERN
+    assert pattern.match("hitl_choice_0")
+    assert pattern.match("hitl_choice_4")
+    assert pattern.match("hitl_choice_deny")
+    assert not pattern.match("hitl_other_0")
+    assert not pattern.match("hitl_choice_cancel")
+
+
+@pytest.mark.asyncio
+async def test_registered_hitl_action_handler_acks_and_resolves_question():
+    app = DecoratorApp()
+    router = Router()
+    slack = FakeSlackClient()
+    q = make_question(suggestions=[{"name": "Run pytest"}])
+    router.hitl.register(q)
+    ack_calls = 0
+
+    async def ack():
+        nonlocal ack_calls
+        ack_calls += 1
+
+    register_listeners(app, make_config(), router, agent=object())
+    _pattern, handler = app.actions[0]
+
+    await handler(
+        ack=ack,
+        body=block_action_payload("prq-1|0"),
+        client=slack,
+    )
+
+    assert ack_calls == 1
+    await wait_until(lambda: q.future.done() and len(slack.update_calls) == 1)
+    result = q.future.result()
+    assert isinstance(result, PermissionResultAllow)
+    assert result.updated_input == q.tool_input
+    assert slack.update_calls[0]["text"] == "Answered: Run pytest"
 
 
 @pytest.mark.asyncio

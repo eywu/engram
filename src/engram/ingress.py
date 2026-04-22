@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import re
 from decimal import Decimal
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
@@ -24,6 +25,7 @@ from engram.router import Router
 
 log = logging.getLogger(__name__)
 _BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+HITL_ACTION_ID_PATTERN = re.compile(r"^hitl_choice_(?:\d+|deny)$")
 
 
 def register_listeners(
@@ -34,6 +36,19 @@ def register_listeners(
     cost_ledger: CostLedger | None = None,
 ) -> None:
     """Attach message/app_mention handlers to a Bolt AsyncApp."""
+
+    @app.action(HITL_ACTION_ID_PATTERN)
+    async def on_hitl_action(ack, body, client):
+        await ack()
+        try:
+            result = await handle_block_action(body, router, client)
+            if not result.get("ok"):
+                log.warning(
+                    "ingress.hitl_action_failed error=%s",
+                    result.get("error", "unknown"),
+                )
+        except Exception:
+            log.exception("ingress.hitl_action_handler_failed")
 
     @app.event("message")
     async def on_message(event, say, client):
