@@ -19,7 +19,9 @@ from engram.bootstrap import ensure_project_root
 from engram.budget import Budget
 from engram.config import EngramConfig
 from engram.costs import CostLedger
+from engram.egress import post_question
 from engram.embeddings import EmbeddingQueue, GeminiEmbedder
+from engram.hitl import PendingQuestion
 from engram.ingress import register_listeners
 from engram.router import Router
 from engram.runtime import write_runtime_snapshot
@@ -173,6 +175,17 @@ async def run() -> int:
         embedder=embedder,
         embedding_queue=embedding_queue,
     )
+
+    async def on_new_question_for_channel(q: PendingQuestion) -> None:
+        try:
+            channel_ts, thread_ts = await post_question(q, app.client)
+            q.slack_channel_ts = channel_ts
+            q.slack_thread_ts = thread_ts
+        except Exception as e:
+            log.exception("Failed to post HITL question: %s", e)
+            raise
+
+    agent._on_new_question = on_new_question_for_channel
     register_listeners(app, config, router, agent, cost_ledger=cost_ledger)
     idle_sweeper_task = router.start_idle_sweeper()
 
