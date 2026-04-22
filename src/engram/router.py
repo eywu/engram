@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from engram import paths
 from engram.bootstrap import provision_channel
+from engram.hitl import HITLRateLimiter, HITLRegistry
 from engram.manifest import (
     ChannelManifest,
     ChannelStatus,
@@ -130,6 +131,8 @@ class Router:
         self._template_vars = dict(template_vars) if template_vars else {}
         self._create_lock = asyncio.Lock()
         self._idle_sweeper_task: asyncio.Task[None] | None = None
+        self.hitl = HITLRegistry()
+        self.hitl_limiter = HITLRateLimiter(self.hitl)
 
     async def get(
         self,
