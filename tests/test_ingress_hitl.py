@@ -207,6 +207,7 @@ async def test_block_action_deny_button():
     result = q.future.result()
     assert isinstance(result, PermissionResultDeny)
     assert result.message == "user denied"
+    assert result.interrupt is True
     assert slack.update_calls[0]["text"] == "Answered: Deny"
 
 

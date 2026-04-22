@@ -38,7 +38,7 @@ from engram.budget import BUDGET_PAUSE_MESSAGE, Budget, CheckResult
 from engram.config import EngramConfig
 from engram.costs import CostDatabase, RateLimitRecord
 from engram.embeddings import EmbeddingQueue
-from engram.hitl import build_permission_request_hook
+from engram.hitl import build_hitl_tool_guard
 from engram.hooks import build_hooks
 from engram.mcp import resolve_team_mcp_servers, warn_missing_mcp_servers
 from engram.mcp_tools import (
@@ -507,6 +507,42 @@ class Agent:
             if strict_mcp_config and not mcp_servers:
                 extra_args["mcp-config"] = json.dumps({"mcpServers": {}})
 
+        hitl_config = (
+            self._router.hitl_config_for_channel(
+                session.channel_id,
+                manifest=manifest,
+            )
+            if self._router is not None
+            else None
+        )
+        if (
+            self._router is not None
+            and hitl_config is not None
+            and hitl_config.enabled
+        ):
+
+            async def _noop_on_new_question(q) -> None:
+                log.warning(
+                    "HITL question fired but no egress wired: pid=%s tool=%s",
+                    q.permission_request_id,
+                    q.tool_name,
+                )
+
+            can_use_tool = build_hitl_tool_guard(
+                router=self._router,
+                channel_id=session.channel_id,
+                session_id=session.session_id,
+                client_provider=lambda: session.agent_client,
+                on_new_question=getattr(
+                    self,
+                    "_on_new_question",
+                    _noop_on_new_question,
+                ),
+                default_timeout_s=hitl_config.timeout_s,
+                max_per_day=hitl_config.max_per_day,
+                precheck=can_use_tool,
+            )
+
         session_kwargs = (
             {"resume": session.session_id}
             if resume
@@ -550,36 +586,6 @@ class Agent:
         )
         hooks.setdefault("Stop", []).append(stop_hook)
         hooks.setdefault("PreCompact", []).append(precompact_hook)
-
-        hitl_config = self._router.hitl_config_for_channel(
-            session.channel_id,
-            manifest=session.manifest,
-        )
-        if not hitl_config.enabled:
-            return hooks
-
-        async def _noop_on_new_question(q) -> None:
-            log.warning(
-                "HITL question fired but no egress wired: pid=%s tool=%s",
-                q.permission_request_id,
-                q.tool_name,
-            )
-
-        permission_hook = build_permission_request_hook(
-            router=self._router,
-            channel_id=session.channel_id,
-            client_provider=lambda: session.agent_client,
-            on_new_question=getattr(
-                self,
-                "_on_new_question",
-                _noop_on_new_question,
-            ),
-            default_timeout_s=hitl_config.timeout_s,
-            max_per_day=hitl_config.max_per_day,
-        )
-        hooks.setdefault("PermissionRequest", []).append(
-            HookMatcher(matcher=".*", hooks=[permission_hook])
-        )
         return hooks
 
     def _check_budget(self, channel_id: str) -> CheckResult | None:

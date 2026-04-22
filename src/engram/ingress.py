@@ -192,7 +192,7 @@ async def handle_block_action(payload: dict, router, slack_client) -> dict:
 async def _resolve_block_action(q, choice_key, router, slack_client) -> None:
     try:
         if choice_key == "deny":
-            result = PermissionResultDeny(message="user denied")
+            result = PermissionResultDeny(message="user denied", interrupt=True)
             answer_text = "Deny"
         else:
             try:

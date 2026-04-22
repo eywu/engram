@@ -3,11 +3,21 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
-from claude_agent_sdk import PermissionResultAllow
+from claude_agent_sdk import (
+    AssistantMessage,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ResultMessage,
+)
+from claude_agent_sdk.types import ToolPermissionContext
 
+from engram.agent import Agent
+from engram.config import AnthropicConfig, EngramConfig, HITLConfig, SlackConfig
 from engram.egress import post_question, update_question_timeout
 from engram.hitl import PendingQuestion, build_permission_request_hook
 from engram.ingress import handle_block_action, handle_thread_reply
@@ -39,6 +49,80 @@ class MockClaudeSDKClient:
 
     async def interrupt(self) -> None:
         self.interrupt_calls += 1
+
+
+@dataclass
+class _TextBlock:
+    text: str
+
+
+class ToolGateFakeClient:
+    def __init__(self, options, target_path: Path) -> None:
+        self.options = options
+        self.target_path = target_path
+        self.content = "engram haiku\n"
+        self.events: list[str] = []
+        self.interrupt_calls = 0
+        self.permission_result = None
+        self._session_id = ""
+
+    async def connect(self) -> None:
+        self.events.append("connect")
+
+    async def disconnect(self) -> None:
+        self.events.append("disconnect")
+
+    async def query(self, _prompt: str, session_id: str = "default") -> None:
+        self._session_id = session_id
+        self.events.append("query")
+
+    async def interrupt(self) -> None:
+        self.interrupt_calls += 1
+        self.events.append("interrupt")
+
+    async def tag_session(self, *, session_id: str, tags: dict[str, str]) -> None:
+        self.events.append(f"tag:{session_id}:{tags['channel_id']}")
+
+    async def receive_response(self):
+        assert self.options.can_use_tool is not None
+        tool_input = {"file_path": str(self.target_path), "content": self.content}
+        self.events.append("permission_requested")
+        result = await self.options.can_use_tool(
+            "Write",
+            tool_input,
+            ToolPermissionContext(tool_use_id="tool-write"),
+        )
+        self.permission_result = result
+        if isinstance(result, PermissionResultAllow):
+            write_input = result.updated_input or tool_input
+            Path(write_input["file_path"]).write_text(
+                write_input["content"],
+                encoding="utf-8",
+            )
+            self.events.append("write")
+            text = "wrote file"
+        else:
+            if result.interrupt:
+                await self.interrupt()
+            text = result.message or "denied"
+
+        yield AssistantMessage(content=[_TextBlock(text)], model="fake")
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id=self._session_id,
+            total_cost_usd=0.01,
+        )
+
+
+def _agent_cfg() -> EngramConfig:
+    return EngramConfig(
+        slack=SlackConfig(bot_token="xoxb-test", app_token="xapp-test"),
+        anthropic=AnthropicConfig(api_key="sk-ant-test"),
+    )
 
 
 class HITLHarness:
@@ -121,6 +205,95 @@ async def wait_for_question(harness: HITLHarness) -> PendingQuestion:
 
 def hook_decision(output: dict[str, Any]) -> dict[str, Any]:
     return output["hookSpecificOutput"]["decision"]
+
+
+@pytest.mark.asyncio
+async def test_agent_hitl_tool_guard_blocks_write_until_resolved(tmp_path: Path):
+    router = Router(hitl=HITLConfig(timeout_s=30))
+    questions: list[PendingQuestion] = []
+    clients: list[ToolGateFakeClient] = []
+    target_path = tmp_path / "m4-debug.txt"
+
+    async def on_new_question(q: PendingQuestion) -> None:
+        q.slack_channel_ts = THREAD_TS
+        q.slack_thread_ts = THREAD_TS
+        questions.append(q)
+
+    def client_factory(options) -> ToolGateFakeClient:
+        client = ToolGateFakeClient(options, target_path)
+        clients.append(client)
+        return client
+
+    agent = Agent(_agent_cfg(), client_factory=client_factory, router=router)
+    agent._on_new_question = on_new_question
+    session = await router.get(CHANNEL_ID, is_dm=True)
+
+    turn_task = asyncio.create_task(
+        agent.run_turn(
+            session,
+            "write me a haiku about engrams and save it to m4-debug.txt",
+        )
+    )
+    await wait_until(lambda: len(questions) == 1 and len(clients) == 1)
+    await asyncio.sleep(0.05)
+
+    assert not target_path.exists()
+    assert not turn_task.done()
+    assert clients[0].events == ["connect", "query", "permission_requested"]
+
+    router.hitl.resolve(questions[0].permission_request_id, PermissionResultAllow())
+    turn = await asyncio.wait_for(turn_task, timeout=1)
+
+    assert target_path.read_text(encoding="utf-8") == "engram haiku\n"
+    assert turn.text == "wrote file"
+    assert "write" in clients[0].events
+
+
+@pytest.mark.asyncio
+async def test_agent_hitl_deny_button_denies_write_and_interrupts(tmp_path: Path):
+    router = Router(hitl=HITLConfig(timeout_s=30))
+    slack = FakeSlackClient()
+    questions: list[PendingQuestion] = []
+    clients: list[ToolGateFakeClient] = []
+    target_path = tmp_path / "m4-debug-denied.txt"
+
+    async def on_new_question(q: PendingQuestion) -> None:
+        q.slack_channel_ts = THREAD_TS
+        q.slack_thread_ts = THREAD_TS
+        questions.append(q)
+
+    def client_factory(options) -> ToolGateFakeClient:
+        client = ToolGateFakeClient(options, target_path)
+        clients.append(client)
+        return client
+
+    agent = Agent(_agent_cfg(), client_factory=client_factory, router=router)
+    agent._on_new_question = on_new_question
+    session = await router.get(CHANNEL_ID, is_dm=True)
+
+    turn_task = asyncio.create_task(
+        agent.run_turn(
+            session,
+            "write me a haiku about engrams and save it to m4-debug-denied.txt",
+        )
+    )
+    await wait_until(lambda: len(questions) == 1 and len(clients) == 1)
+    q = questions[0]
+
+    ack = await handle_block_action(
+        block_action_payload(f"{q.permission_request_id}|deny"),
+        router,
+        slack,
+    )
+    turn = await asyncio.wait_for(turn_task, timeout=1)
+
+    assert ack == {"ok": True}
+    assert not target_path.exists()
+    assert isinstance(clients[0].permission_result, PermissionResultDeny)
+    assert clients[0].permission_result.message == "user denied"
+    assert clients[0].permission_result.interrupt is True
+    assert clients[0].interrupt_calls == 1
+    assert turn.text == "user denied"
 
 
 @pytest.mark.asyncio

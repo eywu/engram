@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 
 import pytest
+from claude_agent_sdk import PermissionResultDeny
+from claude_agent_sdk.types import ToolPermissionContext
 
 from engram.agent import Agent
 from engram.config import AnthropicConfig, EngramConfig, HITLConfig, SlackConfig
@@ -49,18 +51,6 @@ def _write_mcp_config(tmp_path: Path, servers: dict) -> None:
     )
 
 
-def _permission_request_input() -> dict:
-    return {
-        "hook_event_name": "PermissionRequest",
-        "session_id": "session-1",
-        "transcript_path": "/tmp/transcript.jsonl",
-        "cwd": "/tmp",
-        "tool_name": "Bash",
-        "tool_input": {"cmd": "pytest"},
-        "permission_suggestions": [],
-    }
-
-
 # ── Legacy mode (no manifest) ──────────────────────────────────────────
 
 
@@ -75,7 +65,7 @@ def test_legacy_mode_uses_user_setting_source():
 
 
 @pytest.mark.asyncio
-async def test_permission_hook_uses_router_hitl_timeout():
+async def test_hitl_tool_guard_uses_router_hitl_timeout():
     router = Router(hitl=HITLConfig(timeout_s=0))
     session = _session(None)
     questions = []
@@ -85,16 +75,20 @@ async def test_permission_hook_uses_router_hitl_timeout():
         questions.append(q)
 
     a._on_new_question = on_new_question
-    hook = a._build_options(session).hooks["PermissionRequest"][0].hooks[0]
+    opts = a._build_options(session)
+    assert "PermissionRequest" not in opts.hooks
+    assert opts.can_use_tool is not None
 
-    output = await hook(_permission_request_input(), "tool-1", {})
+    result = await opts.can_use_tool(
+        "Bash",
+        {"cmd": "pytest"},
+        ToolPermissionContext(tool_use_id="tool-1"),
+    )
 
     assert questions[0].timeout_s == 0
-    assert output["hookSpecificOutput"]["decision"] == {
-        "behavior": "deny",
-        "message": "question timed out after 0s",
-        "interrupt": True,
-    }
+    assert isinstance(result, PermissionResultDeny)
+    assert result.message == "question timed out after 0s"
+    assert result.interrupt is True
 
 
 def test_hitl_disabled_skips_permission_request_hook():
