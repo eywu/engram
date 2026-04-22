@@ -8,19 +8,22 @@ M2 replaces the allowlist with manifest-driven provisioning.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
 from decimal import Decimal
 
+from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from slack_bolt.async_app import AsyncApp
 
 from engram.agent import Agent
 from engram.config import EngramConfig
 from engram.costs import CostLedger, TurnCost
-from engram.egress import post_reply
+from engram.egress import _suggestion_label, post_reply, update_question_resolved
 from engram.router import Router
 
 log = logging.getLogger(__name__)
+_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 
 
 def register_listeners(
@@ -48,6 +51,13 @@ def register_listeners(
         thread_ts = event.get("thread_ts") or ts
 
         if not channel_id or not text:
+            return
+
+        if event.get("thread_ts") and any(
+            q.slack_thread_ts == event.get("thread_ts")
+            for q in router.hitl.pending_for_channel(channel_id)
+        ):
+            await handle_thread_reply(event, router, client)
             return
 
         is_dm = channel_type == "im"
@@ -131,6 +141,93 @@ def register_listeners(
         # Bolt will also fire on_message for these, so we dedupe here by
         # just logging; the message handler above does the real work.
         log.debug("ingress.app_mention channel=%s user=%s", event.get("channel"), event.get("user"))
+
+
+async def handle_block_action(payload: dict, router, slack_client) -> dict:
+    """Handle Slack block_actions event. Must return ACK within 3 seconds."""
+    actions = payload.get("actions") or []
+    if not actions:
+        return {"ok": False, "error": "no actions"}
+
+    action = actions[0]
+    value = action.get("value", "")
+    if "|" not in value:
+        return {"ok": False, "error": "malformed value"}
+
+    permission_request_id, choice_key = value.split("|", 1)
+    q = router.hitl.get_by_id(permission_request_id)
+    if q is None:
+        return {"ok": False, "error": "question not found (may be resolved)"}
+    if q.future.done():
+        return {"ok": True, "info": "already resolved"}
+
+    clicker_user_id = payload.get("user", {}).get("id")
+    if q.who_can_answer and clicker_user_id != q.who_can_answer:
+        return {"ok": False, "error": "not authorized"}
+
+    task = asyncio.create_task(
+        _resolve_block_action(q, choice_key, router, slack_client)
+    )
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return {"ok": True}
+
+
+async def _resolve_block_action(q, choice_key, router, slack_client) -> None:
+    try:
+        if choice_key == "deny":
+            result = PermissionResultDeny(message="user denied")
+            answer_text = "Deny"
+        else:
+            try:
+                idx = int(choice_key)
+                suggestion = q.suggestions[idx]
+                result = PermissionResultAllow(
+                    updated_input=q.tool_input,
+                    updated_permissions=(
+                        [suggestion] if hasattr(suggestion, "to_dict") else None
+                    ),
+                )
+                answer_text = _suggestion_label(suggestion)
+            except (ValueError, IndexError):
+                result = PermissionResultAllow()
+                answer_text = "Allow"
+
+        router.hitl.resolve(q.permission_request_id, result)
+        await update_question_resolved(q, answer_text, slack_client)
+    except Exception:
+        log.exception("resolve_block_action failed")
+
+
+async def handle_thread_reply(event: dict, router, slack_client) -> None:
+    """Resolve a pending question when a Slack thread reply provides an answer."""
+    thread_ts = event.get("thread_ts")
+    channel_id = event.get("channel")
+    reply_text = event.get("text", "")
+    if not thread_ts or not channel_id or not reply_text:
+        return
+
+    candidates = [
+        q
+        for q in router.hitl.pending_for_channel(channel_id)
+        if q.slack_thread_ts == thread_ts
+    ]
+    if not candidates:
+        return
+
+    q = candidates[0]
+    if q.future.done():
+        return
+
+    replier_user_id = event.get("user")
+    if q.who_can_answer and replier_user_id != q.who_can_answer:
+        return
+
+    result = PermissionResultAllow(
+        updated_input={**q.tool_input, "_user_answer": reply_text}
+    )
+    router.hitl.resolve(q.permission_request_id, result)
+    await update_question_resolved(q, reply_text[:80], slack_client)
 
 
 async def _send_budget_warnings(client, config: EngramConfig, turn, *, channel_id: str) -> None:
