@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from engram.config import EngramConfig
+from engram.config import EngramConfig, HITLConfig
 
 
 @pytest.fixture
@@ -33,6 +33,14 @@ def _write_yaml(tmp_path: Path, content: dict) -> Path:
     return p
 
 
+def test_hitl_config_defaults():
+    cfg = HITLConfig()
+
+    assert cfg.enabled is True
+    assert cfg.timeout_s == 300
+    assert cfg.max_per_day == 5
+
+
 def test_load_from_yaml(tmp_path, clean_env):
     path = _write_yaml(
         tmp_path,
@@ -41,6 +49,7 @@ def test_load_from_yaml(tmp_path, clean_env):
             "anthropic": {"api_key": "sk-ant-file", "model": "claude-sonnet-4-6"},
             "allowed_channels": ["C123"],
             "max_turns_per_message": 5,
+            "hitl": {"enabled": True, "timeout_s": 120, "max_per_day": 2},
         },
     )
     cfg = EngramConfig.load(path)
@@ -50,6 +59,8 @@ def test_load_from_yaml(tmp_path, clean_env):
     assert cfg.anthropic.model == "claude-sonnet-4-6"
     assert cfg.allowed_channels == ["C123"]
     assert cfg.max_turns_per_message == 5
+    assert cfg.hitl.timeout_s == 120
+    assert cfg.hitl.max_per_day == 2
 
 
 def test_env_fallback(tmp_path, clean_env, monkeypatch):

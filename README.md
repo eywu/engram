@@ -54,6 +54,38 @@ Full design: coming in later milestones.
 | M4 — AskUserQuestion + HITL | ⏳ |
 | M5 — Self-improvement loop | ⏳ |
 
+## M4 Demo: Human-in-the-Loop Questions
+
+M4 adds the Slack round-trip for tool-permission prompts. When Claude needs
+human input before continuing, Engram posts a Block Kit question in the same
+channel, waits for a button click or threaded reply, then resumes the original
+agent turn.
+
+Walkthrough:
+
+1. Start Engram with Socket Mode and mention it in an approved channel.
+2. Ask for an action that needs permission, such as running a scoped command
+   or editing a file.
+3. Claude emits a permission prompt. Engram turns it into Slack buttons with
+   the available choices and a deny option.
+4. Click a button, or reply in-thread with clarification. Engram resolves the
+   pending question and lets the Claude SDK continue.
+5. If no one answers before `hitl.timeout_s`, Engram interrupts the turn and
+   denies the permission request. Each channel is capped by
+   `hitl.max_per_day`.
+
+Default manifest settings:
+
+```yaml
+hitl:
+  enabled: true
+  timeout_s: 300
+  max_per_day: 5
+```
+
+Owner DMs use `max_per_day: 5`; team-channel templates use `max_per_day: 3`
+so shared rooms do not get flooded with prompts.
+
 ## License
 
 MIT (to be added).

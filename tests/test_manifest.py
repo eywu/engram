@@ -1,11 +1,13 @@
 """Tests for the channel manifest schema."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 import yaml
 
+from engram import paths
 from engram.manifest import (
     AskUserQuestion,
     Behavior,
@@ -148,6 +150,40 @@ def test_ask_user_question_defaults():
     a = AskUserQuestion()
     assert a.enabled is True
     assert a.fallback == "escalate-to-owner"
+
+
+def test_manifest_loads_hitl_section(tmp_path: Path):
+    templates = [
+        ("owner-dm.yaml", "D07OWNER", "DM", 5),
+        ("task-assistant.yaml", "C07TEAM", "#test-team", 3),
+    ]
+
+    for template_name, channel_id, label, max_per_day in templates:
+        template = paths.TEMPLATES_MANIFESTS_DIR / template_name
+        rendered = (
+            template.read_text()
+            .replace("{{channel_id}}", channel_id)
+            .replace("{{channel_label}}", label)
+        )
+        manifest_path = tmp_path / template_name
+        manifest_path.write_text(rendered)
+
+        manifest = load_manifest(manifest_path)
+
+        assert manifest.hitl.enabled is True
+        assert manifest.hitl.timeout_s == 300
+        assert manifest.hitl.max_per_day == max_per_day
+
+
+def test_no_dont_ask_rule_in_templates():
+    pattern = re.compile(r"don.t ask", re.IGNORECASE)
+    matches = []
+
+    for template in paths.TEMPLATES_DIR.rglob("*"):
+        if template.is_file() and pattern.search(template.read_text()):
+            matches.append(str(template.relative_to(paths.TEMPLATES_DIR)))
+
+    assert matches == []
 
 
 def test_subagents_default_empty():
