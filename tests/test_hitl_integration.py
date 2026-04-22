@@ -11,6 +11,7 @@ from claude_agent_sdk import PermissionResultAllow
 from engram.egress import post_question, update_question_timeout
 from engram.hitl import PendingQuestion, build_permission_request_hook
 from engram.ingress import handle_block_action, handle_thread_reply
+from engram.main import _schedule_timeout_update
 from engram.router import Router
 
 CHANNEL_ID = "C07TEST123"
@@ -165,6 +166,24 @@ async def test_timeout_triggers_interrupt_and_deny():
     await wait_until(lambda: len(harness.slack.update_calls) == 1)
     assert harness.slack.update_calls[0]["text"] == "Timed out"
     assert "⏱️ Question timed out" in harness.slack.update_calls[0]["blocks"][0]["text"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_production_timeout_callback_updates_slack():
+    harness = HITLHarness(update_on_timeout=False)
+
+    task = asyncio.create_task(
+        harness.hook(permission_request_input(), "tool-1", {})
+    )
+    q = await wait_for_question(harness)
+    _schedule_timeout_update(q, harness.slack)
+
+    q.future.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await wait_until(lambda: len(harness.slack.update_calls) == 1)
+    assert harness.slack.update_calls[0]["text"] == "Timed out"
 
 
 @pytest.mark.asyncio
