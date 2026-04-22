@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 
 import pytest
@@ -157,25 +158,37 @@ async def test_registered_hitl_action_handler_acks_and_resolves_question():
 
 
 @pytest.mark.asyncio
-async def test_block_action_happy_path():
+async def test_block_action_happy_path(caplog: pytest.LogCaptureFixture):
     router = Router()
     slack = FakeSlackClient()
     suggestion = permission_update()
     q = make_question(suggestions=[suggestion])
     router.hitl.register(q)
 
-    ack = await handle_block_action(
-        block_action_payload("prq-1|0"), router, slack
-    )
+    with caplog.at_level(logging.INFO, logger="engram.hitl"):
+        ack = await handle_block_action(
+            block_action_payload("prq-1|0"), router, slack
+        )
+        await wait_until(lambda: q.future.done() and len(slack.update_calls) == 1)
 
     assert ack == {"ok": True}
-    await wait_until(lambda: q.future.done() and len(slack.update_calls) == 1)
     result = q.future.result()
     assert isinstance(result, PermissionResultAllow)
     assert result.updated_input == q.tool_input
     assert result.updated_permissions == [suggestion]
     assert slack.update_calls[0]["channel"] == "C07TEST123"
     assert slack.update_calls[0]["ts"] == "1713800000.000100"
+    answer_records = [
+        record
+        for record in caplog.records
+        if record.name == "engram.hitl"
+        and record.getMessage() == "hitl.answer_received"
+    ]
+    assert len(answer_records) == 1
+    answer = answer_records[0]
+    assert answer.permission_request_id == "prq-1"
+    assert answer.choice == "0"
+    assert answer.decision == "allow"
 
 
 @pytest.mark.asyncio

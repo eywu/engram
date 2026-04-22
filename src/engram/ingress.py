@@ -24,6 +24,7 @@ from engram.egress import _suggestion_label, post_reply, update_question_resolve
 from engram.router import Router
 
 log = logging.getLogger(__name__)
+hitl_log = logging.getLogger("engram.hitl")
 _BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 HITL_ACTION_ID_PATTERN = re.compile(r"^hitl_choice_(?:\d+|deny)$")
 
@@ -208,7 +209,16 @@ async def _resolve_block_action(q, choice_key, router, slack_client) -> None:
                 result = PermissionResultAllow()
                 answer_text = "Allow"
 
-        router.hitl.resolve(q.permission_request_id, result)
+        resolved = router.hitl.resolve(q.permission_request_id, result)
+        if resolved:
+            hitl_log.info(
+                "hitl.answer_received",
+                extra={
+                    "permission_request_id": q.permission_request_id,
+                    "choice": choice_key,
+                    "decision": _hitl_decision_label(result),
+                },
+            )
         await update_question_resolved(q, answer_text, slack_client)
     except Exception:
         log.exception("resolve_block_action failed")
@@ -241,8 +251,25 @@ async def handle_thread_reply(event: dict, router, slack_client) -> None:
     result = PermissionResultAllow(
         updated_input={**q.tool_input, "_user_answer": reply_text}
     )
-    router.hitl.resolve(q.permission_request_id, result)
+    resolved = router.hitl.resolve(q.permission_request_id, result)
+    if resolved:
+        hitl_log.info(
+            "hitl.answer_received",
+            extra={
+                "permission_request_id": q.permission_request_id,
+                "choice": "thread_reply",
+                "decision": "allow",
+            },
+        )
     await update_question_resolved(q, reply_text[:80], slack_client)
+
+
+def _hitl_decision_label(result) -> str:
+    if isinstance(result, PermissionResultAllow):
+        return "allow"
+    if isinstance(result, PermissionResultDeny):
+        return "deny"
+    raise TypeError(f"Unknown PermissionResult type: {type(result)}")
 
 
 async def _send_budget_warnings(client, config: EngramConfig, turn, *, channel_id: str) -> None:
