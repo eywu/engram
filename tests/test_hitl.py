@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 
 import pytest
@@ -54,6 +55,20 @@ def permission_request_input() -> dict:
             )
         ],
     }
+
+
+def hitl_records(caplog: pytest.LogCaptureFixture, event: str):
+    return [
+        record
+        for record in caplog.records
+        if record.name == "engram.hitl" and record.getMessage() == event
+    ]
+
+
+def one_hitl_record(caplog: pytest.LogCaptureFixture, event: str):
+    records = hitl_records(caplog, event)
+    assert len(records) == 1
+    return records[0]
 
 
 def test_registry_register_and_get():
@@ -179,11 +194,12 @@ async def _next_question(questions: list[PendingQuestion]) -> PendingQuestion:
 
 
 @pytest.mark.asyncio
-async def test_hook_posts_question_and_awaits():
+async def test_hook_posts_question_and_awaits(caplog: pytest.LogCaptureFixture):
     router = Router()
     questions: list[PendingQuestion] = []
 
     async def on_new_question(q: PendingQuestion) -> None:
+        q.slack_channel_ts = "1713800000.000100"
         questions.append(q)
 
     hook = build_permission_request_hook(
@@ -193,28 +209,48 @@ async def test_hook_posts_question_and_awaits():
         on_new_question=on_new_question,
     )
 
-    task = asyncio.create_task(hook(permission_request_input(), "tool-1", {}))
-    q = await asyncio.wait_for(_next_question(questions), timeout=1)
+    with caplog.at_level(logging.INFO, logger="engram.hitl"):
+        task = asyncio.create_task(hook(permission_request_input(), "tool-1", {}))
+        q = await asyncio.wait_for(_next_question(questions), timeout=1)
 
-    assert router.hitl.get_by_id(q.permission_request_id) is q
-    assert q.session_id == "session-1"
-    assert q.tool_name == "Bash"
-    assert q.tool_input == {"cmd": "pytest"}
-    assert q.suggestions == permission_request_input()["permission_suggestions"]
+        assert router.hitl.get_by_id(q.permission_request_id) is q
+        assert q.session_id == "session-1"
+        assert q.tool_name == "Bash"
+        assert q.tool_input == {"cmd": "pytest"}
+        assert q.suggestions == permission_request_input()["permission_suggestions"]
 
-    router.hitl.resolve(q.permission_request_id, PermissionResultAllow())
+        router.hitl.resolve(q.permission_request_id, PermissionResultAllow())
 
-    assert await task == {
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": {"behavior": "allow"},
+        assert await task == {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {"behavior": "allow"},
+            }
         }
-    }
+    hook_fired = one_hitl_record(caplog, "hitl.hook_fired")
+    assert hook_fired.tool_name == "Bash"
+    assert hook_fired.tool_use_id == "tool-1"
+    assert hook_fired.channel_id == "C07TEST123"
+    assert hook_fired.session_id == "session-1"
+
+    registered = one_hitl_record(caplog, "hitl.question_registered")
+    assert registered.permission_request_id == q.permission_request_id
+    assert registered.tool_name == "Bash"
+
+    posted = one_hitl_record(caplog, "hitl.question_posted")
+    assert posted.slack_channel_ts == "1713800000.000100"
+    assert posted.permission_request_id == q.permission_request_id
+
+    returned = one_hitl_record(caplog, "hitl.hook_returned")
+    assert returned.decision == "allow"
+    assert isinstance(returned.duration_ms, int)
     assert router.hitl.get_by_id(q.permission_request_id) is None
 
 
 @pytest.mark.asyncio
-async def test_hook_timeout_calls_interrupt_and_denies():
+async def test_hook_timeout_calls_interrupt_and_denies(
+    caplog: pytest.LogCaptureFixture,
+):
     class FakeClient:
         def __init__(self) -> None:
             self.interrupted = False
@@ -235,21 +271,28 @@ async def test_hook_timeout_calls_interrupt_and_denies():
         default_timeout_s=0,
     )
 
-    assert await hook(permission_request_input(), "tool-1", {}) == {
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": {
-                "behavior": "deny",
-                "message": "question timed out after 0s",
-                "interrupt": True,
-            },
+    with caplog.at_level(logging.INFO, logger="engram.hitl"):
+        assert await hook(permission_request_input(), "tool-1", {}) == {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {
+                    "behavior": "deny",
+                    "message": "question timed out after 0s",
+                    "interrupt": True,
+                },
+            }
         }
-    }
     assert client.interrupted is True
+    timed_out = one_hitl_record(caplog, "hitl.question_timed_out")
+    assert timed_out.timeout_s == 0
+
+    returned = one_hitl_record(caplog, "hitl.hook_returned")
+    assert returned.decision == "deny"
+    assert isinstance(returned.duration_ms, int)
 
 
 @pytest.mark.asyncio
-async def test_hook_rate_limit_auto_denies():
+async def test_hook_rate_limit_auto_denies(caplog: pytest.LogCaptureFixture):
     router = Router()
     router.hitl.register(make_question())
     called = False
@@ -265,20 +308,27 @@ async def test_hook_rate_limit_auto_denies():
         on_new_question=on_new_question,
     )
 
-    assert await hook(permission_request_input(), "tool-1", {}) == {
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": {
-                "behavior": "deny",
-                "message": (
-                    "HITL rate-limited: another question already pending "
-                    "in this channel"
-                ),
-            },
+    with caplog.at_level(logging.INFO, logger="engram.hitl"):
+        assert await hook(permission_request_input(), "tool-1", {}) == {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {
+                    "behavior": "deny",
+                    "message": (
+                        "HITL rate-limited: another question already pending "
+                        "in this channel"
+                    ),
+                },
+            }
         }
-    }
     assert called is False
     assert len(router.hitl.pending_for_channel("C07TEST123")) == 1
+    rate_limited = one_hitl_record(caplog, "hitl.rate_limited")
+    assert rate_limited.reason == "another question already pending in this channel"
+    assert rate_limited.channel_id == "C07TEST123"
+
+    returned = one_hitl_record(caplog, "hitl.hook_returned")
+    assert returned.decision == "deny"
 
 
 @pytest.mark.asyncio
@@ -345,7 +395,9 @@ async def test_hook_uses_manifest_hitl_daily_cap(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_hook_on_new_question_failure_denies_fast():
+async def test_hook_on_new_question_failure_denies_fast(
+    caplog: pytest.LogCaptureFixture,
+):
     async def on_new_question(_q: PendingQuestion) -> None:
         raise RuntimeError("slack failed")
 
@@ -357,16 +409,23 @@ async def test_hook_on_new_question_failure_denies_fast():
         on_new_question=on_new_question,
     )
 
-    assert await hook(permission_request_input(), "tool-1", {}) == {
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": {
-                "behavior": "deny",
-                "message": "failed to post question",
-            },
+    with caplog.at_level(logging.INFO, logger="engram.hitl"):
+        assert await hook(permission_request_input(), "tool-1", {}) == {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {
+                    "behavior": "deny",
+                    "message": "failed to post question",
+                },
+            }
         }
-    }
     assert router.hitl.pending_for_channel("C07TEST123") == []
+    failed = one_hitl_record(caplog, "hitl.question_post_failed")
+    assert failed.exception == "RuntimeError: slack failed"
+    assert failed.permission_request_id
+
+    returned = one_hitl_record(caplog, "hitl.hook_returned")
+    assert returned.decision == "deny"
 
 
 def test_hook_output_shape_allow():

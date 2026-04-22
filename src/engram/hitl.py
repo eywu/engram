@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -18,6 +20,7 @@ from claude_agent_sdk.types import (
 )
 
 PermissionResult = PermissionResultAllow | PermissionResultDeny
+log = logging.getLogger(__name__)
 
 
 def _create_future() -> asyncio.Future[PermissionResult]:
@@ -144,58 +147,112 @@ def build_permission_request_hook(
         _tool_use_id: str | None,
         _context: dict[str, Any],
     ) -> SyncHookJSONOutput:
-        daily_limit = max_per_day
-        if daily_limit is None:
-            daily_limit = router.hitl_config_for_channel(channel_id).max_per_day
-        allowed, reason = router.hitl_limiter.check(
-            channel_id,
-            max_per_day=daily_limit,
+        started_at = time.monotonic()
+        result: PermissionResult | None = None
+        tool_use_id = _tool_use_id or input_data.get("tool_use_id")
+        log.info(
+            "hitl.hook_fired",
+            extra={
+                "tool_name": input_data["tool_name"],
+                "tool_use_id": tool_use_id,
+                "channel_id": channel_id,
+                "session_id": input_data["session_id"],
+            },
         )
-        if not allowed:
-            return _permission_result_to_hook_output(
-                PermissionResultDeny(message=f"HITL rate-limited: {reason}")
-            )
-
-        permission_request_id = str(uuid.uuid4())
-        q = PendingQuestion(
-            permission_request_id=permission_request_id,
-            channel_id=channel_id,
-            session_id=input_data["session_id"],
-            turn_id=str(uuid.uuid4()),
-            tool_name=input_data["tool_name"],
-            tool_input=input_data["tool_input"],
-            suggestions=list(input_data.get("permission_suggestions") or []),
-            who_can_answer=None,
-            posted_at=datetime.now(UTC),
-            timeout_s=default_timeout_s,
-        )
-
-        router.hitl.register(q)
-        router.hitl_limiter.reserve(channel_id)
-
         try:
-            await on_new_question(q)
-        except Exception:
-            router.hitl.resolve(
-                permission_request_id,
-                PermissionResultDeny(message="failed to post question"),
+            daily_limit = max_per_day
+            if daily_limit is None:
+                daily_limit = router.hitl_config_for_channel(channel_id).max_per_day
+            allowed, reason = router.hitl_limiter.check(
+                channel_id,
+                max_per_day=daily_limit,
+            )
+            if not allowed:
+                log.info(
+                    "hitl.rate_limited",
+                    extra={"reason": reason, "channel_id": channel_id},
+                )
+                result = PermissionResultDeny(message=f"HITL rate-limited: {reason}")
+                return _permission_result_to_hook_output(result)
+
+            permission_request_id = str(uuid.uuid4())
+            q = PendingQuestion(
+                permission_request_id=permission_request_id,
+                channel_id=channel_id,
+                session_id=input_data["session_id"],
+                turn_id=str(uuid.uuid4()),
+                tool_name=input_data["tool_name"],
+                tool_input=input_data["tool_input"],
+                suggestions=list(input_data.get("permission_suggestions") or []),
+                who_can_answer=None,
+                posted_at=datetime.now(UTC),
+                timeout_s=default_timeout_s,
             )
 
-        try:
-            result = await asyncio.wait_for(q.future, timeout=q.timeout_s)
-        except TimeoutError:
-            client = client_provider()
-            if client is not None:
-                with contextlib.suppress(Exception):
-                    await client.interrupt()
-            result = PermissionResultDeny(
-                interrupt=True,
-                message=f"question timed out after {q.timeout_s}s",
+            router.hitl.register(q)
+            log.info(
+                "hitl.question_registered",
+                extra={
+                    "permission_request_id": permission_request_id,
+                    "tool_name": q.tool_name,
+                },
             )
+            router.hitl_limiter.reserve(channel_id)
+
+            try:
+                await on_new_question(q)
+                log.info(
+                    "hitl.question_posted",
+                    extra={
+                        "slack_channel_ts": q.slack_channel_ts,
+                        "permission_request_id": permission_request_id,
+                    },
+                )
+            except Exception as exc:
+                log.error(
+                    "hitl.question_post_failed",
+                    exc_info=True,
+                    extra={
+                        "exception": f"{type(exc).__name__}: {exc}",
+                        "permission_request_id": permission_request_id,
+                    },
+                )
+                router.hitl.resolve(
+                    permission_request_id,
+                    PermissionResultDeny(message="failed to post question"),
+                )
+
+            try:
+                result = await asyncio.wait_for(q.future, timeout=q.timeout_s)
+            except TimeoutError:
+                log.info(
+                    "hitl.question_timed_out",
+                    extra={
+                        "permission_request_id": permission_request_id,
+                        "timeout_s": q.timeout_s,
+                    },
+                )
+                client = client_provider()
+                if client is not None:
+                    with contextlib.suppress(Exception):
+                        await client.interrupt()
+                result = PermissionResultDeny(
+                    interrupt=True,
+                    message=f"question timed out after {q.timeout_s}s",
+                )
+            finally:
+                router.hitl.cleanup_resolved()
+
+            return _permission_result_to_hook_output(result)
         finally:
-            router.hitl.cleanup_resolved()
-
-        return _permission_result_to_hook_output(result)
+            if result is not None:
+                log.info(
+                    "hitl.hook_returned",
+                    extra={
+                        "decision": _decision_label(result),
+                        "duration_ms": _duration_ms(started_at),
+                    },
+                )
 
     return hook
 
@@ -220,6 +277,18 @@ def _permission_result_to_hook_output(
         return _permission_request_output(decision)
 
     raise TypeError(f"Unknown PermissionResult type: {type(result)}")
+
+
+def _decision_label(result: PermissionResult) -> str:
+    if isinstance(result, PermissionResultAllow):
+        return "allow"
+    if isinstance(result, PermissionResultDeny):
+        return "deny"
+    raise TypeError(f"Unknown PermissionResult type: {type(result)}")
+
+
+def _duration_ms(started_at: float) -> int:
+    return max(0, int((time.monotonic() - started_at) * 1000))
 
 
 def _permission_request_output(decision: dict[str, Any]) -> SyncHookJSONOutput:
