@@ -14,10 +14,14 @@ import datetime
 import inspect
 import json
 import logging
+import os
+import re
 import time
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -52,6 +56,9 @@ from engram.scope import build_scope_decision, build_tool_guard
 from engram.telemetry import cli_stderr_logger
 
 log = logging.getLogger(__name__)
+
+_CLAUDE_MAX_SANITIZED_LENGTH = 200
+_CLAUDE_SANITIZE_RE = re.compile(r"[^a-zA-Z0-9]")
 
 
 @dataclass
@@ -272,6 +279,16 @@ class Agent:
         if session.agent_client is not None:
             self._refresh_client_budget_limit(session.agent_client)
             return session.agent_client
+
+        jsonl_path = _claude_cli_jsonl_for(session.session_id, session.cwd)
+        jsonl_exists = jsonl_path.exists()
+        if jsonl_exists and not session.agent_session_initialized:
+            session.agent_session_initialized = True
+            log.info(
+                "agent.session_resume_from_disk session=%s jsonl_exists=%s",
+                session.label(),
+                jsonl_exists,
+            )
 
         options = self._build_options(
             session,
@@ -638,3 +655,46 @@ def _summarize_budget_checks(
             if threshold not in warnings:
                 warnings.append(threshold)
     return tuple(warnings), month_to_date, monthly_cap
+
+
+def _claude_cli_jsonl_for(session_id: str, cwd: Path | str | None = None) -> Path:
+    """Return the Claude CLI transcript path for a session/cwd pair."""
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        claude_home = Path(unicodedata.normalize("NFC", config_dir))
+    else:
+        claude_home = Path(unicodedata.normalize("NFC", str(Path.home() / ".claude")))
+
+    project_cwd = str(cwd if cwd is not None else Path.cwd())
+    project_path = unicodedata.normalize("NFC", os.path.realpath(project_cwd))
+    return (
+        claude_home
+        / "projects"
+        / _claude_sanitize_path(project_path)
+        / f"{session_id}.jsonl"
+    )
+
+
+def _claude_sanitize_path(name: str) -> str:
+    sanitized = _CLAUDE_SANITIZE_RE.sub("-", name)
+    if len(sanitized) <= _CLAUDE_MAX_SANITIZED_LENGTH:
+        return sanitized
+    return f"{sanitized[:_CLAUDE_MAX_SANITIZED_LENGTH]}-{_claude_simple_hash(name)}"
+
+
+def _claude_simple_hash(value: str) -> str:
+    hash_value = 0
+    for char in value:
+        hash_value = ((hash_value << 5) - hash_value + ord(char)) & 0xFFFFFFFF
+        if hash_value >= 0x80000000:
+            hash_value -= 0x100000000
+    hash_value = abs(hash_value)
+    if hash_value == 0:
+        return "0"
+
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    encoded = []
+    while hash_value:
+        encoded.append(digits[hash_value % 36])
+        hash_value //= 36
+    return "".join(reversed(encoded))

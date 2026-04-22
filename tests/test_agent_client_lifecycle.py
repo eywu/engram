@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
-from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage
+from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ProcessError, ResultMessage
 
-from engram.agent import Agent
+from engram.agent import Agent, _claude_cli_jsonl_for
 from engram.config import AnthropicConfig, EngramConfig, SlackConfig
 from engram.router import Router, SessionState, derive_session_id
 
@@ -85,6 +88,68 @@ class _FakeClient:
         tags: dict[str, str],
     ) -> None:
         self.tag_calls.append({"session_id": session_id, "tags": tags})
+
+
+@dataclass
+class _TranscriptFakeClient:
+    options: ClaudeAgentOptions
+    _prompt: str = ""
+    _session_id: str = ""
+
+    async def connect(self) -> None:
+        session_id = self.options.session_id or self.options.resume
+        transcript_path = _claude_cli_jsonl_for(session_id or "", self.options.cwd)
+        if self.options.session_id and transcript_path.exists():
+            raise ProcessError(
+                f"Error: Session ID {self.options.session_id} is already in use.",
+                exit_code=1,
+            )
+
+    async def disconnect(self) -> None:
+        pass
+
+    async def query(self, prompt: str, session_id: str = "default") -> None:
+        self._prompt = prompt
+        self._session_id = session_id
+
+    async def receive_response(self):
+        transcript_path = _claude_cli_jsonl_for(self._session_id, self.options.cwd)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        with transcript_path.open("a", encoding="utf-8") as transcript:
+            transcript.write(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": self._session_id,
+                        "message": {"content": self._prompt},
+                    }
+                )
+                + "\n"
+            )
+            transcript.write(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "sessionId": self._session_id,
+                        "message": {"content": f"ok:{self._prompt}"},
+                    }
+                )
+                + "\n"
+            )
+
+        yield AssistantMessage(
+            content=[_TextBlock(f"{self._prompt}:{self._session_id}")],
+            model="fake",
+        )
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id=self._session_id,
+            total_cost_usd=0.01,
+        )
 
 
 def test_session_id_is_deterministic():
@@ -193,6 +258,56 @@ async def test_first_turn_uses_session_id_subsequent_turns_use_resume():
     assert options_seen[0].resume is None
     assert options_seen[1].session_id is None
     assert options_seen[1].resume == session.session_id
+
+
+@pytest.mark.asyncio
+async def test_existing_transcript_after_state_reset_resumes_from_disk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    channel_id = "C07TEST123"
+    session_id = derive_session_id(channel_id)
+    transcript_path = _claude_cli_jsonl_for(session_id, cwd)
+    options_seen: list[ClaudeAgentOptions] = []
+
+    def factory(options: ClaudeAgentOptions) -> _TranscriptFakeClient:
+        options_seen.append(options)
+        return _TranscriptFakeClient(options)
+
+    agent = Agent(_cfg(), client_factory=factory, retry_base_delay_seconds=0)
+    first_session = SessionState(channel_id=channel_id, cwd=cwd)
+    first = await agent.run_turn(first_session, "first")
+
+    assert first.error_message is None
+    assert transcript_path.exists()
+
+    second_session = SessionState(channel_id=channel_id, cwd=cwd)
+    caplog.clear()
+    caplog.set_level(logging.INFO, logger="engram.agent")
+    second = await agent.run_turn(second_session, "second")
+
+    assert second.error_message is None
+    assert len(options_seen) == 2
+    assert options_seen[0].session_id == session_id
+    assert options_seen[0].resume is None
+    assert options_seen[1].session_id is None
+    assert options_seen[1].resume == session_id
+    assert "agent.session_resume_from_disk" in caplog.text
+
+    records = [
+        json.loads(line)
+        for line in transcript_path.read_text(encoding="utf-8").splitlines()
+    ]
+    user_prompts = [
+        record["message"]["content"]
+        for record in records
+        if record["type"] == "user"
+    ]
+    assert user_prompts == ["first", "second"]
 
 
 @pytest.mark.asyncio
