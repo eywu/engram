@@ -1,10 +1,53 @@
 """Egress tests — chunking + post shape, no real Slack calls."""
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from engram.agent import AgentTurn
-from engram.egress import SLACK_MAX_TEXT_LEN, _chunk_text, post_reply
+from engram.egress import (
+    SLACK_MAX_TEXT_LEN,
+    _chunk_text,
+    _suggestion_label,
+    post_question,
+    post_reply,
+    update_question_resolved,
+    update_question_timeout,
+)
+from engram.hitl import PendingQuestion
+
+
+class FakeSlackClient:
+    def __init__(self) -> None:
+        self.post_calls = []
+        self.update_calls = []
+        self.chat_postMessage = self.chat_post_message
+
+    async def chat_post_message(self, **kwargs):
+        self.post_calls.append(kwargs)
+        return {"ts": "1713800000.000100"}
+
+    async def chat_update(self, **kwargs):
+        self.update_calls.append(kwargs)
+        return {"ok": True}
+
+
+def make_question(*, suggestions=None) -> PendingQuestion:
+    return PendingQuestion(
+        permission_request_id="prq-1",
+        channel_id="C07TEST123",
+        session_id="session-1",
+        turn_id="turn-1",
+        tool_name="Bash",
+        tool_input={"cmd": "pytest", "timeout": 30},
+        suggestions=list(suggestions or []),
+        who_can_answer=None,
+        posted_at=datetime(2026, 4, 22, tzinfo=UTC),
+        timeout_s=300,
+        slack_channel_ts="1713800000.000100",
+        slack_thread_ts="1713800000.000100",
+    )
 
 
 def test_chunk_short_text_single():
@@ -70,3 +113,112 @@ async def test_post_reply_chunks_long_text():
     res = await post_reply(say, turn, thread_ts=None, session_label="ch:C1")
     assert res.chunks_posted == 2
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_post_question_block_kit_shape():
+    slack = FakeSlackClient()
+    q = make_question(suggestions=[{"name": "Allow"}])
+
+    channel_ts, thread_ts = await post_question(q, slack)
+
+    assert (channel_ts, thread_ts) == ("1713800000.000100", "1713800000.000100")
+    assert len(slack.post_calls) == 1
+    call = slack.post_calls[0]
+    blocks = call["blocks"]
+    assert call["channel"] == "C07TEST123"
+    assert call["text"] == "🤔 Can I proceed with `Bash`?"
+    assert blocks[0]["text"]["text"] == "🤔 Can I proceed with `Bash`?"
+    assert blocks[1]["text"]["text"].startswith("```")
+    assert '"cmd": "pytest"' in blocks[1]["text"]["text"]
+    assert blocks[1]["text"]["text"].endswith("```")
+    assert blocks[2]["type"] == "actions"
+    assert blocks[2]["block_id"] == "hitl_actions"
+    assert blocks[3]["type"] == "context"
+    assert "reply in this thread" in blocks[3]["elements"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_post_question_suggestion_buttons():
+    slack = FakeSlackClient()
+    q = make_question(suggestions=[{"name": "A"}, {"name": "B"}, {"name": "C"}])
+
+    await post_question(q, slack)
+
+    elements = slack.post_calls[0]["blocks"][2]["elements"]
+    assert len(elements) == 4
+    assert [element["text"]["text"] for element in elements] == ["A", "B", "C", "Deny"]
+    assert [element["value"] for element in elements] == [
+        "prq-1|0",
+        "prq-1|1",
+        "prq-1|2",
+        "prq-1|deny",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_post_question_suggestions_truncated_at_5():
+    slack = FakeSlackClient()
+    q = make_question(suggestions=[{"name": f"Choice {i}"} for i in range(10)])
+
+    await post_question(q, slack)
+
+    elements = slack.post_calls[0]["blocks"][2]["elements"]
+    assert len(elements) == 6
+    assert [element["text"]["text"] for element in elements] == [
+        "Choice 0",
+        "Choice 1",
+        "Choice 2",
+        "Choice 3",
+        "Choice 4",
+        "Deny",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_post_question_deny_button_has_danger_style():
+    slack = FakeSlackClient()
+    q = make_question()
+
+    await post_question(q, slack)
+
+    deny = slack.post_calls[0]["blocks"][2]["elements"][-1]
+    assert deny["action_id"] == "hitl_choice_deny"
+    assert deny["style"] == "danger"
+
+
+@pytest.mark.asyncio
+async def test_update_question_resolved_strips_buttons():
+    slack = FakeSlackClient()
+    q = make_question()
+
+    await update_question_resolved(q, "approved", slack)
+
+    assert len(slack.update_calls) == 1
+    call = slack.update_calls[0]
+    assert call["channel"] == "C07TEST123"
+    assert call["ts"] == "1713800000.000100"
+    assert call["text"] == "Answered: approved"
+    assert all(block["type"] != "actions" for block in call["blocks"])
+    assert call["blocks"][0]["text"]["text"] == "✅ Answered: *approved*"
+
+
+@pytest.mark.asyncio
+async def test_update_question_timeout_has_clock_emoji():
+    slack = FakeSlackClient()
+    q = make_question()
+
+    await update_question_timeout(q, slack)
+
+    call = slack.update_calls[0]
+    assert call["text"] == "Timed out"
+    assert "⏱️ Question timed out" in call["blocks"][0]["text"]["text"]
+
+
+def test_suggestion_label_extraction():
+    long = "x" * 50
+
+    assert _suggestion_label({"name": "Allow once"}) == "Allow once"
+    assert _suggestion_label({"label": "Allow with label"}) == "Allow with label"
+    assert _suggestion_label({"unknown": "value"}) == "choice"
+    assert _suggestion_label(long) == "x" * 40
