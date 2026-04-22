@@ -135,6 +135,12 @@ def test_engram_status_includes_channels_and_counts(isolated_home: Path):
         conn.execute("CREATE TABLE summaries (id INTEGER PRIMARY KEY)")
         conn.executemany("INSERT INTO transcripts DEFAULT VALUES", [(), (), ()])
         conn.executemany("INSERT INTO summaries DEFAULT VALUES", [(), ()])
+    state_dir = isolated_home / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "status.json").write_text(
+        json.dumps({"memory": {"embedding_queue": {"enabled": True}}}),
+        encoding="utf-8",
+    )
 
     result = CliRunner().invoke(app, ["status", "--json"])
 
@@ -146,6 +152,7 @@ def test_engram_status_includes_channels_and_counts(isolated_home: Path):
     }
     assert payload["memory"]["transcripts_count"] == 3
     assert payload["memory"]["summaries_count"] == 2
+    assert "embedding_queue" not in payload["memory"]
     assert all(c["rate_limit"]["status"] == "allowed" for c in payload["channels"])
 
 
@@ -175,6 +182,8 @@ def test_engram_cost_by_channel_sums_to_total(isolated_home: Path):
 
     assert total.exit_code == 0
     assert by_channel.exit_code == 0
+    assert "embedding cost" not in by_channel.output
+    assert "gemini free-tier" not in by_channel.output
     total_amount = float(re.findall(r"\$([0-9.]+)", total.output)[0])
     amounts = [float(x) for x in re.findall(r"\$([0-9.]+)", by_channel.output)]
     assert amounts[-1] == pytest.approx(total_amount)
