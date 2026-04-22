@@ -38,6 +38,7 @@ from engram.budget import BUDGET_PAUSE_MESSAGE, Budget, CheckResult
 from engram.config import EngramConfig
 from engram.costs import CostDatabase, RateLimitRecord
 from engram.embeddings import EmbeddingQueue
+from engram.hitl import build_permission_request_hook
 from engram.hooks import build_hooks
 from engram.mcp import resolve_team_mcp_servers, warn_missing_mcp_servers
 from engram.mcp_tools import (
@@ -549,6 +550,27 @@ class Agent:
         )
         hooks.setdefault("Stop", []).append(stop_hook)
         hooks.setdefault("PreCompact", []).append(precompact_hook)
+
+        async def _noop_on_new_question(q) -> None:
+            log.warning(
+                "HITL question fired but no egress wired: pid=%s tool=%s",
+                q.permission_request_id,
+                q.tool_name,
+            )
+
+        permission_hook = build_permission_request_hook(
+            router=self._router,
+            channel_id=session.channel_id,
+            client_provider=lambda: session.agent_client,
+            on_new_question=getattr(
+                self,
+                "_on_new_question",
+                _noop_on_new_question,
+            ),
+        )
+        hooks.setdefault("PermissionRequest", []).append(
+            HookMatcher(matcher=".*", hooks=[permission_hook])
+        )
         return hooks
 
     def _check_budget(self, channel_id: str) -> CheckResult | None:
