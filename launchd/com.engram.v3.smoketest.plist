@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+        "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Engram V3 one-shot ClaudeSDKClient smoke test.
+
+  Install:
+    cp launchd/com.engram.v3.smoketest.plist ~/Library/LaunchAgents/
+    # Edit ProgramArguments[0], WorkingDirectory, and HOME to absolute paths.
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.engram.v3.smoketest.plist
+    launchctl kickstart gui/$(id -u)/com.engram.v3.smoketest
+
+  Logs:
+    tail -f ~/.engram/logs/smoketest-$(date +%F).jsonl
+
+  Note: nightly plist inherits this env pattern + HITL-disabled config.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.engram.v3.smoketest</string>
+
+    <!-- EDIT: absolute path to `uv`.
+         Get it with: `which uv` after install.sh finishes. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/uv</string>
+        <string>run</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>engram.smoketest</string>
+    </array>
+
+    <!-- EDIT: absolute path to the repo checkout. -->
+    <key>WorkingDirectory</key>
+    <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/engram-repo</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Keep in sync with the bridge launchd env. HOME is explicit so
+             ~/.engram resolves the same way under launchd and a login shell. -->
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/REPLACE/WITH/HOME</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <!-- Manual only: run with `launchctl kickstart`; no schedule yet. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/engram.smoketest.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/engram.smoketest.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
