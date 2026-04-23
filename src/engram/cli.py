@@ -31,6 +31,7 @@ from engram.mcp_tools import (
 from engram.paths import contexts_dir, engram_home, nightly_heartbeat_path
 from engram.runtime import health_path, pid_path, status_path
 from engram.telemetry import process_exists, read_json
+from engram.uninstall import run_uninstall
 
 app = typer.Typer(
     name="engram",
@@ -254,6 +255,28 @@ def nightly(
         )
     )
     raise typer.Exit(result.exit_code)
+
+
+@app.command()
+def uninstall(
+    keep_data: bool = typer.Option(
+        False,
+        "--keep-data",
+        help="Skip the ~/.engram/ delete prompt and keep local data.",
+    ),
+    purge: bool = typer.Option(
+        False,
+        "--purge",
+        help="Delete data and uninstall the CLI without prompting.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show the uninstall plan without making changes.",
+    ),
+) -> None:
+    """Walk through clean Engram removal."""
+    run_uninstall(keep_data=keep_data, purge=purge, dry_run=dry_run)
 
 
 @scope_app.command("audit")
