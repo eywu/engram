@@ -14,7 +14,6 @@ import json
 import os
 import platform
 import shutil
-import sys
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,6 +21,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import claude_agent_sdk
 import yaml
 from claude_agent_sdk import (
     AssistantMessage,
@@ -31,7 +31,6 @@ from claude_agent_sdk import (
 )
 from dotenv import load_dotenv
 
-import claude_agent_sdk
 from engram import paths
 from engram.budget import Budget, load_budget_config
 from engram.config import HITLConfig
