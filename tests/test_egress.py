@@ -9,6 +9,7 @@ from engram.agent import AgentTurn
 from engram.egress import (
     SLACK_MAX_TEXT_LEN,
     _chunk_text,
+    _notification_fallback,
     _suggestion_label,
     post_question,
     post_reply,
@@ -80,39 +81,124 @@ def test_chunk_hard_split_if_no_newlines():
 
 
 @pytest.mark.asyncio
-async def test_post_reply_calls_say_once_for_short_text():
-    calls = []
-
-    async def say(*, text, thread_ts):
-        calls.append((text, thread_ts))
-        return {"ts": "123.456"}
-
+async def test_reply_renders_markdown_block():
+    slack = FakeSlackClient()
     turn = AgentTurn(
-        text="hello there", cost_usd=0.001, duration_ms=100, num_turns=1, is_error=False
+        text="hello **bold** there",
+        cost_usd=0.001,
+        duration_ms=100,
+        num_turns=1,
+        is_error=False,
     )
-    res = await post_reply(say, turn, thread_ts="T1", session_label="ch:C1")
+    res = await post_reply(
+        slack,
+        "C07TEST123",
+        turn,
+        thread_ts="T1",
+        session_label="ch:C1",
+    )
     assert res.chunks_posted == 1
-    assert res.posted_message_ts == "123.456"
-    assert len(calls) == 1
-    text_sent, thread = calls[0]
-    assert "hello there" in text_sent
-    assert "cost: $0.0010" in text_sent  # cost footer on last chunk
-    assert thread == "T1"
+    assert res.posted_message_ts == "1713800000.000100"
+    assert len(slack.post_calls) == 1
+    call = slack.post_calls[0]
+    assert call["channel"] == "C07TEST123"
+    assert call["thread_ts"] == "T1"
+    assert call["blocks"] == [
+        {
+            "type": "markdown",
+            "text": "hello **bold** there\n\n_cost: $0.0010 · 100ms_",
+        }
+    ]
+    assert call["text"] == "hello bold there"
 
 
 @pytest.mark.asyncio
 async def test_post_reply_chunks_long_text():
-    calls = []
-
-    async def say(*, text, thread_ts):
-        calls.append(text)
-        return {"ts": "x"}
-
+    slack = FakeSlackClient()
     long_text = "a" * (SLACK_MAX_TEXT_LEN + 100)
-    turn = AgentTurn(text=long_text, cost_usd=None, duration_ms=None, num_turns=None, is_error=False)
-    res = await post_reply(say, turn, thread_ts=None, session_label="ch:C1")
+    turn = AgentTurn(
+        text=long_text,
+        cost_usd=None,
+        duration_ms=None,
+        num_turns=None,
+        is_error=False,
+    )
+    res = await post_reply(
+        slack,
+        "C07TEST123",
+        turn,
+        thread_ts=None,
+        session_label="ch:C1",
+    )
     assert res.chunks_posted == 2
-    assert len(calls) == 2
+    assert len(slack.post_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_reply_preserves_thread_ts():
+    slack = FakeSlackClient()
+    turn = AgentTurn(
+        text="threaded reply",
+        cost_usd=None,
+        duration_ms=None,
+        num_turns=1,
+        is_error=False,
+    )
+
+    await post_reply(slack, "C07TEST123", turn, thread_ts="1713800000.000200")
+
+    assert slack.post_calls[0]["thread_ts"] == "1713800000.000200"
+
+
+def test_notification_fallback_strips_markdown():
+    body = "**bold** with [example](https://example.com), `code`, and ~~strike~~"
+
+    assert _notification_fallback(body) == "bold with example, code, and strike"
+
+    long = "# " + ("a" * 200)
+    fallback = _notification_fallback(long)
+    assert fallback.endswith("…")
+    assert len(fallback) == 120
+
+
+def test_notification_fallback_empty_input():
+    assert _notification_fallback("") == ""
+
+
+@pytest.mark.asyncio
+async def test_reply_with_code_block():
+    slack = FakeSlackClient()
+    body = "```python\nprint('hi')\n```"
+    turn = AgentTurn(
+        text=body,
+        cost_usd=None,
+        duration_ms=None,
+        num_turns=1,
+        is_error=False,
+    )
+
+    await post_reply(slack, "C07TEST123", turn)
+
+    assert slack.post_calls[0]["blocks"] == [{"type": "markdown", "text": body}]
+    assert slack.post_calls[0]["text"] == "print('hi')"
+
+
+@pytest.mark.asyncio
+async def test_reply_with_link():
+    slack = FakeSlackClient()
+    body = "[example](https://example.com)"
+    turn = AgentTurn(
+        text=body,
+        cost_usd=None,
+        duration_ms=None,
+        num_turns=1,
+        is_error=False,
+    )
+
+    await post_reply(slack, "C07TEST123", turn)
+
+    assert slack.post_calls[0]["blocks"] == [{"type": "markdown", "text": body}]
+    assert slack.post_calls[0]["text"] == "example"
 
 
 @pytest.mark.asyncio

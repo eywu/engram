@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 
 from engram.agent import AgentTurn
@@ -29,7 +30,8 @@ class EgressResult:
 
 
 async def post_reply(
-    say,
+    slack_client,
+    channel_id: str,
     turn: AgentTurn,
     *,
     thread_ts: str | None = None,
@@ -37,8 +39,8 @@ async def post_reply(
 ) -> EgressResult:
     """Post an agent turn back to Slack.
 
-    `say` is the Bolt-provided callable that posts to the originating
-    channel/thread.
+    Agent replies are sent through Slack's native ``markdown`` block so
+    CommonMark emitted by the model renders cleanly in Slack clients.
     """
     text = turn.text or "(empty reply)"
     chunks = _chunk_text(text, SLACK_MAX_TEXT_LEN)
@@ -49,7 +51,12 @@ async def post_reply(
         body = chunk
         if i == len(chunks) - 1 and turn.cost_usd is not None:
             body = f"{chunk}\n\n_cost: ${turn.cost_usd:.4f} · {turn.duration_ms or 0}ms_"
-        resp = await say(text=body, thread_ts=thread_ts)
+        resp = await slack_client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            blocks=[{"type": "markdown", "text": body}],
+            text=_notification_fallback(body),
+        )
         if i == 0:
             posted_ts = resp.get("ts") if isinstance(resp, dict) else None
         n += 1
@@ -62,6 +69,28 @@ async def post_reply(
         turn.duration_ms,
     )
     return EgressResult(posted_message_ts=posted_ts, chunks_posted=n)
+
+
+def _notification_fallback(body: str, max_len: int = 120) -> str:
+    """Produce a plain-text fallback for Slack notifications and screen readers."""
+    if not body:
+        return ""
+
+    text = body.replace("\r\n", "\n")
+    text = re.sub(r"```[^\n`]*\n?", "", text)
+    text = text.replace("```", "")
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"(?<!\w)[*_](.+?)[*_](?!\w)", r"\1", text)
+    text = re.sub(r"~~(.+?)~~", r"\1", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    if len(first) > max_len:
+        return first[: max_len - 1].rstrip() + "…"
+    return first
 
 
 async def post_question(q: PendingQuestion, slack_client) -> tuple[str, str]:

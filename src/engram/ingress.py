@@ -274,7 +274,8 @@ def register_listeners(
             return
 
         egress_result = await post_reply(
-            say,
+            client,
+            session.channel_id,
             turn,
             thread_ts=thread_ts if not is_dm else None,
             session_label=session.label(),
