@@ -106,7 +106,7 @@ async def test_reply_renders_markdown_block():
     assert call["blocks"] == [
         {
             "type": "markdown",
-            "text": "hello **bold** there\n\n_cost: $0.0010 · 100ms_",
+            "text": "hello **bold** there\n\ncost: $0.0010 · 100ms",
         }
     ]
     assert call["text"] == "hello bold there"

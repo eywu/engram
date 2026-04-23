@@ -47,10 +47,10 @@ async def post_reply(
     posted_ts: str | None = None
     n = 0
     for i, chunk in enumerate(chunks):
-        # On the first chunk we include a subtle footer with cost if we have it.
+        # Keep the cost footer plain text; only the model body relies on markdown conversion.
         body = chunk
         if i == len(chunks) - 1 and turn.cost_usd is not None:
-            body = f"{chunk}\n\n_cost: ${turn.cost_usd:.4f} · {turn.duration_ms or 0}ms_"
+            body = f"{chunk}\n\ncost: ${turn.cost_usd:.4f} · {turn.duration_ms or 0}ms"
         resp = await slack_client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,
