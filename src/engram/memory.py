@@ -14,6 +14,7 @@ import numpy as np
 VALID_SUMMARY_TRIGGERS = frozenset({"compact", "nightly", "nightly-weekly", "manual"})
 MAX_SEARCH_LIMIT = 100
 RRF_K = 60
+SQLITE_BUSY_TIMEOUT_MS = 30_000
 
 
 def open_memory_db(path: Path | None = None) -> sqlite3.Connection:
@@ -21,9 +22,14 @@ def open_memory_db(path: Path | None = None) -> sqlite3.Connection:
     db_path = (path or (Path.home() / ".engram" / "memory.db")).expanduser()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn = sqlite3.connect(
+        db_path,
+        isolation_level=None,
+        timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA foreign_keys=ON")
     migrate(conn)
     return conn

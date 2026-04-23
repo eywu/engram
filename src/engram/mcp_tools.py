@@ -145,16 +145,15 @@ def make_memory_search_server(
                     query,
                 )
                 if query_vec is None:
-                    with closing(open_memory_db(memory_db_path)) as conn:
-                        rows = search_keyword(
-                            conn,
-                            query=query,
-                            scope=scope,  # type: ignore[arg-type]
-                            channel_id=effective_channel,
-                            excluded_channels=excluded_channel_ids,
-                            kind="both",
-                            limit=limit,
-                        )
+                    rows = await _run_keyword_search(
+                        memory_db_path=memory_db_path,
+                        query=query,
+                        scope=scope,
+                        channel_id=effective_channel,
+                        excluded_channels=excluded_channel_ids,
+                        kind="both",
+                        limit=limit,
+                    )
                 else:
                     rows = await _run_hybrid_search(
                         memory_db_path=memory_db_path,
@@ -166,16 +165,15 @@ def make_memory_search_server(
                         limit=limit,
                     )
             else:
-                with closing(open_memory_db(memory_db_path)) as conn:
-                    rows = search_keyword(
-                        conn,
-                        query=query,
-                        scope=scope,  # type: ignore[arg-type]
-                        channel_id=effective_channel,
-                        excluded_channels=excluded_channel_ids,
-                        kind=kind,  # type: ignore[arg-type]
-                        limit=limit,
-                    )
+                rows = await _run_keyword_search(
+                    memory_db_path=memory_db_path,
+                    query=query,
+                    scope=scope,
+                    channel_id=effective_channel,
+                    excluded_channels=excluded_channel_ids,
+                    kind=kind,
+                    limit=limit,
+                )
         except Exception as exc:
             telemetry_logger.error(
                 "memory_search.failed",
@@ -362,6 +360,31 @@ async def _run_semantic_search(
                 channel_id=channel_id,
                 excluded_channels=excluded_channels,
                 kind="both",
+                limit=limit,
+            )
+
+    return await asyncio.to_thread(_run)
+
+
+async def _run_keyword_search(
+    *,
+    memory_db_path: Path | None,
+    query: str,
+    scope: str,
+    channel_id: str | None,
+    excluded_channels: list[str],
+    kind: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    def _run() -> list[dict[str, Any]]:
+        with closing(open_memory_db(memory_db_path)) as conn:
+            return search_keyword(
+                conn,
+                query=query,
+                scope=scope,  # type: ignore[arg-type]
+                channel_id=channel_id,
+                excluded_channels=excluded_channels,
+                kind=kind,  # type: ignore[arg-type]
                 limit=limit,
             )
 
