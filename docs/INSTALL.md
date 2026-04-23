@@ -1,62 +1,296 @@
-# Installation
+# Engram Install Guide
+
+A single walkthrough, from zero to a running Slack bot. Follow it top to
+bottom and you'll end up with Engram running under `launchd` with a nightly
+memory synthesis job.
+
+Estimated time: **25–40 minutes** the first time, most of which is Slack
+app configuration.
+
+> **Platform:** macOS only (tested on Apple Silicon). Linux should mostly
+> work but isn't part of the supported install path.
+
+---
+
+## Prerequisites
+
+You need all six of these before starting. It's easiest to set them up in
+this order.
+
+### 1. `uv` — Python package manager
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Verify: `uv --version` (should print `uv 0.4+`).
+
+### 2. Node.js + npm
+
+If you don't already have it:
+
+```bash
+brew install node
+```
+
+Verify: `node --version` (any LTS is fine) and `npm --version`.
+
+### 3. Claude CLI
+
+Engram delegates turns to the Claude Agent SDK, which subprocesses the
+`claude` CLI. You need this installed globally:
+
+```bash
+npm install -g @anthropic-ai/claude-code
+```
+
+Verify: `claude --version` (should print `@anthropic-ai/claude-code X.Y.Z`).
+
+### 4. Anthropic API key
+
+Engram uses a **separate** API key, not your Claude Code OAuth session.
+This is billed independently from any Claude subscription.
+
+1. Go to https://console.anthropic.com/settings/keys
+2. Create a key (any name — e.g. `engram-bot`)
+3. Copy it (`sk-ant-…`) — you'll paste it into the wizard in a moment
+
+### 5. Gemini API key (optional, recommended)
+
+Engram uses Gemini `text-embedding-004` for semantic memory search. The
+free tier is more than enough for personal use.
+
+- **With a key:** semantic + keyword (FTS5) memory search
+- **Without a key:** keyword-only memory — still works, just less accurate
+  for paraphrase and conceptual recall
+
+1. Go to https://aistudio.google.com/app/apikey
+2. Create an API key
+3. Copy it (`AIzaSy…`) — paste it into the wizard in a moment
+
+You can skip this step and add a key later by editing
+`~/.engram/config.yaml` (`embeddings.api_key`) or exporting
+`GEMINI_API_KEY`.
+
+### 6. Slack workspace
+
+You need admin rights to create apps in the workspace where Engram should
+live. Personal workspaces work. Company workspaces typically require
+approval from a workspace admin.
+
+---
+
+## Step 1 — Clone and install Engram
+
+```bash
+git clone https://github.com/eywu/engram.git
+cd engram
+./scripts/install.sh
+```
+
+What this does:
+- Verifies `uv` and `claude` are on your `PATH`
+- Installs Python 3.12 via `uv` (if not already present)
+- Syncs project dependencies
+- Installs the `engram` CLI as a `uv tool` (so `engram` is on your `PATH`)
+
+Verify:
+
+```bash
+engram version
+```
+
+If `engram` isn't found:
+
+```bash
+uv tool update-shell
+exec $SHELL
+```
+
+---
+
+## Step 2 — Create the Slack app
+
+Engram needs its own Slack app with Socket Mode enabled. Full details with
+the app manifest are in [slack-app-setup.md](slack-app-setup.md).
+
+**Short version:**
+
+1. Go to https://api.slack.com/apps → **Create New App** → **From an app manifest**
+2. Pick your workspace
+3. Paste the manifest from `docs/slack-app-setup.md` (or run
+   `engram setup` — it also writes the manifest to
+   `/tmp/engram-slack-manifest.yaml` for convenience)
+4. Click **Create**
+5. **Install to Workspace** → **Allow**
+6. Under **OAuth & Permissions**, copy the **Bot User OAuth Token** (`xoxb-…`)
+7. Under **Basic Information** → **App-Level Tokens**, generate a token
+   with scope `connections:write` and copy it (`xapp-…`)
+
+Keep both tokens handy for the next step.
+
+---
+
+## Step 3 — Run the setup wizard
+
+```bash
+engram setup
+```
+
+The wizard walks you through six steps:
+
+1. **Claude CLI check** — confirms `claude` is installed
+2. **Slack tokens** — paste the two tokens from Step 2
+3. **Anthropic API key** — paste or confirm the env var
+4. **Gemini API key** (optional) — paste or skip
+5. **MCP inventory** — discovers any MCP servers your `claude` CLI already
+   knows about (zero is fine)
+6. **Write config** — saves to `~/.engram/config.yaml` with mode `600`
+
+If anything was wrong, re-run `engram setup` to overwrite.
+
+---
+
+## Step 4 — Verify
+
+```bash
+engram status
+```
+
+You should see:
+- Bridge version and bridge status (not running yet, that's expected)
+- Memory counts (all zero the first time)
+- Channels table (empty the first time)
+
+If tokens are invalid or the config is malformed, `engram status` will
+tell you. Fix and re-run `engram setup`.
+
+---
+
+## Step 5 — Run it (foreground first)
+
+```bash
+engram run
+```
+
+You should see:
+- `engram.starting` and `engram.ready` log lines
+- A connection confirmation from Socket Mode
+
+**DM the Engram bot in Slack.** Any message works — try "Hello". You should
+get a Claude response within ~30 seconds.
+
+When you `Ctrl-C` to stop, the bridge shuts down gracefully.
+
+---
+
+## Step 6 — Daemonize under launchd (recommended)
+
+```bash
+./scripts/install_launchd.sh
+```
+
+This:
+1. Writes `~/Library/LaunchAgents/com.engram.bridge.plist`
+2. Loads the service
+3. Polls for `engram.ready` to confirm the bot actually connected
+
+After this, Engram runs in the background and auto-restarts on crash. Logs
+go to `/tmp/engram.bridge.out.log` and `/tmp/engram.bridge.err.log`.
+
+### Nightly memory synthesis (also recommended)
+
+```bash
+./scripts/install_launchd.sh --install-nightly
+```
+
+This registers a second launchd job (`com.engram.v3.nightly`) that runs
+every night at 02:00 local time. It harvests recent transcripts, synthesizes
+per-channel summaries with Opus, validates the output, and writes it back
+to the memory DB. Weekly meta-summaries run Monday nights.
+
+You don't need this on day one. Add it once you're using Engram enough
+that a week's worth of transcripts is worth summarizing.
+
+---
+
+## Optional: personal secret-file conventions
+
+Engram's `.env` lookup order is:
+
+1. `$ENGRAM_ENV_FILE` (if set)
+2. `./.env` (project-local)
+3. `~/.engram/.env` (user-scoped)
+
+If you keep secrets in a non-standard location (e.g. a shared `~/secrets/`
+directory), point Engram at it with:
+
+```bash
+# Add to ~/.zshrc or ~/.bash_profile
+export ENGRAM_ENV_FILE=~/secrets/engram.env
+```
+
+For `launchd`, add it to `~/Library/LaunchAgents/com.engram.bridge.plist`
+inside the `EnvironmentVariables` dict:
+
+```xml
+<key>ENGRAM_ENV_FILE</key>
+<string>/Users/YOU/secrets/engram.env</string>
+```
+
+Then `launchctl bootout gui/$(id -u)/com.engram.bridge &&
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.engram.bridge.plist`.
+
+---
+
+## Verifying everything works
+
+```bash
+# Service registered?
+launchctl list | grep engram
+
+# Bridge healthy?
+engram status
+
+# Recent turn costs?
+engram cost --month
+
+# Tail the structured log?
+engram logs
+
+# Memory populated?
+engram channels list
+```
+
+---
 
 ## Uninstall
 
-Use the Engram CLI as the primary uninstall path:
+The primary uninstall path is the built-in CLI command:
 
 ```bash
 engram uninstall
 ```
 
-The command unloads the user launchd bridge and nightly jobs, removes their
-plist files, and then asks whether to delete local Engram data, uninstall the
-CLI, and review the manual Slack app cleanup link.
+It unloads the launchd bridge + nightly jobs, removes their plist files,
+and then prompts separately for each optional action: delete `~/.engram/`,
+uninstall the `engram` CLI, and review the Slack-app cleanup link.
 
-Preview the uninstall plan without changing anything:
+Preview without changing anything:
 
 ```bash
 engram uninstall --dry-run
 ```
 
-Example dry-run output:
-
-```text
-Dry run: no changes will be made.
-This will remove Engram from your system.
-
-  ✓ unload launchd bridge job (com.engram.bridge)
-  ✓ unload launchd nightly job (com.engram.v3.nightly)
-  ✓ remove launchd plist files
-
-Optional:
-  [ ] delete ~/.engram/ (config, memory DB, logs, ~230 MB)
-  [ ] uninstall the `engram` CLI (uv tool uninstall engram)
-  [ ] remove your Slack app (NOT automated — you'll get a link)
-
-Commands that would run:
-  launchctl bootout gui/$(id -u)/com.engram.bridge
-  launchctl unload ~/Library/LaunchAgents/com.engram.bridge.plist  # fallback
-  launchctl bootout gui/$(id -u)/com.engram.v3.nightly
-  launchctl unload ~/Library/LaunchAgents/com.engram.v3.nightly.plist  # fallback
-  rm -f ~/Library/LaunchAgents/com.engram.bridge.plist
-  rm -f ~/Library/LaunchAgents/com.engram.v3.nightly.plist
-  # prompt before deleting ~/.engram/
-  # prompt before running: uv tool uninstall engram
-  # Slack app cleanup is manual: https://api.slack.com/apps
-```
-
 Other modes:
 
-```bash
-engram uninstall --keep-data
-engram uninstall --purge
-```
+- `engram uninstall --keep-data` — skip the `~/.engram/` delete prompt
+- `engram uninstall --purge` — skip all prompts, delete everything
+  (bridge jobs, plists, `~/.engram/`, CLI tool). Use with care.
 
-`--keep-data` skips the `~/.engram/` delete prompt. `--purge` skips prompts,
-deletes local Engram data, removes launchd jobs and plist files, and runs
-`uv tool uninstall engram`.
+### Manual fallback
 
-Manual fallback:
+If `engram uninstall` can't run (e.g. the CLI is already uninstalled):
 
 ```bash
 domain="gui/$(id -u)"
@@ -67,27 +301,87 @@ launchctl bootout "$domain/com.engram.v3.nightly" \
 rm -f "$HOME/Library/LaunchAgents/com.engram.bridge.plist"
 rm -f "$HOME/Library/LaunchAgents/com.engram.v3.nightly.plist"
 
-# Optional data and CLI cleanup:
+# Optional data and CLI cleanup
 rm -rf "$HOME/.engram"
 uv tool uninstall engram
 ```
 
-Slack app cleanup remains manual. Open https://api.slack.com/apps, select the
-Engram app, and remove it from the workspace if desired.
+The Slack app you created stays in your workspace until you delete it at
+https://api.slack.com/apps.
+
+---
 
 ## Troubleshooting
 
-Run `engram doctor` first when an Engram install fails to start or behaves like
-it is silently dropping events. The command checks local binaries, Python,
-`~/.engram/config.yaml`, Slack tokens, Anthropic and Gemini API keys, launchd
-jobs, disk space, and log writability.
+### First stop: `engram doctor`
 
-Use `engram doctor --json` for scripts or issue reports. A healthy setup exits
-with `0`; any failed check exits with `1`. Warnings do not fail the command, but
-their hints should still be reviewed before running Engram as a background
-service.
+Before manual debugging, run:
+
+```bash
+engram doctor
+```
+
+It runs 13 pre-flight checks — `uv`, `claude` CLI, Python version, config
+file + permissions, Slack tokens (live `auth.test`), Anthropic + Gemini API
+keys (live validation), launchd jobs, disk space, log directory — and
+prints a Rich table with actionable hints for every `❌`. Exits `0` on a
+healthy setup or only-warnings, `1` on any failure.
+
+```bash
+engram doctor --json       # machine-readable output for scripts / issue reports
+```
 
 If Engram is running but pauses on a Slack permission card, see
-[`docs/hitl.md`](hitl.md). That page explains when human-in-the-loop prompts
-appear, how timeouts and daily caps work, and what to grep for in logs when a
-card does not behave the way you expect.
+[`hitl.md`](hitl.md) — that page explains when human-in-the-loop prompts
+fire, how timeouts and daily caps behave, and what to grep for in logs when
+a card does not behave as expected.
+
+### `engram setup` reports tokens with the wrong prefix
+
+Double-check which token you copied from where. Bot token starts with
+`xoxb-`, app-level token starts with `xapp-`. The wizard warns but still
+saves — fix by re-running `engram setup`.
+
+### Bridge starts but never responds to DMs
+
+Most common cause: the Slack app isn't installed to your workspace, or
+interactivity/Socket Mode isn't enabled. Re-check
+[slack-app-setup.md](slack-app-setup.md) — the manifest should handle
+this automatically, but manual app configuration sometimes drifts.
+
+Run `tail -f /tmp/engram.bridge.err.log` while DMing the bot. Socket Mode
+auth errors show up immediately.
+
+### Turn takes longer than 30s
+
+Normal for the first turn after a cold start (cache warmup).
+Subsequent turns in the same session typically land in 3–10s. If every
+turn is slow, check `engram cost --today` — high per-turn cost often
+means the agent is doing a lot of tool work.
+
+### "semantic memory disabled — missing Gemini key"
+
+You skipped the Gemini step in setup. Either:
+- Edit `~/.engram/config.yaml` and add `embeddings.api_key: AIzaSy…` under
+  `embeddings:`
+- Or export `GEMINI_API_KEY=AIzaSy…` before starting the bridge
+
+Restart with `launchctl kickstart gui/$(id -u)/com.engram.bridge`.
+
+### Cost looks unexpectedly high
+
+Check `engram cost --by-channel` to see which channel is spending. Each
+channel has its own identity template and permission manifest — tool-heavy
+templates (e.g. `owner-dm-full`) cost more per turn than restricted ones
+(e.g. `task-assistant`).
+
+---
+
+## Next steps
+
+- Read [slack-app-setup.md](slack-app-setup.md) for the full Slack app
+  manifest and token guide.
+- Read [memory-search-scoping.md](memory-search-scoping.md) to understand
+  how per-channel memory isolation works.
+- Read [m4-report.md](m4-report.md) for the HITL (human-in-the-loop)
+  walkthrough.
