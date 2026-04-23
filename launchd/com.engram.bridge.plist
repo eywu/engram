@@ -60,6 +60,12 @@
     <key>ThrottleInterval</key>
     <integer>30</integer>
 
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+
     <key>StandardOutPath</key>
     <string>/tmp/engram.bridge.out.log</string>
 

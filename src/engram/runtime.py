@@ -5,6 +5,7 @@ import datetime
 import json
 import logging
 import os
+import resource
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,8 @@ from engram.router import Router, SessionState
 from engram.telemetry import write_json
 
 log = logging.getLogger(__name__)
+_FD_WARNING_THRESHOLD = 0.5
+_fd_warning_active = False
 
 
 def pid_path(state_dir: Path) -> Path:
@@ -38,8 +41,11 @@ async def write_runtime_snapshot(
     state_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.datetime.now(datetime.UTC).isoformat()
     pid = os.getpid()
+    fd_usage = fd_usage_snapshot()
     pid_path(state_dir).write_text(str(pid), encoding="utf-8")
     health = {"ok": True, "pid": pid, "ts": now}
+    if fd_usage is not None:
+        health["fds"] = fd_usage
     write_json(health_path(state_dir), health)
 
     channels = []
@@ -51,6 +57,9 @@ async def write_runtime_snapshot(
         "channels": channels,
         "memory": memory_tool_metrics(),
     }
+    if fd_usage is not None:
+        snapshot["bridge"]["fds"] = fd_usage
+        _warn_if_fd_usage_high(fd_usage)
     write_json(status_path(state_dir), snapshot)
     return snapshot
 
@@ -157,3 +166,51 @@ async def _reconnect_failed_mcp_servers(
                 session.label(),
                 name,
             )
+
+
+def fd_usage_snapshot() -> dict[str, int | None] | None:
+    in_use = _open_fd_count()
+    if in_use is None:
+        return None
+
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    return {
+        "in_use": in_use,
+        "soft_limit": None if soft_limit == resource.RLIM_INFINITY else int(soft_limit),
+        "hard_limit": None if hard_limit == resource.RLIM_INFINITY else int(hard_limit),
+    }
+
+
+def _open_fd_count() -> int | None:
+    for path in ("/proc/self/fd", "/dev/fd"):
+        if not os.path.isdir(path):
+            continue
+        try:
+            return len(os.listdir(path))
+        except OSError:
+            continue
+    return None
+
+
+def _warn_if_fd_usage_high(fd_usage: dict[str, int | None]) -> None:
+    global _fd_warning_active
+
+    in_use = fd_usage.get("in_use")
+    soft_limit = fd_usage.get("soft_limit")
+    if in_use is None or soft_limit is None or soft_limit <= 0:
+        return
+
+    over_threshold = in_use > (soft_limit * _FD_WARNING_THRESHOLD)
+    if over_threshold and not _fd_warning_active:
+        log.warning(
+            "runtime.fd_usage_high in_use=%s soft_limit=%s hard_limit=%s threshold_pct=%s",
+            in_use,
+            soft_limit,
+            fd_usage.get("hard_limit"),
+            int(_FD_WARNING_THRESHOLD * 100),
+        )
+        _fd_warning_active = True
+        return
+
+    if not over_threshold:
+        _fd_warning_active = False

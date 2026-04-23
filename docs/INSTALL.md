@@ -197,6 +197,8 @@ This:
 
 After this, Engram runs in the background and auto-restarts on crash. Logs
 go to `/tmp/engram.bridge.out.log` and `/tmp/engram.bridge.err.log`.
+The installed bridge plist also raises launchd's soft open-file limit to
+`4096` so the service has headroom above macOS's low default of `256`.
 
 ### Nightly memory synthesis (also recommended)
 

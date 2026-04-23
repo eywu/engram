@@ -151,6 +151,7 @@ def test_launchd_smoketest_plist_is_manual_one_shot_and_copies_bridge_env():
     smoke = _plist(Path("launchd/com.engram.v3.smoketest.plist"))
 
     assert smoke["Label"] == "com.engram.v3.smoketest"
+    assert bridge["SoftResourceLimits"]["NumberOfFiles"] == 4096
     assert smoke["RunAtLoad"] is False
     assert "StartInterval" not in smoke
     assert "StartCalendarInterval" not in smoke
