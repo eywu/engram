@@ -92,6 +92,12 @@ class EmbeddingsConfig:
     @classmethod
     def from_mapping(cls, raw: dict | None) -> EmbeddingsConfig:
         raw = raw or {}
+        # api_key precedence: explicit YAML value (for the setup wizard's
+        # write path) > GEMINI_API_KEY env var (for users who prefer env
+        # management). None means semantic memory is keyword-only; FTS5
+        # still works, and embeddings.py logs
+        # "embeddings.disabled reason=missing_api_key" at startup.
+        api_key = raw.get("api_key") or os.environ.get("GEMINI_API_KEY")
         return cls(
             enabled=raw.get("enabled", True),
             provider=raw.get("provider", "gemini"),
@@ -100,7 +106,7 @@ class EmbeddingsConfig:
             sample_rate_transcripts=raw.get("sample_rate_transcripts", 0.3),
             min_transcript_tokens=raw.get("min_transcript_tokens", 30),
             api_timeout_s=raw.get("api_timeout_s", 2.0),
-            api_key=os.environ.get("GEMINI_API_KEY"),
+            api_key=api_key,
         )
 
 
@@ -280,12 +286,21 @@ class EngramConfig:
 
 
 def _load_env_files() -> None:
-    """Load .env files from standard locations. Silent if absent."""
-    for candidate in (
-        Path.cwd() / ".env",
-        Path.home() / ".engram" / ".env",
-        Path.home() / "code" / "_secret" / ".env",
-    ):
+    """Load .env files from standard locations. Silent if absent.
+
+    Precedence (first match wins for any given key, because override=False):
+      1. $ENGRAM_ENV_FILE        — explicit override for users who keep
+                                   their secrets in a non-standard location
+      2. ./.env                  — project-local override
+      3. ~/.engram/.env          — user-scoped default
+    """
+    candidates: list[Path] = []
+    override = os.environ.get("ENGRAM_ENV_FILE")
+    if override:
+        candidates.append(Path(override).expanduser())
+    candidates.append(Path.cwd() / ".env")
+    candidates.append(Path.home() / ".engram" / ".env")
+    for candidate in candidates:
         if candidate.exists():
             load_dotenv(candidate, override=False)
 

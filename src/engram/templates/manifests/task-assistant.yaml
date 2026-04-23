@@ -57,8 +57,6 @@ permissions:
     - "Read(~/.config/**)"
     # Environment / dotenv files anywhere
     - "Read(**/.env*)"
-    # Common secret directories
-    - "Read(~/code/_secret/**)"
     # Shell history / keychain-like files
     - "Read(~/.zsh_history)"
     - "Read(~/.bash_history)"

@@ -4,8 +4,9 @@ Walks the user through first-time configuration:
   1. Verify `claude` CLI is installed (M0-F1)
   2. Collect Slack tokens (new app — OQ4)
   3. Collect ANTHROPIC_API_KEY
-  4. Discover MCPs and echo them (zero-MCP is supported — OQ19)
-  5. Write ~/.engram/config.yaml
+  4. Collect GEMINI_API_KEY (optional; unlocks semantic memory search)
+  5. Discover MCPs and echo them (zero-MCP is supported — OQ19)
+  6. Write ~/.engram/config.yaml
 """
 from __future__ import annotations
 
@@ -89,10 +90,13 @@ def run_wizard() -> None:
     anthropic_key = _step_anthropic()
     rprint()
 
+    gemini_key = _step_gemini()
+    rprint()
+
     _step_mcp_inventory()
     rprint()
 
-    _write_config(slack=slack, anthropic_key=anthropic_key)
+    _write_config(slack=slack, anthropic_key=anthropic_key, gemini_key=gemini_key)
     rprint("\n[bold green]✓ Setup complete.[/bold green]")
     rprint(f"  Config written to: {DEFAULT_CONFIG_PATH}")
     rprint()
@@ -157,6 +161,8 @@ def _write_manifest_tempfile() -> Path:
 def _step_anthropic() -> str:
     rprint("[bold]Step 3 — Anthropic API Key[/bold]")
     rprint("Engram uses a separate Anthropic API key (not your Claude Code OAuth session).")
+    rprint("  [dim]This key is billed separately from any Claude subscription you have.[/dim]")
+    rprint("  [dim]Get one at: https://console.anthropic.com/settings/keys[/dim]")
     existing = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ENGRAM_ANTHROPIC_API_KEY") or ""
     hint = f" [dim](found existing ANTHROPIC_API_KEY ending {existing[-4:]})[/dim]" if existing else ""
     rprint(f"  If you have one configured in your environment, we'll use that.{hint}")
@@ -169,8 +175,31 @@ def _step_anthropic() -> str:
     return key
 
 
+def _step_gemini() -> str | None:
+    rprint("[bold]Step 4 — Gemini API Key[/bold] [dim](optional)[/dim]")
+    rprint("Engram uses Gemini for semantic memory embeddings (text-embedding-004).")
+    rprint("  [dim]With a key:    semantic + keyword (FTS5) memory search.[/dim]")
+    rprint("  [dim]Without a key: keyword-only memory — still works, just less[/dim]")
+    rprint("  [dim]              accurate for paraphrase / conceptual recall.[/dim]")
+    rprint("  [dim]Get one at: https://aistudio.google.com/app/apikey (free tier is plenty).[/dim]")
+    existing = os.environ.get("GEMINI_API_KEY") or os.environ.get("ENGRAM_GEMINI_API_KEY") or ""
+    hint = f" [dim](found existing GEMINI_API_KEY ending {existing[-4:]})[/dim]" if existing else ""
+    rprint(f"  If you have one configured in your environment, we'll use that.{hint}")
+    key = Prompt.ask(
+        "  GEMINI_API_KEY (leave blank to skip — keyword-only memory)",
+        default=existing,
+        show_default=False,
+    ).strip()
+    if not key:
+        rprint("  [yellow]⚠[/yellow] no key provided — semantic search disabled. You can add one later")
+        rprint("    by editing [cyan]~/.engram/config.yaml[/cyan] (set [italic]embeddings.api_key[/italic])")
+        rprint("    or by exporting [cyan]GEMINI_API_KEY[/cyan] before [cyan]engram run[/cyan].")
+        return None
+    return key
+
+
 def _step_mcp_inventory() -> None:
-    rprint("[bold]Step 4 — MCP Inventory[/bold]")
+    rprint("[bold]Step 5 — MCP Inventory[/bold]")
     rprint("Engram is MCP-agnostic. Whatever [italic]claude[/italic] sees, Engram can use.")
     found: dict[str, str] = {}
     mcp_json = Path.home() / ".claude" / "mcp.json"
@@ -200,11 +229,16 @@ def _step_mcp_inventory() -> None:
     rprint("  sees everything claude sees.")
 
 
-def _write_config(*, slack: dict[str, str], anthropic_key: str) -> None:
-    rprint("[bold]Step 5 — Write Config[/bold]")
+def _write_config(
+    *,
+    slack: dict[str, str],
+    anthropic_key: str,
+    gemini_key: str | None,
+) -> None:
+    rprint("[bold]Step 6 — Write Config[/bold]")
     DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    config = {
+    config: dict = {
         "slack": {
             "bot_token": slack["bot_token"],
             "app_token": slack["app_token"],
@@ -216,6 +250,15 @@ def _write_config(*, slack: dict[str, str], anthropic_key: str) -> None:
         "allowed_channels": [],  # DMs always allowed; team channels opt-in
         "max_turns_per_message": 8,
     }
+    if gemini_key:
+        # Embeddings block is only written when the user supplied a key.
+        # When the block is absent, EmbeddingsConfig.from_mapping falls back
+        # to GEMINI_API_KEY env var (or disables semantic search entirely).
+        config["embeddings"] = {
+            "enabled": True,
+            "provider": "gemini",
+            "api_key": gemini_key,
+        }
 
     DEFAULT_CONFIG_PATH.write_text(yaml.safe_dump(config, sort_keys=False))
     # Tight permissions — secrets live here.

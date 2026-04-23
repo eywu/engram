@@ -358,11 +358,14 @@ def _bundled_cli_path() -> Path | None:
 
 
 def _load_env_files() -> None:
-    for candidate in (
-        Path.cwd() / ".env",
-        paths.engram_home() / ".env",
-        Path.home() / "code" / "_secret" / ".env",
-    ):
+    # Mirrors engram.config._load_env_files; see its docstring for precedence.
+    candidates: list[Path] = []
+    override = os.environ.get("ENGRAM_ENV_FILE")
+    if override:
+        candidates.append(Path(override).expanduser())
+    candidates.append(Path.cwd() / ".env")
+    candidates.append(paths.engram_home() / ".env")
+    for candidate in candidates:
         if candidate.exists():
             load_dotenv(candidate, override=False)
 

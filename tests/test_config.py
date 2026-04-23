@@ -200,3 +200,81 @@ def test_embeddings_config_loaded_from_yaml_and_env(tmp_path, clean_env, monkeyp
     assert cfg.embeddings.sample_rate_transcripts == 0.25
     assert cfg.embeddings.min_transcript_tokens == 12
     assert cfg.embeddings.api_timeout_s == 1.5
+
+
+def test_embeddings_api_key_prefers_yaml_over_env(tmp_path, clean_env, monkeypatch):
+    # The setup wizard writes embeddings.api_key to config.yaml when the user
+    # supplies one interactively. That YAML value must win over a stale env
+    # var (common case: user exports GEMINI_API_KEY in shell, wizard stores
+    # a different key in config, subsequent runs should use the config value).
+    # Stub _load_env_files so a developer's personal dotenv (pointed at by
+    # ENGRAM_ENV_FILE, ./.env, or ~/.engram/.env) doesn't clobber the setenv.
+    monkeypatch.setattr("engram.config._load_env_files", lambda: None)
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-env-stale")
+    path = _write_yaml(
+        tmp_path,
+        {
+            "slack": {"bot_token": "xoxb", "app_token": "xapp"},
+            "anthropic": {"api_key": "sk-ant"},
+            "embeddings": {"enabled": True, "api_key": "gemini-from-yaml"},
+        },
+    )
+
+    cfg = EngramConfig.load(path)
+
+    assert cfg.embeddings.api_key == "gemini-from-yaml"
+
+
+def test_engram_env_file_override_loads_from_custom_path(
+    tmp_path, clean_env, monkeypatch
+):
+    # Users with personal secret-management conventions (e.g. a dedicated
+    # ~/code/_secret/.env directory) can point Engram at it via
+    # ENGRAM_ENV_FILE without patching source. Verify the override wins and
+    # is applied before ./.env / ~/.engram/.env.
+    custom_env = tmp_path / "mysecrets.env"
+    custom_env.write_text("GEMINI_API_KEY=from-custom-env-file\n")
+    monkeypatch.setenv("ENGRAM_ENV_FILE", str(custom_env))
+    # clean_env already stripped GEMINI_API_KEY from the process env; the
+    # only way the key can come back is via _load_env_files reading the
+    # custom file we just pointed at.
+    path = _write_yaml(
+        tmp_path,
+        {
+            "slack": {"bot_token": "xoxb", "app_token": "xapp"},
+            "anthropic": {"api_key": "sk-ant"},
+        },
+    )
+
+    cfg = EngramConfig.load(path)
+
+    assert cfg.embeddings.api_key == "from-custom-env-file"
+
+
+def test_embeddings_api_key_missing_when_neither_source_set(
+    tmp_path, clean_env, monkeypatch
+):
+    # User skipped the Gemini step in the wizard and has no env var.
+    # Config should load fine with api_key=None; embeddings.py will log
+    # "embeddings.disabled reason=missing_api_key" and keyword-only FTS5
+    # memory keeps working.
+    #
+    # NOTE: EngramConfig.load() calls _load_env_files() which reads any of
+    # $ENGRAM_ENV_FILE, ./.env, or ~/.engram/.env. On a developer box those
+    # files almost certainly contain GEMINI_API_KEY, which would silently
+    # defeat this test. Stub it out so we exercise the real "nothing set
+    # anywhere" path.
+    monkeypatch.setattr("engram.config._load_env_files", lambda: None)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    path = _write_yaml(
+        tmp_path,
+        {
+            "slack": {"bot_token": "xoxb", "app_token": "xapp"},
+            "anthropic": {"api_key": "sk-ant"},
+        },
+    )
+
+    cfg = EngramConfig.load(path)
+
+    assert cfg.embeddings.enabled is True  # default
+    assert cfg.embeddings.api_key is None

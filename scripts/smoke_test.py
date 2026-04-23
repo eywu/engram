@@ -84,7 +84,7 @@ async def main() -> int:
 
     # 4. Prompt for a human DM.
     print("=" * 60, flush=True)
-    print("NOW: in Slack (growthgauge.slack.com), DM the Engram bot.", flush=True)
+    print("NOW: in Slack, DM the Engram bot.", flush=True)
     print("     Any message works. Try: 'Hello'", flush=True)
     print(f"     Waiting up to {TIMEOUT_SECONDS}s…", flush=True)
     print("=" * 60, flush=True)
