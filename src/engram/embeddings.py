@@ -180,6 +180,10 @@ class EmbeddingQueue:
             finally:
                 self._queue.task_done()
 
+    async def flush(self) -> None:
+        """Wait for pending queue work to be persisted before process exit."""
+        await self.drain()
+
     def _enqueue(self, item: _EmbeddingWorkItem) -> None:
         try:
             self._queue.put_nowait(item)
