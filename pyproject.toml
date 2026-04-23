@@ -40,6 +40,7 @@ dev = [
 
 [project.scripts]
 engram = "engram.cli:app"
+engram-nightly-harvest = "engram.nightly.harvest:main"
 
 [project.urls]
 Homepage = "https://github.com/eywu/engram"

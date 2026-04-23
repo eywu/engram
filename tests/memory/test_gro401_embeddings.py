@@ -7,7 +7,7 @@ import random
 import sqlite3
 import time
 from contextlib import closing
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -91,7 +91,7 @@ def _seed_summary(
         channel_id=channel_id,
         ts=ts,
         trigger="manual",
-        day=date(2026, 4, 21),
+        day=None,
         custom_instructions=None,
         summary_text=text,
         embedding=embedding,

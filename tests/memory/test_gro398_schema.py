@@ -88,6 +88,7 @@ def test_migration_creates_all_tables_and_indexes():
             "idx_transcripts_channel_ts",
             "idx_summaries_channel_day",
             "idx_summaries_channel_trigger",
+            "idx_summaries_channel_day_trigger_unique",
         }.issubset(names)
         assert {
             "trg_transcripts_fts_ai",
@@ -175,6 +176,75 @@ def test_insert_summary_returns_generated_id(conn):
     summary_id = _insert_summary(conn)
     assert isinstance(summary_id, int)
     assert summary_id > 0
+
+
+def test_summaries_unique_channel_day_trigger_constraint(conn):
+    _insert_summary(
+        conn,
+        channel_id="C07UNIQUE",
+        trigger="nightly",
+        day=date(2026, 4, 21),
+        summary_text="first nightly summary",
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_summary(
+            conn,
+            channel_id="C07UNIQUE",
+            trigger="nightly",
+            day=date(2026, 4, 21),
+            summary_text="duplicate nightly summary",
+        )
+
+
+def test_unique_summary_migration_preserves_existing_rows():
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    try:
+        db.executescript(
+            """
+            CREATE TABLE summaries (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT,
+                channel_id TEXT NOT NULL,
+                ts TIMESTAMP NOT NULL,
+                trigger TEXT NOT NULL,
+                day DATE,
+                custom_instructions TEXT,
+                summary_text TEXT NOT NULL,
+                embedding BLOB,
+                CHECK (trigger IN ('compact', 'nightly', 'nightly-weekly', 'manual'))
+            );
+            INSERT INTO summaries (
+                session_id, channel_id, ts, trigger, day, custom_instructions, summary_text
+            )
+            VALUES (
+                NULL,
+                'C07PRESERVE',
+                '2026-04-21T12:00:00+00:00',
+                'nightly',
+                '2026-04-21',
+                NULL,
+                'preserve this row'
+            );
+            """
+        )
+
+        migrate(db)
+
+        row = db.execute(
+            "SELECT channel_id, day, trigger, summary_text FROM summaries"
+        ).fetchone()
+        indexes = {index[1] for index in db.execute("PRAGMA index_list(summaries)").fetchall()}
+        assert dict(row) == {
+            "channel_id": "C07PRESERVE",
+            "day": "2026-04-21",
+            "trigger": "nightly",
+            "summary_text": "preserve this row",
+        }
+        assert "idx_summaries_channel_day_trigger_unique" in indexes
+    finally:
+        db.close()
 
 
 def test_fts_auto_updates_on_insert(conn):

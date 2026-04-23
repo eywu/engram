@@ -104,6 +104,51 @@ class EmbeddingsConfig:
         )
 
 
+@dataclass(frozen=True)
+class NightlyConfig:
+    dedup_overlap: float = 0.85
+    min_evidence: int = 10
+    max_tokens_per_channel: int = 100_000
+    excluded_channels: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "dedup_overlap",
+            min(1.0, max(0.0, float(self.dedup_overlap))),
+        )
+        object.__setattr__(self, "min_evidence", max(0, int(self.min_evidence)))
+        object.__setattr__(
+            self,
+            "max_tokens_per_channel",
+            max(1, int(self.max_tokens_per_channel)),
+        )
+        object.__setattr__(
+            self,
+            "excluded_channels",
+            tuple(_string_list(self.excluded_channels)),
+        )
+
+    @classmethod
+    def from_mapping(cls, raw: dict | None) -> NightlyConfig:
+        raw = raw or {}
+        return cls(
+            dedup_overlap=raw.get("dedup_overlap", 0.85),
+            min_evidence=raw.get("min_evidence", 10),
+            max_tokens_per_channel=raw.get("max_tokens_per_channel", 100_000),
+            excluded_channels=tuple(_string_list(raw.get("excluded_channels"))),
+        )
+
+
+def load_nightly_config(config_path: Path | None = None) -> NightlyConfig:
+    """Load just the ``nightly`` section without requiring Slack/Claude secrets."""
+    config_path = config_path or DEFAULT_CONFIG_PATH
+    raw: dict = {}
+    if config_path.exists():
+        raw = yaml.safe_load(config_path.read_text()) or {}
+    return NightlyConfig.from_mapping(raw.get("nightly"))
+
+
 @dataclass
 class EngramConfig:
     slack: SlackConfig
@@ -125,6 +170,8 @@ class EngramConfig:
     hitl: HITLConfig = field(default_factory=HITLConfig)
     # M3b: asynchronous Gemini embeddings for semantic memory recall.
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
+    # M5: offline nightly memory jobs.
+    nightly: NightlyConfig = field(default_factory=NightlyConfig)
 
     @classmethod
     def load(cls, config_path: Path | None = None) -> EngramConfig:
@@ -194,6 +241,7 @@ class EngramConfig:
             budget=BudgetConfig.from_mapping(raw.get("budget")),
             hitl=HITLConfig.from_mapping(raw.get("hitl")),
             embeddings=EmbeddingsConfig.from_mapping(raw.get("embeddings")),
+            nightly=NightlyConfig.from_mapping(raw.get("nightly")),
         )
 
     def ensure_dirs(self) -> None:
@@ -241,3 +289,23 @@ def _bool(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _string_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list | tuple | set):
+        values = list(value)
+    else:
+        values = []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        channel_id = str(item).strip()
+        if channel_id and channel_id not in seen:
+            normalized.append(channel_id)
+            seen.add(channel_id)
+    return normalized

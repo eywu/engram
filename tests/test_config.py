@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from engram.config import EngramConfig, HITLConfig
+from engram.config import EngramConfig, HITLConfig, NightlyConfig, load_nightly_config
 
 
 @pytest.fixture
@@ -41,6 +41,15 @@ def test_hitl_config_defaults():
     assert cfg.max_per_day == 5
 
 
+def test_nightly_config_defaults():
+    cfg = NightlyConfig()
+
+    assert cfg.dedup_overlap == 0.85
+    assert cfg.min_evidence == 10
+    assert cfg.max_tokens_per_channel == 100_000
+    assert cfg.excluded_channels == ()
+
+
 def test_load_from_yaml(tmp_path, clean_env):
     path = _write_yaml(
         tmp_path,
@@ -50,6 +59,12 @@ def test_load_from_yaml(tmp_path, clean_env):
             "allowed_channels": ["C123"],
             "max_turns_per_message": 5,
             "hitl": {"enabled": True, "timeout_s": 120, "max_per_day": 2},
+            "nightly": {
+                "dedup_overlap": 0.9,
+                "min_evidence": 4,
+                "max_tokens_per_channel": 5000,
+                "excluded_channels": ["C07SKIP", "C07SKIP", "C07OTHER"],
+            },
         },
     )
     cfg = EngramConfig.load(path)
@@ -61,6 +76,31 @@ def test_load_from_yaml(tmp_path, clean_env):
     assert cfg.max_turns_per_message == 5
     assert cfg.hitl.timeout_s == 120
     assert cfg.hitl.max_per_day == 2
+    assert cfg.nightly.dedup_overlap == 0.9
+    assert cfg.nightly.min_evidence == 4
+    assert cfg.nightly.max_tokens_per_channel == 5000
+    assert cfg.nightly.excluded_channels == ("C07SKIP", "C07OTHER")
+
+
+def test_load_nightly_config_does_not_require_runtime_secrets(tmp_path, clean_env):
+    path = _write_yaml(
+        tmp_path,
+        {
+            "nightly": {
+                "dedup_overlap": 0.75,
+                "min_evidence": 2,
+                "max_tokens_per_channel": 12,
+                "excluded_channels": ["C07SKIP"],
+            },
+        },
+    )
+
+    cfg = load_nightly_config(path)
+
+    assert cfg.dedup_overlap == 0.75
+    assert cfg.min_evidence == 2
+    assert cfg.max_tokens_per_channel == 12
+    assert cfg.excluded_channels == ("C07SKIP",)
 
 
 def test_env_fallback(tmp_path, clean_env, monkeypatch):

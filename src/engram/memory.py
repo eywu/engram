@@ -65,6 +65,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         ON summaries(channel_id, day);
         CREATE INDEX IF NOT EXISTS idx_summaries_channel_trigger
         ON summaries(channel_id, trigger, ts);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_summaries_channel_day_trigger_unique
+        ON summaries(channel_id, day, trigger);
         CREATE VIRTUAL TABLE IF NOT EXISTS summaries_fts
         USING fts5(summary_text, content='summaries', content_rowid='id');
 
