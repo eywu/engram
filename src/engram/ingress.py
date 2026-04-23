@@ -30,7 +30,18 @@ from engram.egress import (
     update_question_resolved,
 )
 from engram.hitl import PendingQuestion
-from engram.manifest import ManifestError, dump_manifest, load_manifest
+from engram.manifest import (
+    ChannelStatus,
+    ManifestError,
+    dump_manifest,
+    load_manifest,
+)
+from engram.notifications import (
+    PENDING_CHANNEL_ACTION_ID_PATTERN,
+    handle_pending_channel_action,
+    notify_pending_channel,
+    post_pending_channel_ack,
+)
 from engram.router import Router
 
 log = logging.getLogger(__name__)
@@ -68,6 +79,29 @@ def register_listeners(
                 )
         except Exception:
             log.exception("ingress.hitl_action_handler_failed")
+
+    @app.action(PENDING_CHANNEL_ACTION_ID_PATTERN)
+    async def on_pending_channel_action(ack, body, client):
+        await ack()
+
+        async def _run() -> None:
+            try:
+                result = await handle_pending_channel_action(
+                    body,
+                    router,
+                    client,
+                )
+                if not result.get("ok"):
+                    log.warning(
+                        "ingress.pending_channel_action_failed error=%s",
+                        result.get("error", "unknown"),
+                    )
+            except Exception:
+                log.exception("ingress.pending_channel_action_handler_failed")
+
+        task = asyncio.create_task(_run())
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
 
     @app.command("/exclude-from-nightly")
     async def on_exclude_from_nightly(ack, body, client):
@@ -155,6 +189,59 @@ def register_listeners(
         # fall back to the M1 allowlist behavior so legacy configs keep
         # working.
         if session.manifest is not None:
+            if session.manifest.status == ChannelStatus.PENDING:
+                async with session.agent_lock:
+                    manifest = session.manifest
+                    if (
+                        manifest is not None
+                        and manifest.status == ChannelStatus.PENDING
+                        and not manifest.acknowledged_pending
+                    ):
+                        channel_label = await _resolve_pending_channel_label(
+                            client,
+                            channel_id=channel_id,
+                            is_dm=is_dm,
+                            fallback=manifest.label or session.channel_name or channel_id,
+                        )
+                        if channel_label:
+                            session.channel_name = channel_label
+                        await post_pending_channel_ack(
+                            client,
+                            channel_id=channel_id,
+                            user_id=user_id,
+                            thread_ts=thread_ts,
+                            owner_dm_channel_id=(
+                                config.owner_dm_channel_id
+                                or router.owner_dm_channel_id
+                            ),
+                        )
+                        await notify_pending_channel(
+                            slack_client=client,
+                            owner_dm_channel_id=(
+                                config.owner_dm_channel_id
+                                or router.owner_dm_channel_id
+                            ),
+                            channel_id=channel_id,
+                            channel_label=channel_label or channel_id,
+                            invited_by_user_id=user_id,
+                            template=manifest.identity.value,
+                            first_message=text,
+                            source_thread_ts=thread_ts,
+                        )
+                        updated_manifest = manifest.model_copy(
+                            update={"acknowledged_pending": True}
+                        )
+                        if router.home is not None:
+                            dump_manifest(
+                                updated_manifest,
+                                paths.channel_manifest_path(channel_id, router.home),
+                            )
+                        router.replace_cached_manifest(updated_manifest)
+                log.info(
+                    "ingress.skip session=%s reason=manifest_status_pending",
+                    session.label(),
+                )
+                return
             if not session.is_active():
                 log.info(
                     "ingress.skip session=%s reason=manifest_status_%s",
@@ -439,6 +526,31 @@ def _channel_label_from_name(channel_name: str | None) -> str | None:
     if not channel_name:
         return None
     return channel_name if channel_name.startswith("#") else f"#{channel_name}"
+
+
+async def _resolve_pending_channel_label(
+    slack_client,
+    *,
+    channel_id: str,
+    is_dm: bool,
+    fallback: str,
+) -> str:
+    if is_dm:
+        return fallback
+    try:
+        info = await slack_client.conversations_info(channel=channel_id)
+    except Exception:
+        log.info(
+            "ingress.pending_channel_label_lookup_failed channel=%s",
+            channel_id,
+            exc_info=True,
+        )
+        return fallback
+
+    name = info.get("channel", {}).get("name")
+    if not name:
+        return fallback
+    return name if str(name).startswith("#") else f"#{name}"
 
 
 async def _resolve_block_action(q, choice_key, router, slack_client) -> None:

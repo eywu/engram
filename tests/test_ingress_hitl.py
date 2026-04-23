@@ -26,6 +26,7 @@ from engram.manifest import (
     dump_manifest,
     load_manifest,
 )
+from engram.notifications import PENDING_CHANNEL_ACTION_ID_PATTERN
 from engram.paths import channel_manifest_path
 from engram.router import Router
 
@@ -162,14 +163,18 @@ def test_register_listeners_attaches_hitl_action_handler():
 
     register_listeners(app, make_config(), Router(), agent=object())
 
-    assert len(app.actions) == 1
-    pattern, _handler = app.actions[0]
-    assert pattern is HITL_ACTION_ID_PATTERN
-    assert pattern.match("hitl_choice_0")
-    assert pattern.match("hitl_choice_4")
-    assert pattern.match("hitl_choice_deny")
-    assert not pattern.match("hitl_other_0")
-    assert not pattern.match("hitl_choice_cancel")
+    assert len(app.actions) == 2
+    patterns = [pattern for pattern, _handler in app.actions]
+    assert HITL_ACTION_ID_PATTERN in patterns
+    assert PENDING_CHANNEL_ACTION_ID_PATTERN in patterns
+    assert HITL_ACTION_ID_PATTERN.match("hitl_choice_0")
+    assert HITL_ACTION_ID_PATTERN.match("hitl_choice_4")
+    assert HITL_ACTION_ID_PATTERN.match("hitl_choice_deny")
+    assert not HITL_ACTION_ID_PATTERN.match("hitl_other_0")
+    assert not HITL_ACTION_ID_PATTERN.match("hitl_choice_cancel")
+    assert PENDING_CHANNEL_ACTION_ID_PATTERN.match("pending_channel_approve")
+    assert PENDING_CHANNEL_ACTION_ID_PATTERN.match("pending_channel_deny")
+    assert PENDING_CHANNEL_ACTION_ID_PATTERN.match("pending_channel_view_manifest")
     assert [command for command, _handler in app.commands] == [
         "/exclude-from-nightly",
         "/include-in-nightly",

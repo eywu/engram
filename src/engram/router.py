@@ -252,6 +252,26 @@ class Router:
         if session is not None:
             session.manifest = manifest
 
+    async def invalidate(self, channel_id: str) -> bool:
+        """Drop a cached session so the next ``get`` reloads it from disk."""
+        session = self._sessions.get(channel_id)
+        if session is None:
+            return False
+
+        async with session.agent_lock:
+            if session.agent_client is not None:
+                await session.agent_client.disconnect()
+                session.agent_client = None
+                log.info(
+                    "router.agent_client_closed_invalidate session=%s",
+                    session.label(),
+                )
+            self._sessions.pop(channel_id, None)
+            self._session_id_to_channel_id.pop(session.session_id, None)
+
+        log.info("router.session_invalidated channel_id=%s", channel_id)
+        return True
+
     def session_count(self) -> int:
         return len(self._sessions)
 

@@ -25,8 +25,8 @@ from engram import paths
 from engram.manifest import (
     ChannelStatus,
     ManifestError,
-    dump_manifest,
     load_manifest,
+    set_channel_status,
 )
 
 app = typer.Typer(
@@ -68,7 +68,11 @@ def _flip_status(
         rprint(f"  Expected at: {manifest_path}")
         raise typer.Exit(code=1)
     try:
-        manifest = load_manifest(manifest_path)
+        manifest, _updated, _manifest_path = set_channel_status(
+            channel_id,
+            new_status,
+            home=home,
+        )
     except ManifestError as e:
         rprint(f"[red]Failed to load manifest: {e}[/red]")
         raise typer.Exit(code=2) from e
@@ -80,8 +84,6 @@ def _flip_status(
         )
         return
 
-    updated = manifest.model_copy(update={"status": new_status})
-    dump_manifest(updated, manifest_path)
     rprint(
         f"[{_status_style(new_status)}]✓[/] "
         f"[bold]{channel_id}[/bold]: "

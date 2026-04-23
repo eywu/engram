@@ -148,6 +148,13 @@ def test_meta_eligible_defaults_to_true():
     assert m.meta_eligible is True
 
 
+def test_acknowledged_pending_defaults_to_false():
+    m = ChannelManifest(
+        channel_id="C07ABC", identity=IdentityTemplate.TASK_ASSISTANT
+    )
+    assert m.acknowledged_pending is False
+
+
 def test_setting_sources_default_is_project():
     """Team channels default to project-level priming, not user-level."""
     m = ChannelManifest(
@@ -403,4 +410,5 @@ def test_yaml_serialization_omits_default_values_cleanly(tmp_path: Path):
     assert raw["identity"] == "owner-dm-full"
     # Defaults are still serialized (we want explicit, not magical)
     assert raw["status"] == "pending"
+    assert raw["acknowledged_pending"] is False
     assert raw["setting_sources"] == ["user"]
