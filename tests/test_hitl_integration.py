@@ -19,7 +19,7 @@ from claude_agent_sdk.types import ToolPermissionContext
 from engram.agent import Agent
 from engram.config import AnthropicConfig, EngramConfig, HITLConfig, SlackConfig
 from engram.egress import post_question, update_question_timeout
-from engram.hitl import PendingQuestion, build_permission_request_hook
+from engram.hitl import PendingQuestion, build_hitl_tool_guard
 from engram.ingress import handle_block_action, handle_thread_reply
 from engram.main import _schedule_timeout_update
 from engram.router import Router
@@ -126,6 +126,19 @@ def _agent_cfg() -> EngramConfig:
 
 
 class HITLHarness:
+    """Exercises the HITL core (``_request_hitl_decision``) via the
+    production entry point :func:`build_hitl_tool_guard`.
+
+    GRO-432 migrated these tests off the deprecated
+    ``build_permission_request_hook``. The harness still drives the same
+    rate-limit, timeout, Slack round-trip, and registry behaviors — only
+    the SDK adapter layer changed.
+    """
+
+    # Fixed session id used by all harness-driven guard invocations.
+    # Real bridge flows derive this from the channel; tests don't care.
+    SESSION_ID = "session-harness"
+
     def __init__(
         self,
         *,
@@ -138,14 +151,37 @@ class HITLHarness:
         self.client = MockClaudeSDKClient()
         self.questions: list[PendingQuestion] = []
         self.timeout_update_tasks: list[asyncio.Task[None]] = []
-        self.hook = build_permission_request_hook(
+        self.guard = build_hitl_tool_guard(
             router=self.router,
             channel_id=CHANNEL_ID,
+            session_id=self.SESSION_ID,
             client_provider=lambda: self.client,
             on_new_question=self._on_new_question,
             default_timeout_s=default_timeout_s,
         )
         self._update_on_timeout = update_on_timeout
+
+    async def ask(
+        self,
+        *,
+        tool_name: str = "Bash",
+        tool_input: dict[str, Any] | None = None,
+        tool_use_id: str = "tool-1",
+        suggestions: list[Any] | None = None,
+    ) -> Any:
+        """Drive the tool guard with a synthetic tool invocation.
+
+        Mirrors what the SDK's ``can_use_tool`` path does at runtime:
+        the guard posts a Slack question, awaits the operator's
+        resolution (or a timeout), and returns a ``PermissionResult``.
+        """
+        ctx = ToolPermissionContext(tool_use_id=tool_use_id)
+        ctx.suggestions = list(suggestions or [])  # type: ignore[attr-defined]
+        return await self.guard(
+            tool_name,
+            dict(tool_input or {"cmd": "pytest"}),
+            ctx,
+        )
 
     async def _on_new_question(self, q: PendingQuestion) -> None:
         self.questions.append(q)
@@ -164,21 +200,7 @@ class HITLHarness:
             q.future.add_done_callback(update_if_timed_out)
 
 
-def permission_request_input(
-    *,
-    session_id: str = "session-1",
-    tool_input: dict[str, Any] | None = None,
-    suggestions: list[Any] | None = None,
-) -> dict[str, Any]:
-    return {
-        "hook_event_name": "PermissionRequest",
-        "session_id": session_id,
-        "transcript_path": "/tmp/transcript.jsonl",
-        "cwd": "/tmp",
-        "tool_name": "Bash",
-        "tool_input": tool_input or {"cmd": "pytest"},
-        "permission_suggestions": suggestions or [],
-    }
+
 
 
 def block_action_payload(value: str, *, user_id: str = "U123") -> dict[str, Any]:
@@ -201,10 +223,6 @@ async def wait_until(predicate, *, timeout_s: float = 1.0) -> None:
 async def wait_for_question(harness: HITLHarness) -> PendingQuestion:
     await wait_until(lambda: len(harness.questions) == 1)
     return harness.questions[0]
-
-
-def hook_decision(output: dict[str, Any]) -> dict[str, Any]:
-    return output["hookSpecificOutput"]["decision"]
 
 
 @pytest.mark.asyncio
@@ -300,41 +318,35 @@ async def test_agent_hitl_deny_button_denies_write_and_interrupts(tmp_path: Path
 async def test_two_rapid_questions_second_denied():
     harness = HITLHarness()
 
-    first_task = asyncio.create_task(
-        harness.hook(permission_request_input(session_id="session-a"), "tool-a", {})
-    )
+    first_task = asyncio.create_task(harness.ask(tool_use_id="tool-a"))
     first_q = await wait_for_question(harness)
 
     assert harness.router.hitl.get_by_id(first_q.permission_request_id) is first_q
 
     started_at = time.perf_counter()
-    second_output = await harness.hook(
-        permission_request_input(session_id="session-b"), "tool-b", {}
-    )
+    second_output = await harness.ask(tool_use_id="tool-b")
     elapsed = time.perf_counter() - started_at
 
     assert elapsed < 0.1
-    assert hook_decision(second_output)["behavior"] == "deny"
-    assert "another question already pending" in hook_decision(second_output)["message"]
+    assert isinstance(second_output, PermissionResultDeny)
+    assert "another question already pending" in second_output.message
     assert not first_q.future.done()
     assert harness.router.hitl.pending_for_channel(CHANNEL_ID) == [first_q]
 
     harness.router.hitl.resolve(first_q.permission_request_id, PermissionResultAllow())
     first_output = await asyncio.wait_for(first_task, timeout=1)
-    assert hook_decision(first_output) == {"behavior": "allow"}
+    assert isinstance(first_output, PermissionResultAllow)
 
 
 @pytest.mark.asyncio
 async def test_timeout_triggers_interrupt_and_deny():
     harness = HITLHarness(default_timeout_s=1, update_on_timeout=True)
 
-    output = await harness.hook(permission_request_input(), "tool-1", {})
+    output = await harness.ask()
 
-    assert hook_decision(output) == {
-        "behavior": "deny",
-        "message": "question timed out after 1s",
-        "interrupt": True,
-    }
+    assert isinstance(output, PermissionResultDeny)
+    assert output.message == "question timed out after 1s"
+    assert output.interrupt is True
     assert harness.client.interrupt_calls == 1
     await wait_until(lambda: len(harness.slack.update_calls) == 1)
     assert harness.slack.update_calls[0]["text"] == "Timed out"
@@ -345,19 +357,15 @@ async def test_timeout_triggers_interrupt_and_deny():
 async def test_production_timeout_callback_updates_slack():
     harness = HITLHarness(default_timeout_s=1)
 
-    output_task = asyncio.create_task(
-        harness.hook(permission_request_input(), "tool-1", {})
-    )
+    output_task = asyncio.create_task(harness.ask())
     q = await wait_for_question(harness)
     _schedule_timeout_update(q, harness.slack)
 
     output = await asyncio.wait_for(output_task, timeout=2)
 
-    assert hook_decision(output) == {
-        "behavior": "deny",
-        "message": "question timed out after 1s",
-        "interrupt": True,
-    }
+    assert isinstance(output, PermissionResultDeny)
+    assert output.message == "question timed out after 1s"
+    assert output.interrupt is True
     await wait_until(lambda: len(harness.slack.update_calls) == 1)
     assert harness.slack.update_calls[0]["text"] == "Timed out"
 
@@ -366,7 +374,7 @@ async def test_production_timeout_callback_updates_slack():
 async def test_client_disconnect_during_wait_cancels_future():
     harness = HITLHarness()
 
-    task = asyncio.create_task(harness.hook(permission_request_input(), "tool-1", {}))
+    task = asyncio.create_task(harness.ask())
     q = await wait_for_question(harness)
 
     task.cancel()
@@ -382,9 +390,7 @@ async def test_client_disconnect_during_wait_cancels_future():
 @pytest.mark.asyncio
 async def test_bridge_restart_loses_pending_but_recovers():
     first_bridge = HITLHarness()
-    task = asyncio.create_task(
-        first_bridge.hook(permission_request_input(), "tool-1", {})
-    )
+    task = asyncio.create_task(first_bridge.ask())
     q = await wait_for_question(first_bridge)
 
     restarted_router = Router()
@@ -408,13 +414,7 @@ async def test_full_happy_path_allow():
     suggestion = {"name": "Run pytest"}
     harness = HITLHarness()
 
-    task = asyncio.create_task(
-        harness.hook(
-            permission_request_input(suggestions=[suggestion]),
-            "tool-1",
-            {},
-        )
-    )
+    task = asyncio.create_task(harness.ask(suggestions=[suggestion]))
     q = await wait_for_question(harness)
 
     assert len(harness.slack.post_calls) == 1
@@ -426,10 +426,8 @@ async def test_full_happy_path_allow():
 
     assert ack == {"ok": True}
     output = await asyncio.wait_for(task, timeout=1)
-    assert hook_decision(output) == {
-        "behavior": "allow",
-        "updatedInput": {"cmd": "pytest"},
-    }
+    assert isinstance(output, PermissionResultAllow)
+    assert output.updated_input == {"cmd": "pytest"}
     await wait_until(lambda: len(harness.slack.update_calls) == 1)
     assert harness.slack.update_calls[0]["text"] == "Answered: Run pytest"
 
@@ -438,7 +436,7 @@ async def test_full_happy_path_allow():
 async def test_full_happy_path_thread_reply():
     harness = HITLHarness()
 
-    task = asyncio.create_task(harness.hook(permission_request_input(), "tool-1", {}))
+    task = asyncio.create_task(harness.ask())
     q = await wait_for_question(harness)
 
     await handle_thread_reply(
@@ -453,12 +451,10 @@ async def test_full_happy_path_thread_reply():
     )
 
     output = await asyncio.wait_for(task, timeout=1)
-    assert hook_decision(output) == {
-        "behavior": "allow",
-        "updatedInput": {
-            "cmd": "pytest",
-            "_user_answer": "Please run only the focused pytest target.",
-        },
+    assert isinstance(output, PermissionResultAllow)
+    assert output.updated_input == {
+        "cmd": "pytest",
+        "_user_answer": "Please run only the focused pytest target.",
     }
     assert harness.slack.update_calls[0]["text"] == (
         "Answered: Please run only the focused pytest target."
@@ -472,18 +468,13 @@ async def test_daily_cap_across_sessions():
     for _ in range(5):
         router.hitl_limiter.reserve(CHANNEL_ID)
 
-    old_session_output = await harness.hook(
-        permission_request_input(session_id="session-old"), "tool-old", {}
-    )
-    new_session_output = await harness.hook(
-        permission_request_input(session_id="session-new"), "tool-new", {}
-    )
+    old_session_output = await harness.ask(tool_use_id="tool-old")
+    new_session_output = await harness.ask(tool_use_id="tool-new")
 
-    expected = {
-        "behavior": "deny",
-        "message": "HITL rate-limited: daily question budget exhausted (5/day)",
-    }
-    assert hook_decision(old_session_output) == expected
-    assert hook_decision(new_session_output) == expected
+    expected_message = "HITL rate-limited: daily question budget exhausted (5/day)"
+    assert isinstance(old_session_output, PermissionResultDeny)
+    assert old_session_output.message == expected_message
+    assert isinstance(new_session_output, PermissionResultDeny)
+    assert new_session_output.message == expected_message
     assert harness.questions == []
     assert harness.slack.post_calls == []

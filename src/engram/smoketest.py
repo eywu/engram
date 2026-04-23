@@ -191,6 +191,12 @@ async def run_smoke(
         can_use_tool=None,
         hooks={},
     )
+    # ``permission_request_hook_wired`` is a diagnostic kept after GRO-432:
+    # Since our ``build_permission_request_hook`` factory was removed, this
+    # flag should always log False in production. If it ever reports True,
+    # someone re-wired the fire-and-forget PermissionRequest hook (which
+    # does NOT block tool execution, see GRO-426). The smoketest JSONL
+    # flag makes that regression visible early.
     logger.event(
         "smoketest.options",
         setting_sources=options.setting_sources,

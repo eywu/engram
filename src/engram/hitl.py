@@ -14,10 +14,6 @@ from typing import Any
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import (
     CanUseTool,
-    HookCallback,
-    PermissionRequestHookInput,
-    PermissionRequestHookSpecificOutput,
-    SyncHookJSONOutput,
     ToolPermissionContext,
 )
 
@@ -139,40 +135,13 @@ class HITLRateLimiter:
         self._daily_counts[channel_id] = (today, count + 1)
 
 
-def build_permission_request_hook(
-    router: Any,
-    channel_id: str,
-    client_provider: Callable[[], Any | None],
-    on_new_question: Callable[[PendingQuestion], Awaitable[None]],
-    default_timeout_s: int = 300,
-    max_per_day: int | None = None,
-) -> HookCallback:
-    """Build a PermissionRequest hook that round-trips through HITL."""
-
-    async def hook(
-        input_data: PermissionRequestHookInput,
-        _tool_use_id: str | None,
-        _context: dict[str, Any],
-    ) -> SyncHookJSONOutput:
-        tool_use_id = _tool_use_id or input_data.get("tool_use_id")
-        result = await _request_hitl_decision(
-            router=router,
-            channel_id=channel_id,
-            client_provider=client_provider,
-            on_new_question=on_new_question,
-            session_id=input_data["session_id"],
-            tool_name=input_data["tool_name"],
-            tool_input=input_data["tool_input"],
-            suggestions=list(input_data.get("permission_suggestions") or []),
-            tool_use_id=tool_use_id,
-            default_timeout_s=default_timeout_s,
-            max_per_day=max_per_day,
-            fired_event="hitl.hook_fired",
-            returned_event="hitl.hook_returned",
-        )
-        return _permission_result_to_hook_output(result)
-
-    return hook
+# NOTE: build_permission_request_hook was removed in GRO-432 (M4.5).
+# It wrapped the Claude Agent SDK's PermissionRequest hook, which is
+# notify-only: the SDK does NOT wait for the hook's PermissionResult
+# before dispatching the tool. GRO-426 found this the hard way during
+# the live HITL demo — the operator's deny came back after the tool
+# had already run. Use build_hitl_tool_guard (below) instead; its
+# can_use_tool callback is genuinely awaited by the SDK.
 
 
 def build_hitl_tool_guard(
@@ -347,28 +316,6 @@ async def _request_hitl_decision(
             )
 
 
-def _permission_result_to_hook_output(
-    result: PermissionResult,
-) -> SyncHookJSONOutput:
-    if isinstance(result, PermissionResultAllow):
-        decision: dict[str, Any] = {"behavior": "allow"}
-        if result.updated_input is not None:
-            decision["updatedInput"] = result.updated_input
-        if result.updated_permissions is not None:
-            decision["updatedPermissions"] = [
-                permission.to_dict() for permission in result.updated_permissions
-            ]
-        return _permission_request_output(decision)
-
-    if isinstance(result, PermissionResultDeny):
-        decision = {"behavior": "deny", "message": result.message}
-        if result.interrupt:
-            decision["interrupt"] = True
-        return _permission_request_output(decision)
-
-    raise TypeError(f"Unknown PermissionResult type: {type(result)}")
-
-
 def _decision_label(result: PermissionResult) -> str:
     if isinstance(result, PermissionResultAllow):
         return "allow"
@@ -379,11 +326,3 @@ def _decision_label(result: PermissionResult) -> str:
 
 def _duration_ms(started_at: float) -> int:
     return max(0, int((time.monotonic() - started_at) * 1000))
-
-
-def _permission_request_output(decision: dict[str, Any]) -> SyncHookJSONOutput:
-    hook_specific: PermissionRequestHookSpecificOutput = {
-        "hookEventName": "PermissionRequest",
-        "decision": decision,
-    }
-    return {"hookSpecificOutput": hook_specific}
