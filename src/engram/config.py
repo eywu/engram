@@ -110,6 +110,8 @@ class NightlyConfig:
     min_evidence: int = 10
     max_tokens_per_channel: int = 100_000
     excluded_channels: tuple[str, ...] = field(default_factory=tuple)
+    model: str | None = None
+    daily_cost_cap_usd: float = 10.0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -128,6 +130,12 @@ class NightlyConfig:
             "excluded_channels",
             tuple(_string_list(self.excluded_channels)),
         )
+        object.__setattr__(self, "model", _optional_string(self.model))
+        object.__setattr__(
+            self,
+            "daily_cost_cap_usd",
+            max(0.0, float(self.daily_cost_cap_usd)),
+        )
 
     @classmethod
     def from_mapping(cls, raw: dict | None) -> NightlyConfig:
@@ -137,6 +145,8 @@ class NightlyConfig:
             min_evidence=raw.get("min_evidence", 10),
             max_tokens_per_channel=raw.get("max_tokens_per_channel", 100_000),
             excluded_channels=tuple(_string_list(raw.get("excluded_channels"))),
+            model=raw.get("model"),
+            daily_cost_cap_usd=raw.get("daily_cost_cap_usd", 10.0),
         )
 
 
@@ -309,3 +319,10 @@ def _string_list(value: object) -> list[str]:
             normalized.append(channel_id)
             seen.add(channel_id)
     return normalized
+
+
+def _optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None

@@ -12,6 +12,7 @@ from engram.manifest import (
     AskUserQuestion,
     Behavior,
     ChannelManifest,
+    ChannelNightly,
     ChannelStatus,
     CostBudget,
     IdentityTemplate,
@@ -176,6 +177,27 @@ def test_manifest_loads_hitl_section(tmp_path: Path):
         assert manifest.hitl.max_per_day == max_per_day
 
 
+def test_manifest_loads_nightly_model_from_templates(tmp_path: Path):
+    templates = [
+        ("owner-dm.yaml", "D07OWNER", "DM", "opus"),
+        ("task-assistant.yaml", "C07TEAM", "#test-team", "sonnet"),
+    ]
+
+    for template_name, channel_id, label, expected_model in templates:
+        template = paths.TEMPLATES_MANIFESTS_DIR / template_name
+        rendered = (
+            template.read_text()
+            .replace("{{channel_id}}", channel_id)
+            .replace("{{channel_label}}", label)
+        )
+        manifest_path = tmp_path / template_name
+        manifest_path.write_text(rendered)
+
+        manifest = load_manifest(manifest_path)
+
+        assert manifest.nightly.model == expected_model
+
+
 def test_no_dont_ask_rule_in_templates():
     pattern = re.compile(r"don.t ask", re.IGNORECASE)
     matches = []
@@ -204,6 +226,14 @@ def test_memory_scope_defaults_to_no_exclusions():
 def test_memory_scope_normalizes_excluded_channels():
     scope = MemoryScope(excluded_channels=[" C07A ", "C07B", "C07A"])
     assert scope.excluded_channels == ["C07A", "C07B"]
+
+
+def test_channel_nightly_model_normalized():
+    nightly = ChannelNightly(model=" sonnet ")
+    assert nightly.model == "sonnet"
+
+    empty = ChannelNightly(model=" ")
+    assert empty.model is None
 
 
 # ── YAML I/O round-trip ─────────────────────────────────────────────────

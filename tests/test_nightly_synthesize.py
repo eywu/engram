@@ -1,0 +1,366 @@
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+import pytest
+from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage
+
+from engram.budget import BudgetConfig
+from engram.config import HITLConfig, NightlyConfig
+from engram.manifest import (
+    ChannelManifest,
+    ChannelNightly,
+    ChannelStatus,
+    IdentityTemplate,
+    dump_manifest,
+)
+from engram.mcp_tools import MEMORY_SEARCH_FULL_TOOL_NAMES
+from engram.nightly.synthesize import (
+    NIGHTLY_CHANNEL_ID,
+    AnthropicRuntime,
+    PlannedChannel,
+    build_nightly_options,
+    synthesize,
+)
+
+
+@dataclass
+class _TextBlock:
+    text: str
+
+
+class _FakeBudget:
+    def __init__(self) -> None:
+        self.config = BudgetConfig(hard_cap_enabled=True)
+        self.records: list[tuple[str, str | None, Any]] = []
+
+    def record(self, channel_id: str, user_id: str | None, result_message: Any) -> None:
+        self.records.append((channel_id, user_id, result_message))
+
+
+class _FakeClient:
+    def __init__(self, options: ClaudeAgentOptions, response_text: str, result: ResultMessage):
+        self.options = options
+        self.response_text = response_text
+        self.result = result
+        self.connected = False
+        self.disconnected = False
+        self.prompt: str | None = None
+        self.session_id: str | None = None
+
+    async def connect(self) -> None:
+        self.connected = True
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
+
+    async def query(self, prompt: str, session_id: str = "default") -> None:
+        self.prompt = prompt
+        self.session_id = session_id
+
+    async def receive_response(self):
+        yield AssistantMessage(content=[_TextBlock(self.response_text)], model="fake")
+        yield self.result
+
+
+class _BudgetAbortClient:
+    def __init__(self, options: ClaudeAgentOptions):
+        self.options = options
+        self.disconnected = False
+
+    async def connect(self) -> None:
+        pass
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
+
+    async def query(self, prompt: str, session_id: str = "default") -> None:
+        assert self.options.max_budget_usd == 5.0
+
+    async def receive_response(self):
+        raise RuntimeError("mocked max budget exceeded")
+        yield
+
+
+class _ClientFactory:
+    def __init__(self, responses: list[tuple[str, ResultMessage]]) -> None:
+        self.responses = responses
+        self.options: list[ClaudeAgentOptions] = []
+        self.clients: list[_FakeClient] = []
+
+    def __call__(self, options: ClaudeAgentOptions) -> _FakeClient:
+        self.options.append(options)
+        response_text, result = self.responses.pop(0)
+        client = _FakeClient(options, response_text, result)
+        self.clients.append(client)
+        return client
+
+
+def _result(cost: float = 0.01, *, cache_read: int = 0) -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="session-test",
+        total_cost_usd=cost,
+        usage={
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 0 if cache_read else 7,
+            "cache_read_input_tokens": cache_read,
+        },
+        model_usage={"claude-test-model": {"input_tokens": 100}},
+    )
+
+
+def _synthesis_json(channel_id: str) -> str:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "date": "2026-04-22",
+            "channel_id": channel_id,
+            "summary": "durable summary",
+            "highlights": [],
+            "decisions": [],
+            "action_items": [],
+            "open_questions": [],
+            "source_row_ids": [1],
+        }
+    )
+
+
+def _write_harvest(tmp_path: Path, channels: list[dict[str, Any]]) -> Path:
+    path = tmp_path / "harvest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "date": "2026-04-22",
+                "channels": channels,
+                "skipped_channels": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _channel(channel_id: str, *, row_id: int = 1, token_count: int = 2) -> dict[str, Any]:
+    return {
+        "channel_id": channel_id,
+        "row_count": 1,
+        "token_count": token_count,
+        "rows": [
+            {
+                "kind": "transcript",
+                "id": row_id,
+                "channel_id": channel_id,
+                "ts": "2026-04-22T01:00:00+00:00",
+                "token_count": token_count,
+                "text": "alpha beta",
+                "session_id": f"session-{channel_id}",
+                "role": "assistant",
+                "message_uuid": f"msg-{row_id}",
+                "parent_uuid": None,
+            }
+        ],
+    }
+
+
+def _write_manifest(contexts_dir: Path, manifest: ChannelManifest) -> None:
+    path = contexts_dir / manifest.channel_id / ".claude" / "channel-manifest.yaml"
+    path.parent.mkdir(parents=True)
+    dump_manifest(manifest, path)
+
+
+@pytest.mark.asyncio
+async def test_synthesize_sets_nightly_sdk_invariants_and_records_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="engram.nightly.synthesize")
+    captured_mcp: dict[str, Any] = {}
+
+    def fake_make_memory_search_server(
+        caller_channel_id: str,
+        memory_db_path: Path | None = None,
+        embedder: object | None = None,
+        *,
+        excluded_channels: list[str] | None = None,
+    ) -> dict[str, Any]:
+        captured_mcp["caller_channel_id"] = caller_channel_id
+        captured_mcp["excluded_channels"] = excluded_channels
+        return {"name": "engram-memory"}
+
+    monkeypatch.setattr(
+        "engram.nightly.synthesize.make_memory_search_server",
+        fake_make_memory_search_server,
+    )
+    contexts_dir = tmp_path / "contexts"
+    _write_manifest(
+        contexts_dir,
+        ChannelManifest(
+            channel_id="D07OWNER",
+            identity=IdentityTemplate.OWNER_DM_FULL,
+            status=ChannelStatus.ACTIVE,
+            setting_sources=["user"],
+        ),
+    )
+    harvest = _write_harvest(tmp_path, [_channel("D07OWNER")])
+    budget = _FakeBudget()
+    factory = _ClientFactory([(_synthesis_json("D07OWNER"), _result(cache_read=123))])
+
+    result = await synthesize(
+        harvest,
+        output_root=tmp_path / "nightly",
+        config=NightlyConfig(excluded_channels=("C07SKIP",)),
+        contexts_dir=contexts_dir,
+        anthropic_runtime=AnthropicRuntime(api_key="sk-test", model="global-model"),
+        budget=budget,
+        client_factory=factory,
+    )
+
+    assert result.output_path == tmp_path / "nightly" / "archive" / "2026-04-22" / "synthesis.json"
+    assert result.payload["channels"][0]["synthesis"]["summary"] == "durable summary"
+    assert result.payload["channels"][0]["prompt_cache"]["status"] == "read"
+    assert budget.records[0][0] == NIGHTLY_CHANNEL_ID
+    options = factory.options[0]
+    assert options.cwd == str(tmp_path / "nightly" / "current")
+    assert options.max_budget_usd == 5.0
+    assert options.allowed_tools == MEMORY_SEARCH_FULL_TOOL_NAMES
+    assert options.permission_mode == "dontAsk"
+    assert options.skills == []
+    assert options.hitl_config.enabled is False
+    assert options.budget_config.hard_cap_enabled is False
+    assert captured_mcp == {
+        "caller_channel_id": "D07OWNER",
+        "excluded_channels": ["C07SKIP"],
+    }
+
+    startup = _single_log(caplog.records, "nightly.synthesis_start")
+    assert startup.hitl_disabled is True
+    assert startup.hitl_config_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_team_manifest_nightly_model_overrides_global_default(tmp_path: Path) -> None:
+    contexts_dir = tmp_path / "contexts"
+    _write_manifest(
+        contexts_dir,
+        ChannelManifest(
+            channel_id="C07TEAM",
+            identity=IdentityTemplate.TASK_ASSISTANT,
+            status=ChannelStatus.ACTIVE,
+            nightly=ChannelNightly(model="sonnet"),
+        ),
+    )
+    harvest = _write_harvest(tmp_path, [_channel("C07TEAM")])
+    factory = _ClientFactory([(_synthesis_json("C07TEAM"), _result())])
+
+    result = await synthesize(
+        harvest,
+        output_root=tmp_path / "nightly",
+        config=NightlyConfig(model="opus"),
+        contexts_dir=contexts_dir,
+        anthropic_runtime=AnthropicRuntime(api_key=None, model="global-model"),
+        budget=_FakeBudget(),
+        client_factory=factory,
+    )
+
+    assert factory.options[0].model == "sonnet"
+    assert result.payload["channels"][0]["model"] == "sonnet"
+
+
+@pytest.mark.asyncio
+async def test_daily_cost_cap_skips_remaining_channels_and_logs(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="engram.nightly.synthesize")
+    harvest = _write_harvest(
+        tmp_path,
+        [
+            _channel("C07FIRST", row_id=1),
+            _channel("C07SECOND", row_id=2),
+        ],
+    )
+    factory = _ClientFactory([(_synthesis_json("C07FIRST"), _result(cost=0.02))])
+
+    result = await synthesize(
+        harvest,
+        output_root=tmp_path / "nightly",
+        config=NightlyConfig(daily_cost_cap_usd=0.025),
+        contexts_dir=tmp_path / "contexts",
+        anthropic_runtime=AnthropicRuntime(api_key=None, model="sonnet"),
+        budget=_FakeBudget(),
+        client_factory=factory,
+    )
+
+    assert len(factory.options) == 1
+    assert [channel["channel_id"] for channel in result.payload["channels"]] == ["C07FIRST"]
+    assert result.payload["skipped_channels"] == [
+        {
+            "channel_id": "C07SECOND",
+            "estimated_cost_usd": "0.010000",
+            "reason": "daily_cost_cap",
+        }
+    ]
+    record = _single_log(caplog.records, "nightly.cost_cap_hit")
+    assert record.skipped_channels == ["C07SECOND"]
+    assert record.daily_cost_cap_usd == "0.025000"
+
+
+@pytest.mark.asyncio
+async def test_mocked_sdk_budget_overrun_aborts_channel(tmp_path: Path) -> None:
+    options_seen: list[ClaudeAgentOptions] = []
+
+    def factory(options: ClaudeAgentOptions) -> _BudgetAbortClient:
+        options_seen.append(options)
+        return _BudgetAbortClient(options)
+
+    harvest = _write_harvest(tmp_path, [_channel("C07BUDGET")])
+
+    result = await synthesize(
+        harvest,
+        output_root=tmp_path / "nightly",
+        config=NightlyConfig(),
+        contexts_dir=tmp_path / "contexts",
+        anthropic_runtime=AnthropicRuntime(api_key=None, model="sonnet"),
+        budget=_FakeBudget(),
+        client_factory=factory,
+    )
+
+    assert options_seen[0].max_budget_usd == 5.0
+    assert result.payload["channels"][0]["status"] == "sdk_error"
+    assert result.payload["channels"][0]["error"]["error"] == "mocked max budget exceeded"
+
+
+def test_build_nightly_options_attaches_hard_cap_disabled(tmp_path: Path) -> None:
+    options = build_nightly_options(
+        plan=PlannedChannel(
+            channel=_channel("C07TEST"),
+            manifest=None,
+            model="sonnet",
+            estimated_cost_usd=Decimal("0.01"),
+        ),
+        run_date="2026-04-22",
+        current_dir=tmp_path / "current",
+        runtime=AnthropicRuntime(api_key=None, model="sonnet"),
+        hitl_config=HITLConfig(enabled=False),
+        config=NightlyConfig(),
+    )
+
+    assert options.budget_config.hard_cap_enabled is False
+
+
+def _single_log(records, message: str):
+    matches = [record for record in records if record.getMessage() == message]
+    assert len(matches) == 1
+    return matches[0]

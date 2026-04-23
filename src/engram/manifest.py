@@ -174,6 +174,27 @@ class MemoryScope(BaseModel):
         return normalized
 
 
+class ChannelNightly(BaseModel):
+    """Per-channel nightly synthesis overrides."""
+
+    model: str | None = Field(
+        default=None,
+        description=(
+            "Claude model alias or full model ID for nightly synthesis. "
+            "When unset, the synthesizer falls back to global nightly.model, "
+            "then owner-DM/team defaults."
+        ),
+    )
+
+    @field_validator("model")
+    @classmethod
+    def _normalize_model(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Permission rules (native Claude Code `Tool(specifier)` syntax)
 # ──────────────────────────────────────────────────────────────────────────
@@ -302,6 +323,7 @@ class ChannelManifest(BaseModel):
     ask_user_question: AskUserQuestion = Field(default_factory=AskUserQuestion)
     hitl: HITLConfig = Field(default_factory=HITLConfig)
     memory: MemoryScope = Field(default_factory=MemoryScope)
+    nightly: ChannelNightly = Field(default_factory=ChannelNightly)
 
     # ── Sub-agents (stored only — M-future) ──────────────────────
     subagents: list[str] = Field(

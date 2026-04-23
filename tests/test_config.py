@@ -48,6 +48,8 @@ def test_nightly_config_defaults():
     assert cfg.min_evidence == 10
     assert cfg.max_tokens_per_channel == 100_000
     assert cfg.excluded_channels == ()
+    assert cfg.model is None
+    assert cfg.daily_cost_cap_usd == 10.0
 
 
 def test_load_from_yaml(tmp_path, clean_env):
@@ -64,6 +66,8 @@ def test_load_from_yaml(tmp_path, clean_env):
                 "min_evidence": 4,
                 "max_tokens_per_channel": 5000,
                 "excluded_channels": ["C07SKIP", "C07SKIP", "C07OTHER"],
+                "model": "sonnet",
+                "daily_cost_cap_usd": 12.50,
             },
         },
     )
@@ -80,6 +84,8 @@ def test_load_from_yaml(tmp_path, clean_env):
     assert cfg.nightly.min_evidence == 4
     assert cfg.nightly.max_tokens_per_channel == 5000
     assert cfg.nightly.excluded_channels == ("C07SKIP", "C07OTHER")
+    assert cfg.nightly.model == "sonnet"
+    assert cfg.nightly.daily_cost_cap_usd == 12.5
 
 
 def test_load_nightly_config_does_not_require_runtime_secrets(tmp_path, clean_env):
@@ -91,6 +97,8 @@ def test_load_nightly_config_does_not_require_runtime_secrets(tmp_path, clean_en
                 "min_evidence": 2,
                 "max_tokens_per_channel": 12,
                 "excluded_channels": ["C07SKIP"],
+                "model": "opus",
+                "daily_cost_cap_usd": 3,
             },
         },
     )
@@ -101,6 +109,8 @@ def test_load_nightly_config_does_not_require_runtime_secrets(tmp_path, clean_en
     assert cfg.min_evidence == 2
     assert cfg.max_tokens_per_channel == 12
     assert cfg.excluded_channels == ("C07SKIP",)
+    assert cfg.model == "opus"
+    assert cfg.daily_cost_cap_usd == 3.0
 
 
 def test_env_fallback(tmp_path, clean_env, monkeypatch):
