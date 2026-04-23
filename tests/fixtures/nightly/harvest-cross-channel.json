@@ -1,0 +1,37 @@
+{
+  "date": "2026-04-22",
+  "channels": [
+    {
+      "channel_id": "C07ALPHA01",
+      "row_count": 2,
+      "token_count": 32,
+      "rows": [
+        {
+          "kind": "transcript",
+          "id": 20,
+          "channel_id": "C07ALPHA01",
+          "ts": "2026-04-22T04:00:00+00:00",
+          "token_count": 18,
+          "text": "The owner DM needs a heads-up if alpha blocks beta.",
+          "session_id": "session-C07ALPHA01",
+          "role": "assistant",
+          "message_uuid": "msg-20",
+          "parent_uuid": null
+        },
+        {
+          "kind": "transcript",
+          "id": 21,
+          "channel_id": "C07ALPHA01",
+          "ts": "2026-04-22T04:05:00+00:00",
+          "token_count": 14,
+          "text": "Related beta channel id for follow-up is C07BETA02.",
+          "session_id": "session-C07ALPHA01",
+          "role": "user",
+          "message_uuid": "msg-21",
+          "parent_uuid": "msg-20"
+        }
+      ]
+    }
+  ],
+  "skipped_channels": []
+}

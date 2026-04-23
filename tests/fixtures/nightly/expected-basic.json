@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "date": "2026-04-22",
+  "channel_id": "C07TEST123",
+  "summary": "The channel's durable context is the deploy checklist for the next day's work.",
+  "highlights": [
+    {
+      "text": "Preserve the deploy checklist as tomorrow's working context.",
+      "source_row_ids": [1, 2]
+    }
+  ],
+  "decisions": [],
+  "action_items": [],
+  "open_questions": [],
+  "cross_channel_flags": [],
+  "source_row_ids": [1, 2]
+}

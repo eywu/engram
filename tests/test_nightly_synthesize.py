@@ -24,7 +24,9 @@ from engram.nightly.synthesize import (
     NIGHTLY_CHANNEL_ID,
     AnthropicRuntime,
     PlannedChannel,
+    SynthesisOutputError,
     build_nightly_options,
+    parse_synthesis_output,
     synthesize,
 )
 
@@ -44,14 +46,18 @@ class _FakeBudget:
 
 
 class _FakeClient:
-    def __init__(self, options: ClaudeAgentOptions, response_text: str, result: ResultMessage):
+    def __init__(
+        self,
+        options: ClaudeAgentOptions,
+        responses: list[tuple[str, ResultMessage]],
+    ):
         self.options = options
-        self.response_text = response_text
-        self.result = result
+        self.responses = responses
         self.connected = False
         self.disconnected = False
-        self.prompt: str | None = None
-        self.session_id: str | None = None
+        self.prompts: list[str] = []
+        self.session_ids: list[str] = []
+        self.receive_count = 0
 
     async def connect(self) -> None:
         self.connected = True
@@ -60,12 +66,14 @@ class _FakeClient:
         self.disconnected = True
 
     async def query(self, prompt: str, session_id: str = "default") -> None:
-        self.prompt = prompt
-        self.session_id = session_id
+        self.prompts.append(prompt)
+        self.session_ids.append(session_id)
 
     async def receive_response(self):
-        yield AssistantMessage(content=[_TextBlock(self.response_text)], model="fake")
-        yield self.result
+        response_text, result = self.responses[self.receive_count]
+        self.receive_count += 1
+        yield AssistantMessage(content=[_TextBlock(response_text)], model="fake")
+        yield result
 
 
 class _BudgetAbortClient:
@@ -88,15 +96,22 @@ class _BudgetAbortClient:
 
 
 class _ClientFactory:
-    def __init__(self, responses: list[tuple[str, ResultMessage]]) -> None:
+    def __init__(
+        self,
+        responses: list[tuple[str, ResultMessage] | list[tuple[str, ResultMessage]]],
+    ) -> None:
         self.responses = responses
         self.options: list[ClaudeAgentOptions] = []
         self.clients: list[_FakeClient] = []
 
     def __call__(self, options: ClaudeAgentOptions) -> _FakeClient:
         self.options.append(options)
-        response_text, result = self.responses.pop(0)
-        client = _FakeClient(options, response_text, result)
+        response_spec = self.responses.pop(0)
+        if isinstance(response_spec, list):
+            client_responses = response_spec
+        else:
+            client_responses = [response_spec]
+        client = _FakeClient(options, client_responses)
         self.clients.append(client)
         return client
 
@@ -131,6 +146,7 @@ def _synthesis_json(channel_id: str) -> str:
             "decisions": [],
             "action_items": [],
             "open_questions": [],
+            "cross_channel_flags": [],
             "source_row_ids": [1],
         }
     )
@@ -234,6 +250,8 @@ async def test_synthesize_sets_nightly_sdk_invariants_and_records_budget(
     options = factory.options[0]
     assert options.cwd == str(tmp_path / "nightly" / "current")
     assert options.max_budget_usd == 5.0
+    assert options.output_format is not None
+    assert options.output_format["type"] == "json_schema"
     assert options.allowed_tools == MEMORY_SEARCH_FULL_TOOL_NAMES
     assert options.permission_mode == "dontAsk"
     assert options.skills == []
@@ -247,6 +265,90 @@ async def test_synthesize_sets_nightly_sdk_invariants_and_records_budget(
     startup = _single_log(caplog.records, "nightly.synthesis_start")
     assert startup.hitl_disabled is True
     assert startup.hitl_config_enabled is False
+    assert _single_log(caplog.records, "nightly.parse_ok").attempt == 1
+
+
+def test_golden_fixture_outputs_match_schema() -> None:
+    fixture_dir = Path(__file__).parent / "fixtures" / "nightly"
+    harvest_paths = sorted(fixture_dir.glob("harvest-*.json"))
+    assert len(harvest_paths) >= 3
+
+    for harvest_path in harvest_paths:
+        harvest = json.loads(harvest_path.read_text(encoding="utf-8"))
+        expected_path = fixture_dir / harvest_path.name.replace("harvest-", "expected-")
+        expected = parse_synthesis_output(expected_path.read_text(encoding="utf-8"))
+        channel = harvest["channels"][0]
+        source_ids = {row["id"] for row in channel["rows"]}
+
+        assert expected["date"] == harvest["date"]
+        assert expected["channel_id"] == channel["channel_id"]
+        assert set(expected["source_row_ids"]).issubset(source_ids)
+        assert "cross_channel_flags" in expected
+
+
+@pytest.mark.asyncio
+async def test_mocked_sdk_malformed_then_valid_retries_and_accepts(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="engram.nightly.synthesize")
+    harvest = _write_harvest(tmp_path, [_channel("C07RETRY")])
+    factory = _ClientFactory(
+        [[("not json", _result(cost=0.01)), (_synthesis_json("C07RETRY"), _result(cost=0.02))]]
+    )
+    budget = _FakeBudget()
+
+    result = await synthesize(
+        harvest,
+        output_root=tmp_path / "nightly",
+        config=NightlyConfig(),
+        contexts_dir=tmp_path / "contexts",
+        anthropic_runtime=AnthropicRuntime(api_key=None, model="sonnet"),
+        budget=budget,
+        client_factory=factory,
+    )
+
+    channel = result.payload["channels"][0]
+    assert channel["status"] == "synthesized"
+    assert channel["synthesis"]["summary"] == "durable summary"
+    assert channel["cost_usd"] == "0.030000"
+    assert len(budget.records) == 2
+    client = factory.clients[0]
+    assert len(client.prompts) == 2
+    assert client.prompts[1].startswith("Your previous response did not match the schema.")
+    assert "Required JSON Schema" in client.prompts[1]
+    assert _single_log(caplog.records, "nightly.parse_retry").channel_id == "C07RETRY"
+    assert _single_log(caplog.records, "nightly.parse_ok").attempt == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_failure_logs_both_raw_outputs_and_aborts(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="engram.nightly.synthesize")
+    harvest = _write_harvest(tmp_path, [_channel("C07FAIL")])
+    second_raw = json.dumps({"schema_version": 1, "date": "2026-04-22"})
+    factory = _ClientFactory([[("not json", _result()), (second_raw, _result())]])
+
+    with pytest.raises(SynthesisOutputError):
+        await synthesize(
+            harvest,
+            output_root=tmp_path / "nightly",
+            config=NightlyConfig(),
+            contexts_dir=tmp_path / "contexts",
+            anthropic_runtime=AnthropicRuntime(api_key=None, model="sonnet"),
+            budget=_FakeBudget(),
+            client_factory=factory,
+        )
+
+    assert not (tmp_path / "nightly" / "archive" / "2026-04-22" / "synthesis.json").exists()
+    assert _single_log(caplog.records, "nightly.parse_retry").channel_id == "C07FAIL"
+    record = _single_log(caplog.records, "nightly.parse_fail_final")
+    assert record.channel_id == "C07FAIL"
+    assert record.raw_outputs == ["not json", second_raw]
+    assert record.raw_output_initial == "not json"
+    assert record.raw_output_retry == second_raw
 
 
 @pytest.mark.asyncio

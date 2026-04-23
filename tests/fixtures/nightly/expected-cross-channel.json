@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "date": "2026-04-22",
+  "channel_id": "C07ALPHA01",
+  "summary": "Alpha may block beta, and the owner DM should be notified if that risk materializes.",
+  "highlights": [
+    {
+      "text": "Alpha-blocks-beta risk should be tracked for owner visibility.",
+      "source_row_ids": [20]
+    }
+  ],
+  "decisions": [],
+  "action_items": [],
+  "open_questions": [],
+  "cross_channel_flags": [
+    {
+      "text": "If alpha blocks beta, notify the owner DM and coordinate with the beta channel.",
+      "related_channel_ids": ["C07BETA02"],
+      "source_row_ids": [20, 21]
+    }
+  ],
+  "source_row_ids": [20, 21]
+}

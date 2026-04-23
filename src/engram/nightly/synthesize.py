@@ -24,6 +24,7 @@ from claude_agent_sdk import (
     ResultMessage,
 )
 from dotenv import load_dotenv
+from pydantic import ValidationError
 
 from engram import paths
 from engram.budget import Budget, BudgetConfig, load_budget_config
@@ -38,6 +39,11 @@ from engram.mcp_tools import (
     MEMORY_SEARCH_FULL_TOOL_NAMES,
     MEMORY_SEARCH_SERVER_NAME,
     make_memory_search_server,
+)
+from engram.nightly.schema import (
+    NightlySynthesisOutput,
+    synthesis_output_format,
+    synthesis_schema_prompt,
 )
 from engram.telemetry import cli_stderr_logger, configure_logging, write_json
 
@@ -85,6 +91,21 @@ class PlannedChannel:
 class SynthesisResult:
     output_path: Path
     payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ClaudeTurnResult:
+    raw_output: str
+    result: ResultMessage | None
+
+
+class SynthesisOutputError(ValueError):
+    """Raised when Claude output cannot be parsed as the pinned synthesis schema."""
+
+    def __init__(self, detail: str, raw_output: str):
+        super().__init__(detail)
+        self.detail = detail
+        self.raw_output = raw_output
 
 
 class BudgetRecorder(Protocol):
@@ -246,7 +267,7 @@ async def synthesize(
 
 
 def parse_synthesis_output(text: str) -> dict[str, Any]:
-    """Parse Claude's JSON object without doing the M5.2.5 schema validation."""
+    """Parse Claude's JSON object and validate it against the nightly schema."""
     candidate = text.strip()
     if candidate.startswith("```"):
         lines = candidate.splitlines()
@@ -262,12 +283,20 @@ def parse_synthesis_output(text: str) -> dict[str, Any]:
         start = candidate.find("{")
         end = candidate.rfind("}")
         if start == -1 or end == -1 or end <= start:
-            raise
-        parsed = json.loads(candidate[start : end + 1])
+            raise SynthesisOutputError("response is not valid JSON", text) from None
+        try:
+            parsed = json.loads(candidate[start : end + 1])
+        except json.JSONDecodeError as exc:
+            raise SynthesisOutputError(str(exc), text) from exc
 
     if not isinstance(parsed, dict):
-        raise ValueError("nightly synthesis output must be a JSON object")
-    return parsed
+        raise SynthesisOutputError("nightly synthesis output must be a JSON object", text)
+
+    try:
+        validated = NightlySynthesisOutput.model_validate(parsed)
+    except ValidationError as exc:
+        raise SynthesisOutputError(exc.json(), text) from exc
+    return validated.model_dump(mode="json")
 
 
 def select_nightly_model(
@@ -331,7 +360,11 @@ def build_nightly_options(
         can_use_tool=None,
         hooks={},
         stderr=cli_stderr_logger(NIGHTLY_CHANNEL_ID),
+        output_format=synthesis_output_format(),
     )
+    # Claude Agent SDK exposes output_format as CLI --json-schema. Nightly uses
+    # that native structured output path first, with parse_synthesis_output as
+    # defense-in-depth for SDK/model drift.
     # SDK 0.1.x has no constructor field for these knobs yet; attach them so
     # nightly callers/tests can assert the invariant and future SDKs can adopt it.
     options.hitl_config = hitl_config
@@ -371,19 +404,57 @@ async def _synthesize_channel(
         config=config,
     )
     client = client_factory(options)
-    text_chunks: list[str] = []
-    result: ResultMessage | None = None
     error_payload: dict[str, Any] | None = None
+    raw_outputs: list[str] = []
+    parsed: dict[str, Any] | None = None
+    cost_usd = Decimal("0")
+    prompt_cache = {"status": "miss", "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+    budget_recorded = False
+
+    def record_turn(result: ResultMessage | None) -> None:
+        nonlocal budget_recorded, cost_usd, prompt_cache
+        if result is None:
+            return
+        cost_usd += _usd(getattr(result, "total_cost_usd", None) or 0)
+        prompt_cache = _prompt_cache(result)
+        budget.record(NIGHTLY_CHANNEL_ID, NIGHTLY_USER_ID, result)
+        budget_recorded = True
 
     try:
         await client.connect()
-        await client.query(prompt, session_id=options.session_id or "default")
-        async for message in client.receive_response():
-            if isinstance(message, AssistantMessage):
-                text_chunks.extend(_assistant_text(message))
-            elif isinstance(message, ResultMessage):
-                result = message
+        first_turn = await _run_claude_turn(
+            client,
+            prompt,
+            session_id=options.session_id or "default",
+        )
+        raw_outputs.append(first_turn.raw_output)
+        record_turn(first_turn.result)
+        try:
+            parsed = parse_synthesis_output(first_turn.raw_output)
+            _log_parse_ok(plan=plan, run_date=run_date, attempt=1)
+        except SynthesisOutputError as exc:
+            _log_parse_retry(plan=plan, run_date=run_date, error=exc.detail)
+            retry_turn = await _run_claude_turn(
+                client,
+                _repair_prompt(exc.detail),
+                session_id=options.session_id or "default",
+            )
+            raw_outputs.append(retry_turn.raw_output)
+            record_turn(retry_turn.result)
+            try:
+                parsed = parse_synthesis_output(retry_turn.raw_output)
+                _log_parse_ok(plan=plan, run_date=run_date, attempt=2)
+            except SynthesisOutputError as retry_exc:
+                _log_parse_fail_final(
+                    plan=plan,
+                    run_date=run_date,
+                    error=retry_exc.detail,
+                    raw_outputs=raw_outputs,
+                )
+                raise
     except Exception as exc:
+        if isinstance(exc, SynthesisOutputError):
+            raise
         error_payload = {
             "status": "sdk_error",
             "error_class": type(exc).__name__,
@@ -405,30 +476,9 @@ async def _synthesize_channel(
                     },
                 )
 
-    cost_usd = Decimal("0")
-    prompt_cache = {"status": "miss", "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
-    budget_recorded = False
-    if result is not None:
-        cost_usd = _usd(getattr(result, "total_cost_usd", None) or 0)
-        prompt_cache = _prompt_cache(result)
-        budget.record(NIGHTLY_CHANNEL_ID, NIGHTLY_USER_ID, result)
-        budget_recorded = True
-
-    response_text = "".join(text_chunks).strip()
-    parsed: dict[str, Any] | None = None
     status = "synthesized"
     if error_payload is not None:
         status = str(error_payload["status"])
-    else:
-        try:
-            parsed = parse_synthesis_output(response_text)
-        except (ValueError, json.JSONDecodeError) as exc:
-            status = "parse_error"
-            error_payload = {
-                "status": status,
-                "error_class": type(exc).__name__,
-                "error": str(exc),
-            }
 
     payload: dict[str, Any] = {
         "channel_id": plan.channel_id,
@@ -445,8 +495,8 @@ async def _synthesize_channel(
         payload["synthesis"] = parsed
     if error_payload is not None:
         payload["error"] = error_payload
-        if response_text:
-            payload["raw_output"] = response_text
+        if raw_outputs:
+            payload["raw_output"] = raw_outputs[-1]
 
     log.info(
         "nightly.channel_synthesized",
@@ -550,6 +600,83 @@ def _assistant_text(message: AssistantMessage) -> list[str]:
         if text:
             chunks.append(text)
     return chunks
+
+
+async def _run_claude_turn(
+    client: ClaudeSDKClient,
+    prompt: str,
+    *,
+    session_id: str,
+) -> ClaudeTurnResult:
+    text_chunks: list[str] = []
+    result: ResultMessage | None = None
+    await client.query(prompt, session_id=session_id)
+    async for message in client.receive_response():
+        if isinstance(message, AssistantMessage):
+            text_chunks.extend(_assistant_text(message))
+        elif isinstance(message, ResultMessage):
+            result = message
+    return ClaudeTurnResult(raw_output="".join(text_chunks).strip(), result=result)
+
+
+def _repair_prompt(error: str) -> str:
+    return (
+        "Your previous response did not match the schema. "
+        f"The error was: `{error}`. "
+        "Please reformat preserving the same content.\n\n"
+        "Required JSON Schema:\n"
+        "```json\n"
+        f"{synthesis_schema_prompt()}\n"
+        "```\n\n"
+        "Return only the corrected JSON object."
+    )
+
+
+def _log_parse_ok(*, plan: PlannedChannel, run_date: str, attempt: int) -> None:
+    log.info(
+        "nightly.parse_ok",
+        extra={
+            "phase": "synthesis",
+            "date": run_date,
+            "channel_id": plan.channel_id,
+            "attempt": attempt,
+        },
+    )
+
+
+def _log_parse_retry(*, plan: PlannedChannel, run_date: str, error: str) -> None:
+    log.warning(
+        "nightly.parse_retry",
+        extra={
+            "phase": "synthesis",
+            "date": run_date,
+            "channel_id": plan.channel_id,
+            "attempt": 1,
+            "error": error,
+        },
+    )
+
+
+def _log_parse_fail_final(
+    *,
+    plan: PlannedChannel,
+    run_date: str,
+    error: str,
+    raw_outputs: list[str],
+) -> None:
+    log.error(
+        "nightly.parse_fail_final",
+        extra={
+            "phase": "synthesis",
+            "date": run_date,
+            "channel_id": plan.channel_id,
+            "attempts": len(raw_outputs),
+            "error": error,
+            "raw_outputs": raw_outputs,
+            "raw_output_initial": raw_outputs[0] if raw_outputs else "",
+            "raw_output_retry": raw_outputs[1] if len(raw_outputs) > 1 else "",
+        },
+    )
 
 
 def _prompt_cache(result: ResultMessage) -> dict[str, int | str]:
@@ -685,7 +812,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    configure_logging()
+    configure_logging(file_prefix="nightly")
     try:
         result = asyncio.run(
             synthesize(

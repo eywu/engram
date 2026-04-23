@@ -1,0 +1,49 @@
+{
+  "date": "2026-04-22",
+  "channels": [
+    {
+      "channel_id": "C07WORK999",
+      "row_count": 3,
+      "token_count": 48,
+      "rows": [
+        {
+          "kind": "transcript",
+          "id": 10,
+          "channel_id": "C07WORK999",
+          "ts": "2026-04-22T03:00:00+00:00",
+          "token_count": 16,
+          "text": "Decision: keep the retry limit at one repair attempt.",
+          "session_id": "session-C07WORK999",
+          "role": "assistant",
+          "message_uuid": "msg-10",
+          "parent_uuid": null
+        },
+        {
+          "kind": "transcript",
+          "id": 11,
+          "channel_id": "C07WORK999",
+          "ts": "2026-04-22T03:05:00+00:00",
+          "token_count": 14,
+          "text": "Action item: add malformed-then-valid mocked SDK coverage.",
+          "session_id": "session-C07WORK999",
+          "role": "user",
+          "message_uuid": "msg-11",
+          "parent_uuid": "msg-10"
+        },
+        {
+          "kind": "transcript",
+          "id": 12,
+          "channel_id": "C07WORK999",
+          "ts": "2026-04-22T03:10:00+00:00",
+          "token_count": 18,
+          "text": "Open question: should weekly synthesis keep the same schema?",
+          "session_id": "session-C07WORK999",
+          "role": "assistant",
+          "message_uuid": "msg-12",
+          "parent_uuid": "msg-11"
+        }
+      ]
+    }
+  ],
+  "skipped_channels": []
+}
