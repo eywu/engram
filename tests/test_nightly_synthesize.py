@@ -108,10 +108,7 @@ class _ClientFactory:
     def __call__(self, options: ClaudeAgentOptions) -> _FakeClient:
         self.options.append(options)
         response_spec = self.responses.pop(0)
-        if isinstance(response_spec, list):
-            client_responses = response_spec
-        else:
-            client_responses = [response_spec]
+        client_responses = response_spec if isinstance(response_spec, list) else [response_spec]
         client = _FakeClient(options, client_responses)
         self.clients.append(client)
         return client
