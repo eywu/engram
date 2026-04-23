@@ -23,8 +23,8 @@ import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
 from collections import defaultdict
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path

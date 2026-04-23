@@ -91,7 +91,7 @@ class _FakeSDKClient:
 
 
 class _FakeSlackClient:
-    async def chat_postMessage(self, **kwargs):
+    async def chat_postMessage(self, **kwargs):  # noqa: N802 - Slack SDK uses camelCase
         del kwargs
         return {"ok": True, "ts": "1713800000.000200"}
 
