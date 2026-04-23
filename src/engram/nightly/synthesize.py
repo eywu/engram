@@ -153,9 +153,12 @@ async def synthesize(
     current_dir.mkdir(parents=True, exist_ok=True)
     archive_dir.mkdir(parents=True, exist_ok=True)
 
+    # Nightly synthesis never prompts a human: there is no Slack operator
+    # attached to the launchd subprocess. HITL is hard-disabled here and
+    # threaded into the SDK invocation at line ~376 so ``options.hitl_config``
+    # carries the same truth everywhere. If this default ever needs to change,
+    # hoist it to a module-level constant instead of re-enabling per-call.
     hitl_config = HITLConfig(enabled=False)
-    hitl_disabled = not hitl_config.enabled
-    assert hitl_disabled is True
 
     ledger = budget or _nightly_budget(config_path)
     prompt_template = prompt_template_path.expanduser().read_text(encoding="utf-8")
@@ -167,7 +170,7 @@ async def synthesize(
             "date": run_date,
             "trigger": trigger,
             "cwd": str(current_dir),
-            "hitl_disabled": hitl_disabled,
+            "hitl_disabled": not hitl_config.enabled,
             "hitl_config_enabled": hitl_config.enabled,
             "max_budget_usd": MAX_TURN_BUDGET_USD,
             "daily_cost_cap_usd": nightly_config.daily_cost_cap_usd,
@@ -239,7 +242,7 @@ async def synthesize(
         "harvest_path": str(harvest_path),
         "cwd": str(current_dir),
         "archive_dir": str(archive_dir),
-        "hitl_disabled": hitl_disabled,
+        "hitl_disabled": not hitl_config.enabled,
         "hitl_config_enabled": hitl_config.enabled,
         "max_budget_usd": MAX_TURN_BUDGET_USD,
         "daily_cost_cap_usd": nightly_config.daily_cost_cap_usd,
