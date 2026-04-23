@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import plistlib
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -160,6 +162,124 @@ def test_launchd_smoketest_plist_is_manual_one_shot_and_copies_bridge_env():
     assert smoke_env["PATH"] == bridge_env["PATH"]
     assert smoke_env["LANG"] == bridge_env["LANG"]
     assert smoke_env["HOME"] == "/REPLACE/WITH/HOME"
+
+
+def test_launchd_nightly_plist_is_daily_2am_and_copies_smoketest_env():
+    smoke = _plist(Path("launchd/com.engram.v3.smoketest.plist"))
+    nightly = _plist(Path("launchd/com.engram.v3.nightly.plist"))
+
+    assert nightly["Label"] == "com.engram.v3.nightly"
+    assert nightly["RunAtLoad"] is False
+    assert "KeepAlive" not in nightly
+    assert nightly["StartCalendarInterval"] == {"Hour": 2, "Minute": 0}
+    assert nightly["ProgramArguments"][0].endswith("engram_nightly_launchd.sh")
+
+    smoke_env = smoke["EnvironmentVariables"]
+    nightly_env = nightly["EnvironmentVariables"]
+    assert nightly_env["PATH"] == smoke_env["PATH"]
+    assert nightly_env["LANG"] == smoke_env["LANG"]
+    assert nightly_env["HOME"] == "/REPLACE/WITH/HOME"
+    assert nightly_env["ENGRAM_REPO_ROOT"] == "/REPLACE/WITH/ABSOLUTE/PATH/TO/engram-repo"
+    assert nightly_env["ENGRAM_UV_BIN"] == "/REPLACE/WITH/ABSOLUTE/PATH/TO/uv"
+    assert "nightly-stdio-" in nightly["StandardOutPath"]
+    assert nightly["StandardOutPath"] == nightly["StandardErrorPath"]
+
+
+def test_nightly_launchd_wrapper_adds_weekly_on_monday(tmp_path: Path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    args_path = tmp_path / "uv-args.txt"
+    uv = bin_dir / "uv"
+    uv.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$UV_ARGS\"\n")
+    date = bin_dir / "date"
+    date.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"+%F\" ]; then echo 2026-04-20; exit 0; fi\n"
+        "if [ \"$1\" = \"+%u\" ]; then echo 1; exit 0; fi\n"
+        "exec /bin/date \"$@\"\n"
+    )
+    uv.chmod(0o755)
+    date.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "ENGRAM_REPO_ROOT": str(Path.cwd()),
+        "ENGRAM_UV_BIN": str(uv),
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "UV_ARGS": str(args_path),
+    }
+
+    subprocess.run(["scripts/engram_nightly_launchd.sh"], env=env, check=True)
+
+    assert (tmp_path / ".engram" / "logs" / "nightly-stdio-2026-04-20.log").exists()
+    assert args_path.read_text(encoding="utf-8").splitlines() == [
+        "run",
+        "--project",
+        str(Path.cwd()),
+        "engram",
+        "nightly",
+        "--verbose",
+        "--weekly",
+    ]
+
+
+def test_install_launchd_install_nightly_is_idempotent(tmp_path: Path):
+    home = tmp_path / "home"
+    bin_dir = tmp_path / "bin"
+    home.mkdir()
+    bin_dir.mkdir()
+    calls = tmp_path / "launchctl-calls.txt"
+    state = tmp_path / "launchctl-state.txt"
+
+    uv = bin_dir / "uv"
+    uv.write_text("#!/bin/sh\nexit 0\n")
+    launchctl = bin_dir / "launchctl"
+    launchctl.write_text(
+        "#!/bin/sh\n"
+        "cmd=\"$1\"\n"
+        "shift || true\n"
+        "case \"$cmd\" in\n"
+        "  list)\n"
+        "    [ -f \"$LAUNCHCTL_STATE\" ] && cat \"$LAUNCHCTL_STATE\"\n"
+        "    ;;\n"
+        "  bootstrap|load)\n"
+        "    printf '%s\\n' '- 0 com.engram.v3.nightly' > \"$LAUNCHCTL_STATE\"\n"
+        "    printf '%s %s\\n' \"$cmd\" \"$*\" >> \"$LAUNCHCTL_CALLS\"\n"
+        "    ;;\n"
+        "  bootout|unload)\n"
+        "    rm -f \"$LAUNCHCTL_STATE\"\n"
+        "    printf '%s %s\\n' \"$cmd\" \"$*\" >> \"$LAUNCHCTL_CALLS\"\n"
+        "    ;;\n"
+        "  enable)\n"
+        "    printf '%s %s\\n' \"$cmd\" \"$*\" >> \"$LAUNCHCTL_CALLS\"\n"
+        "    ;;\n"
+        "esac\n"
+    )
+    uv.chmod(0o755)
+    launchctl.chmod(0o755)
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "LAUNCHCTL_CALLS": str(calls),
+        "LAUNCHCTL_STATE": str(state),
+    }
+
+    subprocess.run(["scripts/install_launchd.sh", "--install-nightly"], env=env, check=True)
+    subprocess.run(["scripts/install_launchd.sh", "--install-nightly"], env=env, check=True)
+
+    installed = _plist(home / "Library" / "LaunchAgents" / "com.engram.v3.nightly.plist")
+    assert installed["Label"] == "com.engram.v3.nightly"
+    assert installed["EnvironmentVariables"]["HOME"] == str(home)
+    assert installed["EnvironmentVariables"]["ENGRAM_UV_BIN"] == str(uv)
+    assert installed["ProgramArguments"] == [
+        str(Path.cwd() / "scripts" / "engram_nightly_launchd.sh")
+    ]
+
+    call_text = calls.read_text(encoding="utf-8")
+    assert call_text.count("bootstrap ") == 2
+    assert "bootout " in call_text
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
@@ -245,6 +246,85 @@ async def test_pipeline_report_suppress_skips_success_dm(tmp_path: Path) -> None
     report = report_path.read_text(encoding="utf-8")
     assert "C07TEST123" in report
     assert "$0.0400" in report
+
+
+async def test_pipeline_dry_run_passes_apply_flag_and_verbose_phase_events(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("nightly:\n  min_evidence: 1\n", encoding="utf-8")
+    apply_dry_runs: list[bool] = []
+
+    def fake_harvest(**kwargs: Any) -> HarvestResult:
+        payload = {
+            "date": "2026-04-22",
+            "channels": [],
+            "skipped_channels": [],
+        }
+        path = kwargs["output_root"] / "2026-04-22" / "harvest.json"
+        write_json(path, payload)
+        return HarvestResult(output_path=path, payload=payload)
+
+    async def fake_synthesize(
+        harvest_json: Path,
+        *,
+        output_root: Path,
+        **_: Any,
+    ) -> SynthesisResult:
+        payload = {
+            "schema_version": 1,
+            "date": "2026-04-22",
+            "channels": [],
+            "skipped_channels": [],
+            "totals": {"cost_usd": "0.000000"},
+        }
+        path = output_root / "2026-04-22" / "synthesis.json"
+        write_json(path, payload)
+        return SynthesisResult(output_path=path, payload=payload)
+
+    async def fake_apply(
+        synthesis_json: Path,
+        *,
+        dry_run: bool,
+        **_: Any,
+    ) -> ApplyResult:
+        apply_dry_runs.append(dry_run)
+        payload = json.loads(synthesis_json.read_text(encoding="utf-8"))
+        return ApplyResult(
+            output_path=tmp_path / "dry-run" / "synthesis.json",
+            rows_written=0,
+            rows_queued=0,
+            dry_run=dry_run,
+            payload=payload,
+        )
+
+    caplog.set_level(logging.INFO, logger="engram.nightly")
+
+    result = await run_nightly_pipeline(
+        dry_run=True,
+        verbose=True,
+        target_date=date(2026, 4, 22),
+        db_path=tmp_path / "memory.db",
+        output_root=tmp_path / "nightly",
+        config_path=config_path,
+        harvest_func=fake_harvest,
+        synthesize_func=fake_synthesize,
+        apply_func=fake_apply,
+    )
+
+    assert result["channels_covered"] == 0
+    assert apply_dry_runs == [True]
+    events = [record.getMessage() for record in caplog.records]
+    assert events == [
+        "nightly.harvest_started",
+        "nightly.harvest_completed",
+        "nightly.synthesis_started",
+        "nightly.synthesis_completed",
+        "nightly.apply_started",
+        "nightly.apply_completed",
+    ]
+    assert all(getattr(record, "dry_run", None) is True for record in caplog.records)
 
 
 def _seed_summary(
