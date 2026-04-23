@@ -26,7 +26,8 @@ bridge between Slack and Claude.
   proposes improvements to its own prompts, skills, and memory. Dry-run for a
   week before auto-apply.
 - **Human-in-the-loop, cleanly.** When Engram needs your input, it asks you in
-  Slack with block-kit buttons. You click. It resumes.
+  Slack with block-kit buttons. You click. It resumes. See
+  [docs/hitl.md](docs/hitl.md).
 
 ## Architecture (short version)
 
