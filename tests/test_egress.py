@@ -216,9 +216,68 @@ async def test_update_question_timeout_has_clock_emoji():
 
 
 def test_suggestion_label_extraction():
-    long = "x" * 50
-
+    # 1. Explicit override in a dict (internal flows like OQ31)
     assert _suggestion_label({"name": "Allow once"}) == "Allow once"
     assert _suggestion_label({"label": "Allow with label"}) == "Allow with label"
-    assert _suggestion_label({"unknown": "value"}) == "choice"
-    assert _suggestion_label(long) == "x" * 40
+    # 2. Dict with no name/label falls through to the semantic default,
+    #    NOT the old placeholder "choice"
+    assert _suggestion_label({"unknown": "value"}) == "Allow"
+    assert _suggestion_label({"unknown": "value"}, tool_name="WebFetch") == "Allow fetch"
+    # 3. Universal fallback for bare / unknown-shape suggestions (e.g. None)
+    assert _suggestion_label(None) == "Allow"
+    assert _suggestion_label(None, tool_name="Bash") == "Allow shell command"
+    assert _suggestion_label(None, tool_name="UnknownTool") == "Allow"
+    # 4. 40-char cap still applies for long explicit overrides
+    assert _suggestion_label({"name": "x" * 50}) == "x" * 40
+
+
+def test_suggestion_label_from_sdk_permission_update():
+    """The SDK emits PermissionUpdate dataclasses — derive labels from .type."""
+    from claude_agent_sdk.types import PermissionUpdate
+
+    add_rules = PermissionUpdate(type="addRules")
+    assert _suggestion_label(add_rules) == "Always allow"
+
+    set_mode = PermissionUpdate(type="setMode", mode="acceptEdits")
+    assert _suggestion_label(set_mode) == "Set mode: acceptEdits"
+
+    add_dirs = PermissionUpdate(type="addDirectories")
+    assert _suggestion_label(add_dirs) == "Add to allowed dirs"
+
+
+@pytest.mark.asyncio
+async def test_post_question_renders_allow_button_even_with_no_suggestions():
+    """Regression: historically we only posted buttons for suggestions in the
+    SDK context, so an empty list left the user with only a 'Deny' button."""
+    slack = FakeSlackClient()
+    q = make_question(suggestions=[])
+    q.tool_name = "WebFetch"
+
+    await post_question(q, slack)
+
+    call = slack.post_calls[0]
+    action_block = next(b for b in call["blocks"] if b["type"] == "actions")
+    labels = [el["text"]["text"] for el in action_block["elements"]]
+    # Must include at least one allow-style button AND the Deny button
+    assert labels[0] == "Allow fetch"
+    assert "Deny" in labels
+    # Primary button should have the "primary" style to stand out
+    assert action_block["elements"][0].get("style") == "primary"
+    assert "choice" not in labels  # regression for the old placeholder bug
+
+
+@pytest.mark.asyncio
+async def test_post_question_never_renders_choice_placeholder():
+    """Regression: a suggestion dict with neither name nor label previously
+    produced a button labeled 'choice'. Must now render a semantic label."""
+    slack = FakeSlackClient()
+    q = make_question(suggestions=[{"unknown": "payload"}])
+    q.tool_name = "Bash"
+
+    await post_question(q, slack)
+
+    call = slack.post_calls[0]
+    action_block = next(b for b in call["blocks"] if b["type"] == "actions")
+    labels = [el["text"]["text"] for el in action_block["elements"]]
+    assert "choice" not in labels
+    assert "Allow shell command" in labels

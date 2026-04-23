@@ -74,13 +74,22 @@ async def post_question(q: PendingQuestion, slack_client) -> tuple[str, str]:
     input_summary = json.dumps(q.tool_input, indent=2)[:800]
     action_elements = []
 
-    for i, suggestion in enumerate(q.suggestions[:5]):
+    # Always include a primary "Allow" button (index 0), even when the SDK
+    # returned no suggestions — otherwise the user would only see "Deny",
+    # which is a UX dead end. If the SDK did return suggestions, we use
+    # _suggestion_label to label each one (but never fall back to the meaningless
+    # word "choice" — see _suggestion_label docstring).
+    suggestions = list(q.suggestions[:5]) if q.suggestions else [None]
+    for i, suggestion in enumerate(suggestions):
+        label = _suggestion_label(suggestion, tool_name=q.tool_name)
         action_elements.append(
             {
                 "type": "button",
-                "text": {"type": "plain_text", "text": _suggestion_label(suggestion)},
+                "text": {"type": "plain_text", "text": label},
                 "value": f"{q.permission_request_id}|{i}",
                 "action_id": f"hitl_choice_{i}",
+                # Highlight the primary allow action so it reads clearly against Deny.
+                **({"style": "primary"} if i == 0 else {}),
             }
         )
 
@@ -219,11 +228,71 @@ async def update_question_timeout(q: PendingQuestion, slack_client) -> None:
     )
 
 
-def _suggestion_label(suggestion) -> str:
-    """Extract a display label from an SDK-opaque permission suggestion."""
+# Map from Claude tool names to human-friendly verb fragments. We surface the
+# verb in the HITL approval label so users see "Allow fetch" instead of just
+# "Allow" or the useless "choice" placeholder. Unknown tools fall back to
+# "Allow" — never the tool name itself (avoids leaking implementation jargon
+# like "BashOutput" into the UI).
+_TOOL_VERB = {
+    "WebFetch": "fetch",
+    "WebSearch": "search",
+    "Read": "read",
+    "Write": "write",
+    "Edit": "edit",
+    "MultiEdit": "edit",
+    "NotebookEdit": "edit",
+    "Bash": "shell command",
+    "BashOutput": "shell output",
+    "KillShell": "kill shell",
+    "Task": "subtask",
+    "TodoWrite": "todos update",
+    "Grep": "grep",
+    "Glob": "glob",
+    "SlashCommand": "slash command",
+}
+
+
+def _suggestion_label(suggestion, *, tool_name: str | None = None) -> str:
+    """Build a human-readable button label for a HITL permission suggestion.
+
+    The Claude Agent SDK emits ``suggestions`` as a list of ``PermissionUpdate``
+    dataclasses (see ``claude_agent_sdk.types.PermissionUpdate``); these have
+    no ``name`` / ``label`` attributes, so earlier versions of this helper
+    always fell back to the placeholder string ``"choice"``. That was leaking
+    to Slack as a mystery button label.
+
+    Label precedence (first match wins):
+      1. ``suggestion["name"]`` or ``suggestion["label"]`` (explicit override,
+         used by our own internal flows e.g. the OQ31 nightly-eligibility card)
+      2. A friendly label derived from a ``PermissionUpdate``'s ``type`` field
+         (e.g. ``addRules`` → "Always allow")
+      3. ``"Allow <verb>"`` where ``<verb>`` is mapped from ``tool_name``
+      4. Plain ``"Allow"`` as the universal fallback — never ``"choice"``.
+    """
+    # 1. Explicit override in a dict (preserves internal callers e.g. {"name": "Confirm"})
     if isinstance(suggestion, dict):
-        return str(suggestion.get("name") or suggestion.get("label") or "choice")[:40]
-    return str(suggestion)[:40]
+        explicit = suggestion.get("name") or suggestion.get("label")
+        if explicit:
+            return str(explicit)[:40]
+
+    # 2. SDK PermissionUpdate dataclass — derive from .type
+    update_type = getattr(suggestion, "type", None)
+    if update_type == "addRules":
+        return "Always allow"
+    if update_type == "replaceRules":
+        return "Replace rules"
+    if update_type == "setMode":
+        mode = getattr(suggestion, "mode", None)
+        return f"Set mode: {mode}"[:40] if mode else "Set mode"
+    if update_type == "addDirectories":
+        return "Add to allowed dirs"
+
+    # 3 + 4. Default "Allow" label, optionally specialized by tool
+    if tool_name:
+        verb = _TOOL_VERB.get(tool_name)
+        if verb:
+            return f"Allow {verb}"[:40]
+    return "Allow"
 
 
 def _chunk_text(text: str, limit: int) -> list[str]:
