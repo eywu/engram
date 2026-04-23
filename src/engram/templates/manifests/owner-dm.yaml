@@ -11,6 +11,7 @@ channel_id: "{{channel_id}}"
 identity: owner-dm-full
 label: "DM"
 status: active
+meta_eligible: true
 
 setting_sources: [user]
 

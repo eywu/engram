@@ -12,21 +12,39 @@ import asyncio
 import datetime
 import logging
 import re
+import uuid
+from dataclasses import dataclass
 from decimal import Decimal
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from slack_bolt.async_app import AsyncApp
 
+from engram import paths
 from engram.agent import Agent
 from engram.config import EngramConfig
 from engram.costs import CostLedger, TurnCost
-from engram.egress import _suggestion_label, post_reply, update_question_resolved
+from engram.egress import (
+    _suggestion_label,
+    post_meta_eligibility_question,
+    post_reply,
+    update_question_resolved,
+)
+from engram.hitl import PendingQuestion
+from engram.manifest import ManifestError, dump_manifest, load_manifest
 from engram.router import Router
 
 log = logging.getLogger(__name__)
 hitl_log = logging.getLogger("engram.hitl")
 _BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 HITL_ACTION_ID_PATTERN = re.compile(r"^hitl_choice_(?:\d+|deny)$")
+CHANNEL_REF_PATTERN = re.compile(r"<#(?P<id>[A-Z0-9]+)(?:\|[^>]+)?>")
+CHANNEL_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]+$")
+
+
+@dataclass(frozen=True)
+class MetaEligibilityCommand:
+    eligible: bool
+    target: str | None
 
 
 def register_listeners(
@@ -50,6 +68,40 @@ def register_listeners(
                 )
         except Exception:
             log.exception("ingress.hitl_action_handler_failed")
+
+    @app.command("/exclude-from-nightly")
+    async def on_exclude_from_nightly(ack, body, client):
+        await ack()
+        try:
+            await handle_meta_eligibility_command(
+                router=router,
+                config=config,
+                slack_client=client,
+                source_channel_id=str(body.get("channel_id") or ""),
+                source_channel_name=body.get("channel_name"),
+                user_id=body.get("user_id"),
+                eligible=False,
+                target_text=body.get("text"),
+            )
+        except Exception:
+            log.exception("ingress.meta_exclusion_command_failed")
+
+    @app.command("/include-in-nightly")
+    async def on_include_in_nightly(ack, body, client):
+        await ack()
+        try:
+            await handle_meta_eligibility_command(
+                router=router,
+                config=config,
+                slack_client=client,
+                source_channel_id=str(body.get("channel_id") or ""),
+                source_channel_name=body.get("channel_name"),
+                user_id=body.get("user_id"),
+                eligible=True,
+                target_text=body.get("text"),
+            )
+        except Exception:
+            log.exception("ingress.meta_inclusion_command_failed")
 
     @app.event("message")
     async def on_message(event, say, client):
@@ -83,6 +135,20 @@ def register_listeners(
             channel_name=None,  # resolve lazily later
             is_dm=is_dm,
         )
+
+        parsed_meta_command = parse_meta_eligibility_command(text)
+        if parsed_meta_command is not None:
+            await handle_meta_eligibility_command(
+                router=router,
+                config=config,
+                slack_client=client,
+                source_channel_id=channel_id,
+                source_channel_name=session.channel_name,
+                user_id=user_id,
+                eligible=parsed_meta_command.eligible,
+                target_text=parsed_meta_command.target,
+            )
+            return
 
         # M2: manifest-driven gating replaces the M1 allowlist.
         # If the router produced a manifest, use its status. Otherwise
@@ -189,6 +255,192 @@ async def handle_block_action(payload: dict, router, slack_client) -> dict:
     return {"ok": True}
 
 
+async def handle_meta_eligibility_command(
+    *,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+    source_channel_id: str,
+    source_channel_name: str | None,
+    user_id: str | None,
+    eligible: bool,
+    target_text: str | None,
+) -> dict[str, object]:
+    """Create an owner-DM HITL card for OQ31 nightly meta eligibility changes."""
+    if not source_channel_id:
+        return {"ok": False, "error": "missing source channel"}
+
+    home = router.home or paths.engram_home()
+    target_channel_id = _resolve_meta_target(
+        target_text,
+        source_channel_id=source_channel_id,
+        home=home,
+    )
+    if target_channel_id is None:
+        return {"ok": False, "error": "target channel not found"}
+
+    if target_channel_id == source_channel_id:
+        await router.get(
+            target_channel_id,
+            channel_name=_channel_label_from_name(source_channel_name),
+            is_dm=target_channel_id.startswith("D"),
+        )
+
+    manifest_path = paths.channel_manifest_path(target_channel_id, home)
+    try:
+        manifest = load_manifest(manifest_path)
+    except ManifestError as exc:
+        log.warning(
+            "ingress.meta_eligibility_manifest_missing channel=%s error=%s",
+            target_channel_id,
+            exc,
+        )
+        return {"ok": False, "error": "manifest not found"}
+
+    owner_dm_channel_id = config.owner_dm_channel_id or router.owner_dm_channel_id
+    if not owner_dm_channel_id:
+        log.warning(
+            "ingress.meta_eligibility_no_owner_dm source=%s target=%s",
+            source_channel_id,
+            target_channel_id,
+        )
+        return {"ok": False, "error": "owner DM channel is not configured"}
+
+    async def apply_confirmed_decision(result) -> None:
+        if not isinstance(result, PermissionResultAllow):
+            return
+        latest = load_manifest(manifest_path)
+        updated = latest.model_copy(update={"meta_eligible": eligible})
+        dump_manifest(updated, manifest_path)
+        router.replace_cached_manifest(updated)
+        log.info(
+            "ingress.meta_eligibility_updated channel=%s meta_eligible=%s",
+            target_channel_id,
+            eligible,
+        )
+
+    command_name = "include-in-nightly" if eligible else "exclude-from-nightly"
+    q = PendingQuestion(
+        permission_request_id=str(uuid.uuid4()),
+        channel_id=owner_dm_channel_id,
+        session_id=f"meta-eligibility:{target_channel_id}",
+        turn_id=str(uuid.uuid4()),
+        tool_name=command_name,
+        tool_input={
+            "channel_id": target_channel_id,
+            "source_channel_id": source_channel_id,
+            "requested_by": user_id,
+            "meta_eligible": eligible,
+        },
+        suggestions=[{"name": "Confirm"}],
+        who_can_answer=None,
+        posted_at=datetime.datetime.now(datetime.UTC),
+        timeout_s=config.hitl.timeout_s,
+        on_resolve=apply_confirmed_decision,
+    )
+    router.hitl.register(q)
+
+    # OQ31 locked decision: cards are always sent to the owner DM, even when
+    # the command originates in a channel, so approvals have one consistent
+    # operator-facing surface.
+    channel_ts, thread_ts = await post_meta_eligibility_question(
+        q,
+        slack_client,
+        channel_label=_manifest_display_label(manifest),
+        eligible=eligible,
+    )
+    q.slack_channel_ts = channel_ts
+    q.slack_thread_ts = thread_ts
+    log.info(
+        "ingress.meta_eligibility_question_posted source=%s target=%s owner_dm=%s eligible=%s",
+        source_channel_id,
+        target_channel_id,
+        owner_dm_channel_id,
+        eligible,
+    )
+    return {"ok": True, "permission_request_id": q.permission_request_id}
+
+
+def parse_meta_eligibility_command(text: str) -> MetaEligibilityCommand | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+
+    parts = stripped.split(maxsplit=1)
+    command = parts[0].lstrip("/").lower()
+    if command == "exclude-from-nightly":
+        return MetaEligibilityCommand(False, _normalize_target_text(parts[1] if len(parts) > 1 else None))
+    if command == "include-in-nightly":
+        return MetaEligibilityCommand(True, _normalize_target_text(parts[1] if len(parts) > 1 else None))
+
+    natural_patterns = (
+        (False, r"\bexclude(?:\s+(?P<target><#[^>]+>|[A-Z][A-Z0-9]+|#[A-Za-z0-9_-]+|this channel))?\s+from\s+nightly\b"),
+        (True, r"\binclude(?:\s+(?P<target><#[^>]+>|[A-Z][A-Z0-9]+|#[A-Za-z0-9_-]+|this channel))?\s+in\s+nightly\b"),
+    )
+    for eligible, pattern in natural_patterns:
+        match = re.search(pattern, stripped, flags=re.IGNORECASE)
+        if match:
+            return MetaEligibilityCommand(
+                eligible,
+                _normalize_target_text(match.groupdict().get("target")),
+            )
+    return None
+
+
+def _normalize_target_text(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    target = raw.strip()
+    if not target or target.lower() in {"this", "this channel"}:
+        return None
+    return target
+
+
+def _resolve_meta_target(
+    raw_target: str | None,
+    *,
+    source_channel_id: str,
+    home,
+) -> str | None:
+    target = _normalize_target_text(raw_target)
+    if target is None:
+        return source_channel_id
+
+    mention = CHANNEL_REF_PATTERN.search(target)
+    if mention:
+        return mention.group("id")
+
+    first_token = target.split()[0]
+    if CHANNEL_ID_PATTERN.match(first_token):
+        return first_token
+
+    if first_token.startswith("#"):
+        wanted = first_token.lower()
+        for manifest_path in sorted(paths.contexts_dir(home).glob("*/.claude/channel-manifest.yaml")):
+            try:
+                manifest = load_manifest(manifest_path)
+            except ManifestError:
+                continue
+            labels = {
+                str(manifest.label or "").lower(),
+                f"#{manifest.channel_id}".lower(),
+                manifest.channel_id.lower(),
+            }
+            if wanted in labels:
+                return manifest.channel_id
+    return None
+
+
+def _manifest_display_label(manifest) -> str:
+    return manifest.label or manifest.channel_id
+
+
+def _channel_label_from_name(channel_name: str | None) -> str | None:
+    if not channel_name:
+        return None
+    return channel_name if channel_name.startswith("#") else f"#{channel_name}"
+
+
 async def _resolve_block_action(q, choice_key, router, slack_client) -> None:
     try:
         if choice_key == "deny":
@@ -219,6 +471,8 @@ async def _resolve_block_action(q, choice_key, router, slack_client) -> None:
                     "decision": _hitl_decision_label(result),
                 },
             )
+            if q.on_resolve is not None:
+                await q.on_resolve(result)
         await update_question_resolved(q, answer_text, slack_client)
     except Exception:
         log.exception("resolve_block_action failed")

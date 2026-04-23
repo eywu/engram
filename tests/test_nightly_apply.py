@@ -13,6 +13,7 @@ from engram.config import EmbeddingsConfig
 from engram.embeddings import EmbeddingQueue
 from engram.memory import open_memory_db
 from engram.nightly.apply import apply_synthesis
+from engram.nightly.schema import META_CHANNEL_ID
 
 
 class _FakeEmbedder:
@@ -239,3 +240,59 @@ async def test_apply_weekly_writes_nightly_weekly_with_seven_source_rows(
     assert row["summary_text"].endswith(
         "Source daily summary row ids: 11, 12, 13, 14, 15, 16, 17"
     )
+
+
+@pytest.mark.asyncio
+async def test_apply_weekly_meta_row_upserts_at_most_one_per_week(tmp_path: Path) -> None:
+    synthesis = tmp_path / "weekly-meta-synthesis.json"
+    payload = {
+        "schema_version": 1,
+        "date": "2026-04-20",
+        "trigger": "nightly-weekly",
+        "channels": [
+            {
+                "channel_id": META_CHANNEL_ID,
+                "status": "synthesized",
+                "synthesis": {
+                    "schema_version": 1,
+                    "date": "2026-04-20",
+                    "channel_id": META_CHANNEL_ID,
+                    "summary": "first meta summary",
+                    "source_row_ids": [11, 12, 21, 22],
+                },
+            }
+        ],
+    }
+    synthesis.write_text(json.dumps(payload), encoding="utf-8")
+    db_path = tmp_path / "memory.db"
+
+    await apply_synthesis(
+        synthesis,
+        db_path=db_path,
+        embedding_queue=EmbeddingQueue(_FakeEmbedder(), db_path=db_path),
+        summary_trigger="nightly-weekly",
+        clock=_clock,
+    )
+    payload["channels"][0]["synthesis"]["summary"] = "updated meta summary"
+    synthesis.write_text(json.dumps(payload), encoding="utf-8")
+    await apply_synthesis(
+        synthesis,
+        db_path=db_path,
+        embedding_queue=EmbeddingQueue(_FakeEmbedder(), db_path=db_path),
+        summary_trigger="nightly-weekly",
+        clock=_clock,
+    )
+
+    with closing(open_memory_db(db_path)) as conn:
+        rows = conn.execute(
+            """
+            SELECT channel_id, trigger, day, summary_text
+            FROM summaries
+            WHERE channel_id = ? AND trigger = 'nightly-weekly'
+            """,
+            (META_CHANNEL_ID,),
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["day"] == "2026-04-20"
+    assert rows[0]["summary_text"].startswith("updated meta summary")
+    assert rows[0]["summary_text"].endswith("Source weekly summary row ids: 11, 12, 21, 22")

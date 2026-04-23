@@ -27,6 +27,7 @@ from engram import paths
 from engram.config import DEFAULT_CONFIG_PATH, EmbeddingsConfig
 from engram.embeddings import EmbeddingQueue, GeminiEmbedder
 from engram.memory import open_memory_db
+from engram.nightly.schema import META_CHANNEL_ID
 from engram.telemetry import configure_logging
 
 DEFAULT_MEMORY_DB = Path.home() / ".engram" / "memory.db"
@@ -317,7 +318,12 @@ def _extract_rows(payload: dict[str, Any], *, summary_trigger: str) -> list[Appl
         if not isinstance(summary_text, str) or not summary_text.strip():
             raise ValueError(f"synthesized channel {channel_id!r} is missing summary text")
         source_row_ids = _source_row_ids(synthesis.get("source_row_ids"))
-        if summary_trigger == "nightly-weekly":
+        if summary_trigger == "nightly-weekly" and channel_id == META_CHANNEL_ID:
+            if not source_row_ids:
+                raise ValueError("synthesized weekly meta channel must reference source rows")
+            source_text = ", ".join(str(row_id) for row_id in source_row_ids)
+            summary_text = f"{summary_text.strip()}\n\nSource weekly summary row ids: {source_text}"
+        elif summary_trigger == "nightly-weekly":
             if len(source_row_ids) != 7:
                 raise ValueError(
                     f"synthesized weekly channel {channel_id!r} must reference 7 daily rows"

@@ -123,6 +123,54 @@ async def post_question(q: PendingQuestion, slack_client) -> tuple[str, str]:
     return (response["ts"], response["ts"])
 
 
+async def post_meta_eligibility_question(
+    q: PendingQuestion,
+    slack_client,
+    *,
+    channel_label: str,
+    eligible: bool,
+) -> tuple[str, str]:
+    """Post the OQ31 nightly meta-summary eligibility confirmation card."""
+    action = "Include" if eligible else "Exclude"
+    preposition = "in" if eligible else "from"
+    text = f"{action} {channel_label} {preposition} nightly meta-summary?"
+    action_elements = [
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Confirm"},
+            "value": f"{q.permission_request_id}|0",
+            "action_id": "hitl_choice_0",
+            "style": "primary",
+        },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Deny"},
+            "value": f"{q.permission_request_id}|deny",
+            "action_id": "hitl_choice_deny",
+            "style": "danger",
+        },
+    ]
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        {"type": "actions", "block_id": "hitl_actions", "elements": action_elements},
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "_Deny or timeout leaves the current manifest setting unchanged._",
+                }
+            ],
+        },
+    ]
+    response = await slack_client.chat_postMessage(
+        channel=q.channel_id,
+        blocks=blocks,
+        text=text,
+    )
+    return (response["ts"], response["ts"])
+
+
 async def update_question_resolved(
     q: PendingQuestion,
     answer_text: str,

@@ -50,6 +50,7 @@ class PendingQuestion:
     who_can_answer: str | None
     posted_at: datetime
     timeout_s: int
+    on_resolve: Callable[[PermissionResult], Awaitable[None]] | None = None
     future: asyncio.Future[PermissionResult] = field(default_factory=_create_future)
     slack_channel_ts: str | None = None
     slack_thread_ts: str | None = None

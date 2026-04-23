@@ -20,6 +20,7 @@ from engram.manifest import (
     dump_manifest,
 )
 from engram.mcp_tools import MEMORY_SEARCH_FULL_TOOL_NAMES
+from engram.nightly.schema import META_CHANNEL_ID
 from engram.nightly.synthesize import (
     NIGHTLY_CHANNEL_ID,
     AnthropicRuntime,
@@ -133,13 +134,13 @@ def _result(cost: float = 0.01, *, cache_read: int = 0) -> ResultMessage:
     )
 
 
-def _synthesis_json(channel_id: str) -> str:
+def _synthesis_json(channel_id: str, *, summary: str = "durable summary") -> str:
     return json.dumps(
         {
             "schema_version": 1,
             "date": "2026-04-22",
             "channel_id": channel_id,
-            "summary": "durable summary",
+            "summary": summary,
             "highlights": [],
             "decisions": [],
             "action_items": [],
@@ -165,7 +166,13 @@ def _write_harvest(tmp_path: Path, channels: list[dict[str, Any]]) -> Path:
     return path
 
 
-def _channel(channel_id: str, *, row_id: int = 1, token_count: int = 2) -> dict[str, Any]:
+def _channel(
+    channel_id: str,
+    *,
+    row_id: int = 1,
+    token_count: int = 2,
+    text: str = "alpha beta",
+) -> dict[str, Any]:
     return {
         "channel_id": channel_id,
         "row_count": 1,
@@ -177,7 +184,7 @@ def _channel(channel_id: str, *, row_id: int = 1, token_count: int = 2) -> dict[
                 "channel_id": channel_id,
                 "ts": "2026-04-22T01:00:00+00:00",
                 "token_count": token_count,
-                "text": "alpha beta",
+                "text": text,
                 "session_id": f"session-{channel_id}",
                 "role": "assistant",
                 "message_uuid": f"msg-{row_id}",
@@ -414,6 +421,98 @@ async def test_team_manifest_nightly_model_overrides_global_default(tmp_path: Pa
 
     assert factory.options[0].model == "sonnet"
     assert result.payload["channels"][0]["model"] == "sonnet"
+
+
+@pytest.mark.asyncio
+async def test_weekly_meta_synthesis_excludes_ineligible_channel_from_prompt_and_memory_search(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contexts_dir = tmp_path / "contexts"
+    _write_manifest(
+        contexts_dir,
+        ChannelManifest(
+            channel_id="C07KEEP",
+            identity=IdentityTemplate.TASK_ASSISTANT,
+            status=ChannelStatus.ACTIVE,
+            label="#keep",
+        ),
+    )
+    _write_manifest(
+        contexts_dir,
+        ChannelManifest(
+            channel_id="C07PRIVATE",
+            identity=IdentityTemplate.TASK_ASSISTANT,
+            status=ChannelStatus.ACTIVE,
+            label="#private",
+            meta_eligible=False,
+        ),
+    )
+    captured_mcp: list[dict[str, Any]] = []
+
+    def fake_make_memory_search_server(
+        caller_channel_id: str,
+        memory_db_path: Path | None = None,
+        embedder: object | None = None,
+        *,
+        excluded_channels: list[str] | None = None,
+    ) -> dict[str, Any]:
+        captured_mcp.append(
+            {
+                "caller_channel_id": caller_channel_id,
+                "excluded_channels": excluded_channels,
+            }
+        )
+        return {"name": "engram-memory"}
+
+    monkeypatch.setattr(
+        "engram.nightly.synthesize.make_memory_search_server",
+        fake_make_memory_search_server,
+    )
+    harvest = _write_harvest(
+        tmp_path,
+        [
+            _channel("C07KEEP", row_id=11, text="eligible keep weekly row"),
+            _channel("C07PRIVATE", row_id=22, text="private canary weekly row"),
+            _channel("C07OPEN", row_id=33, text="eligible open weekly row"),
+        ],
+    )
+    factory = _ClientFactory(
+        [
+            (_synthesis_json("C07KEEP"), _result()),
+            (_synthesis_json("C07PRIVATE", summary="private per-channel summary"), _result()),
+            (_synthesis_json("C07OPEN"), _result()),
+            (_synthesis_json(META_CHANNEL_ID, summary="combined keep and open"), _result()),
+        ]
+    )
+
+    result = await synthesize(
+        harvest,
+        output_root=tmp_path / "nightly",
+        config=NightlyConfig(),
+        contexts_dir=contexts_dir,
+        anthropic_runtime=AnthropicRuntime(api_key=None, model="sonnet"),
+        budget=_FakeBudget(),
+        client_factory=factory,
+        weekly=True,
+    )
+
+    channel_ids = [channel["channel_id"] for channel in result.payload["channels"]]
+    assert channel_ids.count(META_CHANNEL_ID) == 1
+    meta_channel = result.payload["channels"][-1]
+    assert meta_channel["channel_id"] == META_CHANNEL_ID
+    assert meta_channel["synthesis"]["summary"] == "combined keep and open"
+    assert meta_channel["synthesis"]["source_row_ids"] == [11, 33]
+    assert "private canary" not in json.dumps(meta_channel)
+
+    meta_prompt = factory.clients[-1].prompts[0]
+    assert "eligible keep weekly row" in meta_prompt
+    assert "eligible open weekly row" in meta_prompt
+    assert "private canary weekly row" not in meta_prompt
+    assert captured_mcp[-1] == {
+        "caller_channel_id": META_CHANNEL_ID,
+        "excluded_channels": ["C07PRIVATE"],
+    }
 
 
 @pytest.mark.asyncio

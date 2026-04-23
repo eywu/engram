@@ -13,6 +13,7 @@ channel_id: "{{channel_id}}"
 identity: task-assistant
 label: "{{channel_label}}"
 status: pending        # operator must approve before bot responds
+meta_eligible: true
 
 # Team channels use project-level priming, NOT user-level.
 # Prevents the operator's personal MCPs / settings from leaking into a

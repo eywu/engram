@@ -38,10 +38,20 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+scope_app = typer.Typer(
+    name="scope",
+    help="Audit per-channel scope and memory eligibility.",
+    no_args_is_help=True,
+)
 app.add_typer(
     channels_app,
     name="channels",
     help="List and manage per-channel manifests.",
+)
+app.add_typer(
+    scope_app,
+    name="scope",
+    help="Audit per-channel scope and memory eligibility.",
 )
 console = Console()
 
@@ -212,6 +222,37 @@ def nightly(
     parsed_date = _parse_cli_date(target_date)
     result = asyncio.run(run_configured_nightly(weekly=weekly, target_date=parsed_date))
     raise typer.Exit(result.exit_code)
+
+
+@scope_app.command("audit")
+def scope_audit(
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Show manifest scope posture for every provisioned channel."""
+    rows = _manifest_audit_rows(engram_home())
+    if json_output:
+        typer.echo(json.dumps(rows, sort_keys=True))
+        return
+
+    table = Table(title="Scope Audit")
+    table.add_column("channel")
+    table.add_column("label")
+    table.add_column("identity")
+    table.add_column("status")
+    table.add_column("meta eligible")
+    table.add_column("mcp")
+    table.add_column("tools")
+    for row in rows:
+        table.add_row(
+            row["channel_id"],
+            row["label"] or "-",
+            row["identity"],
+            row["status"],
+            "yes" if row["meta_eligible"] else "no",
+            row["mcp"],
+            row["tools"],
+        )
+    console.print(table)
 
 
 @app.command()
@@ -407,6 +448,7 @@ def _merge_channels(
         )
         channel.setdefault("manifest_status", str(manifest.status))
         channel.setdefault("identity", str(manifest.identity))
+        channel.setdefault("meta_eligible", manifest.meta_eligible)
         channel["mcp"] = _manifest_mcp_policy(manifest)
         channel["tools"] = _merge_registered_tools(
             channel.get("tools"),
@@ -421,6 +463,45 @@ def _merge_channels(
         channel.setdefault("context_usage", None)
         channel.setdefault("live", False)
     return sorted(by_channel.values(), key=lambda item: item["channel_id"])
+
+
+def _manifest_audit_rows(home: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for manifest_path in sorted(contexts_dir(home).glob("*/.claude/channel-manifest.yaml")):
+        try:
+            manifest = load_manifest(manifest_path)
+        except ManifestError as exc:
+            rows.append(
+                {
+                    "channel_id": manifest_path.parents[1].name,
+                    "label": None,
+                    "identity": "invalid",
+                    "status": "invalid",
+                    "meta_eligible": None,
+                    "mcp": f"invalid: {exc}",
+                    "tools": "invalid",
+                }
+            )
+            continue
+        rows.append(
+            {
+                "channel_id": manifest.channel_id,
+                "label": manifest.label,
+                "identity": str(manifest.identity),
+                "status": str(manifest.status),
+                "meta_eligible": manifest.meta_eligible,
+                "mcp": _scope_summary(manifest.mcp_servers.allowed, manifest.mcp_servers.disallowed),
+                "tools": _scope_summary(manifest.tools.allowed, manifest.tools.disallowed),
+            }
+        )
+    return rows
+
+
+def _scope_summary(allowed: list[str] | None, disallowed: list[str]) -> str:
+    base = f"allow:{','.join(allowed) or '-'}" if allowed is not None else "inherit"
+    if disallowed:
+        return f"{base} deny:{','.join(disallowed)}"
+    return base
 
 
 def _manifest_mcp_policy(manifest: ChannelManifest) -> dict[str, Any]:

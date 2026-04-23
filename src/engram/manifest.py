@@ -295,6 +295,13 @@ class ChannelManifest(BaseModel):
         description="Human-readable name (e.g. '#growth-team'). Optional.",
     )
     status: ChannelStatus = ChannelStatus.PENDING
+    meta_eligible: bool = Field(
+        default=True,
+        description=(
+            "Whether this channel may be included in the weekly cross-channel "
+            "nightly meta-summary. Defaults true per OQ31 opt-in."
+        ),
+    )
 
     # ── Scope (exclusion-first; M2-enforced) ─────────────────────
     setting_sources: list[SettingSource] = Field(

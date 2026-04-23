@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+META_CHANNEL_ID = "__meta__"
+
 
 class SourcedText(BaseModel):
     model_config = ConfigDict(extra="forbid")

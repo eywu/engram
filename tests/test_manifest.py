@@ -140,6 +140,13 @@ def test_status_defaults_to_pending():
     assert m.status == ChannelStatus.PENDING
 
 
+def test_meta_eligible_defaults_to_true():
+    m = ChannelManifest(
+        channel_id="C07ABC", identity=IdentityTemplate.TASK_ASSISTANT
+    )
+    assert m.meta_eligible is True
+
+
 def test_setting_sources_default_is_project():
     """Team channels default to project-level priming, not user-level."""
     m = ChannelManifest(
@@ -175,6 +182,7 @@ def test_manifest_loads_hitl_section(tmp_path: Path):
         assert manifest.hitl.enabled is True
         assert manifest.hitl.timeout_s == 300
         assert manifest.hitl.max_per_day == max_per_day
+        assert manifest.meta_eligible is True
 
 
 def test_manifest_loads_nightly_model_from_templates(tmp_path: Path):
@@ -267,6 +275,7 @@ identity: task-assistant
 label: "#growth"
 status: active
 setting_sources: [project]
+meta_eligible: false
 tools:
   disallowed: [Bash, Write, Edit]
 mcp_servers:
@@ -282,6 +291,7 @@ cost_budget:
 """
     )
     m = load_manifest(p)
+    assert m.meta_eligible is False
     assert m.tools.disallowed == ["Bash", "Write", "Edit"]
     assert m.mcp_servers.disallowed == ["personal-notes"]
     assert m.memory.excluded_channels == ["C07OPTEDOUT"]

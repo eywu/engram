@@ -41,6 +41,7 @@ from engram.mcp_tools import (
     make_memory_search_server,
 )
 from engram.nightly.schema import (
+    META_CHANNEL_ID,
     NightlySynthesisOutput,
     synthesis_output_format,
     synthesis_schema_prompt,
@@ -81,6 +82,7 @@ class PlannedChannel:
     manifest: ChannelManifest | None
     model: str
     estimated_cost_usd: Decimal
+    memory_excluded_channels: tuple[str, ...] = ()
 
     @property
     def channel_id(self) -> str:
@@ -177,6 +179,7 @@ async def synthesize(
         contexts_dir=context_root,
         config=nightly_config,
         global_model=runtime.model,
+        weekly=weekly,
     )
 
     synthesized_channels: list[dict[str, Any]] = []
@@ -326,7 +329,10 @@ def build_nightly_options(
     mcp_servers = {
         MEMORY_SEARCH_SERVER_NAME: make_memory_search_server(
             plan.channel_id or NIGHTLY_CHANNEL_ID,
-            excluded_channels=list(config.excluded_channels),
+            excluded_channels=_merge_channel_ids(
+                config.excluded_channels,
+                plan.memory_excluded_channels,
+            ),
         )
     }
     child_env: dict[str, str] = {}
@@ -431,6 +437,7 @@ async def _synthesize_channel(
         record_turn(first_turn.result)
         try:
             parsed = parse_synthesis_output(first_turn.raw_output)
+            _attach_plan_source_row_ids(parsed, plan=plan, weekly=weekly)
             _log_parse_ok(plan=plan, run_date=run_date, attempt=1)
         except SynthesisOutputError as exc:
             _log_parse_retry(plan=plan, run_date=run_date, error=exc.detail)
@@ -443,6 +450,7 @@ async def _synthesize_channel(
             record_turn(retry_turn.result)
             try:
                 parsed = parse_synthesis_output(retry_turn.raw_output)
+                _attach_plan_source_row_ids(parsed, plan=plan, weekly=weekly)
                 _log_parse_ok(plan=plan, run_date=run_date, attempt=2)
             except SynthesisOutputError as retry_exc:
                 _log_parse_fail_final(
@@ -520,10 +528,13 @@ def _plan_channels(
     contexts_dir: Path,
     config: NightlyConfig,
     global_model: str | None,
+    weekly: bool,
 ) -> list[PlannedChannel]:
     planned: list[PlannedChannel] = []
     for channel in channels:
         channel_id = str(channel.get("channel_id") or "")
+        if channel_id == META_CHANNEL_ID:
+            continue
         manifest = _load_channel_manifest(channel_id, contexts_dir=contexts_dir)
         model = select_nightly_model(manifest, config=config, global_model=global_model)
         planned.append(
@@ -534,7 +545,68 @@ def _plan_channels(
                 estimated_cost_usd=_estimate_channel_cost(channel, model),
             )
         )
+    if weekly:
+        meta_plan = _build_meta_plan(planned, config=config, global_model=global_model)
+        if meta_plan is not None:
+            planned.append(meta_plan)
     return planned
+
+
+def _build_meta_plan(
+    planned: list[PlannedChannel],
+    *,
+    config: NightlyConfig,
+    global_model: str | None,
+) -> PlannedChannel | None:
+    eligible = [
+        plan
+        for plan in planned
+        if plan.channel_id and _is_meta_eligible(plan.manifest)
+    ]
+    if not eligible:
+        return None
+
+    rows: list[dict[str, Any]] = []
+    token_count = 0
+    for plan in eligible:
+        channel_rows = [
+            row
+            for row in plan.channel.get("rows", [])
+            if isinstance(row, dict)
+        ]
+        rows.extend(channel_rows)
+        token_count += int(plan.channel.get("token_count") or 0)
+
+    if not rows:
+        return None
+
+    model = config.model or global_model or "sonnet"
+    ineligible_channel_ids = tuple(
+        plan.channel_id
+        for plan in planned
+        if plan.channel_id and not _is_meta_eligible(plan.manifest)
+    )
+    channel = {
+        "channel_id": META_CHANNEL_ID,
+        "row_count": len(rows),
+        "token_count": token_count,
+        "rows_before": len(rows),
+        "rows_after_dedup": len(rows),
+        "truncated": False,
+        "source_channel_ids": [plan.channel_id for plan in eligible],
+        "rows": rows,
+    }
+    return PlannedChannel(
+        channel=channel,
+        manifest=None,
+        model=model,
+        estimated_cost_usd=_estimate_channel_cost(channel, model),
+        memory_excluded_channels=ineligible_channel_ids,
+    )
+
+
+def _is_meta_eligible(manifest: ChannelManifest | None) -> bool:
+    return True if manifest is None else manifest.meta_eligible
 
 
 def _load_channel_manifest(
@@ -574,6 +646,7 @@ def _render_prompt(
             "channel_id": manifest.channel_id,
             "identity": str(manifest.identity),
             "label": manifest.label,
+            "meta_eligible": manifest.meta_eligible,
             "nightly_model": manifest.nightly.model,
         }
     rendered = Template(prompt_template).safe_substitute(
@@ -583,7 +656,15 @@ def _render_prompt(
         manifest_json=json.dumps(manifest_json, indent=2, sort_keys=True),
         channel_json=json.dumps(channel, indent=2, sort_keys=True),
     )
-    if weekly:
+    if weekly and str(channel.get("channel_id") or "") == META_CHANNEL_ID:
+        rendered += (
+            "\n\nWeekly meta-summary mode: this is one cross-channel pass over "
+            "only the eligible weekly channel rows present in channel_json. "
+            f"Return channel_id {META_CHANNEL_ID!r}. Do not infer from or mention "
+            "channels absent from channel_json, and include every cited input row "
+            "id in top-level source_row_ids."
+        )
+    elif weekly:
         rendered += (
             "\n\nWeekly mode: the channel harvest contains exactly seven daily "
             "nightly summary rows ending on the run date. Synthesize across all "
@@ -591,6 +672,36 @@ def _render_prompt(
             "source_row_ids."
         )
     return rendered
+
+
+def _attach_plan_source_row_ids(
+    parsed: dict[str, Any],
+    *,
+    plan: PlannedChannel,
+    weekly: bool,
+) -> None:
+    if not weekly:
+        return
+    source_row_ids = [
+        int(row["id"])
+        for row in plan.channel.get("rows", [])
+        if isinstance(row, dict) and "id" in row
+    ]
+    if not source_row_ids:
+        return
+    parsed["source_row_ids"] = source_row_ids
+
+
+def _merge_channel_ids(*groups: tuple[str, ...]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for raw in group:
+            channel_id = str(raw).strip()
+            if channel_id and channel_id not in seen:
+                merged.append(channel_id)
+                seen.add(channel_id)
+    return merged
 
 
 def _assistant_text(message: AssistantMessage) -> list[str]:

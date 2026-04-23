@@ -235,6 +235,19 @@ class Router:
     def list_sessions(self) -> list[SessionState]:
         return list(self._sessions.values())
 
+    @property
+    def home(self) -> Path | None:
+        return self._home
+
+    @property
+    def owner_dm_channel_id(self) -> str | None:
+        return self._owner_dm_channel_id
+
+    def replace_cached_manifest(self, manifest: ChannelManifest) -> None:
+        session = self._sessions.get(manifest.channel_id)
+        if session is not None:
+            session.manifest = manifest
+
     def session_count(self) -> int:
         return len(self._sessions)
 

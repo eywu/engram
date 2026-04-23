@@ -14,20 +14,38 @@ from engram.hitl import PendingQuestion
 from engram.ingress import (
     HITL_ACTION_ID_PATTERN,
     handle_block_action,
+    handle_meta_eligibility_command,
     handle_thread_reply,
+    parse_meta_eligibility_command,
     register_listeners,
 )
+from engram.manifest import (
+    ChannelManifest,
+    ChannelStatus,
+    IdentityTemplate,
+    dump_manifest,
+    load_manifest,
+)
+from engram.paths import channel_manifest_path
 from engram.router import Router
 
 
 class DecoratorApp:
     def __init__(self) -> None:
         self.actions = []
+        self.commands = []
         self.events = []
 
     def action(self, pattern):
         def decorator(func):
             self.actions.append((pattern, func))
+            return func
+
+        return decorator
+
+    def command(self, command_name):
+        def decorator(func):
+            self.commands.append((command_name, func))
             return func
 
         return decorator
@@ -42,7 +60,13 @@ class DecoratorApp:
 
 class FakeSlackClient:
     def __init__(self) -> None:
+        self.post_calls = []
         self.update_calls = []
+        self.chat_postMessage = self._chat_post_message
+
+    async def _chat_post_message(self, **kwargs):
+        self.post_calls.append(kwargs)
+        return {"ok": True, "ts": "1713800000.000200"}
 
     async def chat_update(self, **kwargs):
         self.update_calls.append(kwargs)
@@ -103,6 +127,12 @@ def make_config() -> EngramConfig:
     )
 
 
+def make_config_with_owner_dm(owner_dm_channel_id: str = "D07OWNER") -> EngramConfig:
+    cfg = make_config()
+    cfg.owner_dm_channel_id = owner_dm_channel_id
+    return cfg
+
+
 async def wait_until(predicate) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + 1
@@ -110,6 +140,21 @@ async def wait_until(predicate) -> None:
         if loop.time() > deadline:
             pytest.fail("condition was not met before timeout")
         await asyncio.sleep(0)
+
+
+def _write_channel_manifest(home, channel_id: str, *, meta_eligible: bool = True) -> None:
+    path = channel_manifest_path(channel_id, home)
+    path.parent.mkdir(parents=True)
+    dump_manifest(
+        ChannelManifest(
+            channel_id=channel_id,
+            identity=IdentityTemplate.TASK_ASSISTANT,
+            status=ChannelStatus.ACTIVE,
+            label="#growth",
+            meta_eligible=meta_eligible,
+        ),
+        path,
+    )
 
 
 def test_register_listeners_attaches_hitl_action_handler():
@@ -125,6 +170,96 @@ def test_register_listeners_attaches_hitl_action_handler():
     assert pattern.match("hitl_choice_deny")
     assert not pattern.match("hitl_other_0")
     assert not pattern.match("hitl_choice_cancel")
+    assert [command for command, _handler in app.commands] == [
+        "/exclude-from-nightly",
+        "/include-in-nightly",
+    ]
+
+
+def test_parse_meta_eligibility_commands():
+    exclude = parse_meta_eligibility_command("please exclude this channel from nightly")
+    include = parse_meta_eligibility_command("/include-in-nightly <#C07TEAM|growth>")
+
+    assert exclude is not None
+    assert exclude.eligible is False
+    assert exclude.target is None
+    assert include is not None
+    assert include.eligible is True
+    assert include.target == "<#C07TEAM|growth>"
+
+
+@pytest.mark.asyncio
+async def test_exclusion_command_posts_owner_dm_card_and_confirm_updates_manifest(tmp_path):
+    home = tmp_path / ".engram"
+    _write_channel_manifest(home, "C07TEAM", meta_eligible=True)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_meta_eligibility_command(
+        router=router,
+        config=make_config_with_owner_dm(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U123",
+        eligible=False,
+        target_text=None,
+    )
+
+    assert result["ok"] is True
+    assert len(slack.post_calls) == 1
+    post = slack.post_calls[0]
+    assert post["channel"] == "D07OWNER"
+    assert post["text"] == "Exclude #growth from nightly meta-summary?"
+    button_texts = [
+        element["text"]["text"]
+        for element in post["blocks"][1]["elements"]
+    ]
+    assert button_texts == ["Confirm", "Deny"]
+
+    permission_request_id = result["permission_request_id"]
+    ack = await handle_block_action(
+        block_action_payload(f"{permission_request_id}|0"),
+        router,
+        slack,
+    )
+
+    assert ack == {"ok": True}
+    await wait_until(lambda: len(slack.update_calls) == 1)
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert manifest.meta_eligible is False
+
+
+@pytest.mark.asyncio
+async def test_include_command_deny_leaves_manifest_unchanged(tmp_path):
+    home = tmp_path / ".engram"
+    _write_channel_manifest(home, "C07TEAM", meta_eligible=False)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_meta_eligibility_command(
+        router=router,
+        config=make_config_with_owner_dm(),
+        slack_client=slack,
+        source_channel_id="D07OWNER",
+        source_channel_name=None,
+        user_id="U123",
+        eligible=True,
+        target_text="#growth",
+    )
+
+    assert result["ok"] is True
+    permission_request_id = result["permission_request_id"]
+    ack = await handle_block_action(
+        block_action_payload(f"{permission_request_id}|deny"),
+        router,
+        slack,
+    )
+
+    assert ack == {"ok": True}
+    await wait_until(lambda: len(slack.update_calls) == 1)
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert manifest.meta_eligible is False
 
 
 @pytest.mark.asyncio
