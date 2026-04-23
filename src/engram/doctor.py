@@ -1,0 +1,841 @@
+"""Pre-flight diagnostics for an Engram installation."""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from enum import StrEnum
+from pathlib import Path
+from typing import Any
+
+import yaml
+from rich.console import Console
+from rich.table import Table
+
+from engram.config import EngramConfig
+
+SLACK_AUTH_TEST_URL = "https://slack.com/api/auth.test"
+ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_DOCTOR_MODEL = "claude-3-5-haiku-latest"
+GEMINI_EMBED_URL_TEMPLATE = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent?key={api_key}"
+)
+MIN_MEMORY_DB_FREE_BYTES = 1_000_000_000
+
+
+class CheckStatus(StrEnum):
+    PASS = "pass"
+    WARN = "warn"
+    FAIL = "fail"
+
+
+STATUS_EMOJI = {
+    CheckStatus.PASS: "✅",
+    CheckStatus.WARN: "⚠️",
+    CheckStatus.FAIL: "❌",
+}
+
+
+@dataclass(frozen=True)
+class DoctorCheck:
+    id: str
+    name: str
+    status: CheckStatus
+    message: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def emoji(self) -> str:
+        return STATUS_EMOJI[self.status]
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "status": self.status.value,
+            "emoji": self.emoji,
+            "message": self.message,
+            "details": self.details,
+        }
+
+
+@dataclass(frozen=True)
+class DoctorReport:
+    checks: list[DoctorCheck]
+    schema_version: int = 1
+
+    @property
+    def exit_code(self) -> int:
+        return 1 if any(check.status == CheckStatus.FAIL for check in self.checks) else 0
+
+    @property
+    def summary(self) -> dict[str, int]:
+        return {
+            "total": len(self.checks),
+            "passed": sum(1 for check in self.checks if check.status == CheckStatus.PASS),
+            "warnings": sum(1 for check in self.checks if check.status == CheckStatus.WARN),
+            "failed": sum(1 for check in self.checks if check.status == CheckStatus.FAIL),
+            "exit_code": self.exit_code,
+        }
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "summary": self.summary,
+            "checks": [check.to_json() for check in self.checks],
+        }
+
+
+@dataclass(frozen=True)
+class HttpResult:
+    status_code: int
+    payload: dict[str, Any]
+    text: str = ""
+
+
+def default_config_path() -> Path:
+    return Path.home() / ".engram" / "config.yaml"
+
+
+def run_doctor(config_path: Path | None = None) -> DoctorReport:
+    path = (config_path or default_config_path()).expanduser()
+    config_check, config = check_config_loads(path)
+    log_dir = config.paths.log_dir if config is not None else path.parent / "logs"
+
+    checks = [
+        check_uv_on_path(),
+        check_claude_on_path(),
+        check_python_version(),
+        check_config_file(path),
+        config_check,
+        check_slack_bot_token(
+            config,
+            expected_team_id=_configured_slack_team_id(path),
+        ),
+        check_slack_app_token(config),
+        check_anthropic_api_key(config),
+        check_gemini_api_key(config),
+        check_launchd_job(
+            "launchd_bridge",
+            "launchd bridge job",
+            "com.engram.bridge",
+        ),
+        check_launchd_job(
+            "launchd_nightly",
+            "launchd nightly job",
+            "com.engram.v3.nightly",
+        ),
+        check_disk_space(path.parent),
+        check_log_dir_writable(log_dir),
+    ]
+    return DoctorReport(checks=checks)
+
+
+def render_report(report: DoctorReport, console: Console | None = None) -> None:
+    target = console or Console()
+    table = Table(title="Engram Doctor")
+    table.add_column("Check")
+    table.add_column("Status", justify="center")
+    table.add_column("Hint")
+    for check in report.checks:
+        table.add_row(check.name, check.emoji, check.message)
+    target.print(table)
+    summary = report.summary
+    target.print(
+        f"{summary['passed']} passed, "
+        f"{summary['warnings']} warnings, "
+        f"{summary['failed']} failed"
+    )
+
+
+def check_uv_on_path(
+    *,
+    which: Callable[[str], str | None] | None = None,
+    version_runner: Callable[[str], str | None] | None = None,
+) -> DoctorCheck:
+    return _check_binary_on_path(
+        check_id="uv_path",
+        name="uv on PATH",
+        binary="uv",
+        install_hint="Install uv and make sure it is on PATH.",
+        which=which,
+        version_runner=version_runner,
+    )
+
+
+def check_claude_on_path(
+    *,
+    which: Callable[[str], str | None] | None = None,
+    version_runner: Callable[[str], str | None] | None = None,
+) -> DoctorCheck:
+    return _check_binary_on_path(
+        check_id="claude_path",
+        name="claude CLI on PATH",
+        binary="claude",
+        install_hint="Install the Claude CLI or add it to PATH.",
+        which=which,
+        version_runner=version_runner,
+    )
+
+
+def check_python_version(version_info: tuple[Any, ...] | None = None) -> DoctorCheck:
+    raw = version_info or sys.version_info
+    major = int(raw[0])
+    minor = int(raw[1])
+    micro = int(raw[2])
+    version = f"{major}.{minor}.{micro}"
+    if (major, minor) >= (3, 12):
+        return DoctorCheck(
+            id="python_version",
+            name="Python version",
+            status=CheckStatus.PASS,
+            message=f"Python {version} satisfies 3.12+.",
+            details={"version": version},
+        )
+    return DoctorCheck(
+        id="python_version",
+        name="Python version",
+        status=CheckStatus.FAIL,
+        message=f"Python {version} is too old; install Python 3.12+.",
+        details={"version": version},
+    )
+
+
+def check_config_file(config_path: Path | None = None) -> DoctorCheck:
+    path = (config_path or default_config_path()).expanduser()
+    details = {"path": str(path)}
+    if not path.exists():
+        return DoctorCheck(
+            id="config_file",
+            name="Config file",
+            status=CheckStatus.FAIL,
+            message=f"{path} is missing; run `engram setup` or create config.yaml.",
+            details=details,
+        )
+    if not path.is_file():
+        return DoctorCheck(
+            id="config_file",
+            name="Config file",
+            status=CheckStatus.FAIL,
+            message=f"{path} exists but is not a file.",
+            details=details,
+        )
+
+    mode = stat.S_IMODE(path.stat().st_mode)
+    details["mode"] = oct(mode)
+    if mode != 0o600:
+        return DoctorCheck(
+            id="config_file",
+            name="Config file",
+            status=CheckStatus.WARN,
+            message=f"{path} mode is {mode:o}; run `chmod 600 {path}`.",
+            details=details,
+        )
+    return DoctorCheck(
+        id="config_file",
+        name="Config file",
+        status=CheckStatus.PASS,
+        message=f"{path} exists with mode 600.",
+        details=details,
+    )
+
+
+def check_config_loads(
+    config_path: Path | None = None,
+    *,
+    loader: Callable[[Path], EngramConfig] | None = None,
+) -> tuple[DoctorCheck, EngramConfig | None]:
+    path = (config_path or default_config_path()).expanduser()
+    load = loader or EngramConfig.load
+    try:
+        config = load(path)
+    except Exception as exc:
+        return (
+            DoctorCheck(
+                id="config_load",
+                name="Config loads",
+                status=CheckStatus.FAIL,
+                message=f"Config failed to load: {type(exc).__name__}: {exc}",
+                details={"path": str(path), "error_class": type(exc).__name__},
+            ),
+            None,
+        )
+    return (
+        DoctorCheck(
+            id="config_load",
+            name="Config loads",
+            status=CheckStatus.PASS,
+            message="EngramConfig.load() completed cleanly.",
+            details={"path": str(path)},
+        ),
+        config,
+    )
+
+
+def check_slack_bot_token(
+    config: EngramConfig | None,
+    *,
+    expected_team_id: str | None = None,
+    requester: Callable[..., HttpResult] | None = None,
+) -> DoctorCheck:
+    if config is None:
+        return _blocked_by_config("slack_bot_token", "Slack bot token")
+
+    request = requester or _post_json
+    try:
+        response = request(
+            SLACK_AUTH_TEST_URL,
+            headers={
+                "Authorization": f"Bearer {config.slack.bot_token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            payload={},
+        )
+    except Exception as exc:
+        return DoctorCheck(
+            id="slack_bot_token",
+            name="Slack bot token",
+            status=CheckStatus.WARN,
+            message=f"Could not reach Slack auth.test: {type(exc).__name__}: {exc}",
+            details={"error_class": type(exc).__name__},
+        )
+
+    details = {
+        "status_code": response.status_code,
+        "team_id": response.payload.get("team_id"),
+        "expected_team_id": expected_team_id,
+    }
+    if response.status_code != 200:
+        return DoctorCheck(
+            id="slack_bot_token",
+            name="Slack bot token",
+            status=CheckStatus.FAIL,
+            message=f"Slack auth.test returned HTTP {response.status_code}.",
+            details=details,
+        )
+    if not response.payload.get("ok"):
+        error = response.payload.get("error") or "unknown_error"
+        return DoctorCheck(
+            id="slack_bot_token",
+            name="Slack bot token",
+            status=CheckStatus.FAIL,
+            message=f"Slack bot token rejected by auth.test: {error}.",
+            details=details | {"slack_error": error},
+        )
+
+    team_id = _optional_str(response.payload.get("team_id"))
+    if expected_team_id and team_id != expected_team_id:
+        return DoctorCheck(
+            id="slack_bot_token",
+            name="Slack bot token",
+            status=CheckStatus.FAIL,
+            message=f"Slack token is for team {team_id}; expected {expected_team_id}.",
+            details=details,
+        )
+    if not team_id:
+        return DoctorCheck(
+            id="slack_bot_token",
+            name="Slack bot token",
+            status=CheckStatus.WARN,
+            message="Slack auth.test succeeded but did not return a team_id.",
+            details=details,
+        )
+    return DoctorCheck(
+        id="slack_bot_token",
+        name="Slack bot token",
+        status=CheckStatus.PASS,
+        message=f"Slack auth.test succeeded for team {team_id}.",
+        details=details,
+    )
+
+
+def check_slack_app_token(config: EngramConfig | None) -> DoctorCheck:
+    if config is None:
+        return _blocked_by_config("slack_app_token", "Slack app token")
+    token = config.slack.app_token
+    if token.startswith("xapp-"):
+        return DoctorCheck(
+            id="slack_app_token",
+            name="Slack app token",
+            status=CheckStatus.PASS,
+            message="Slack app token has the required xapp- prefix.",
+            details={"prefix": "xapp-"},
+        )
+    return DoctorCheck(
+        id="slack_app_token",
+        name="Slack app token",
+        status=CheckStatus.FAIL,
+        message="Slack app token must start with xapp- for Socket Mode.",
+        details={"prefix": token[:5]},
+    )
+
+
+def check_anthropic_api_key(
+    config: EngramConfig | None,
+    *,
+    requester: Callable[..., HttpResult] | None = None,
+) -> DoctorCheck:
+    if config is None:
+        return _blocked_by_config("anthropic_api_key", "Anthropic API key")
+
+    request = requester or _post_json
+    try:
+        response = request(
+            ANTHROPIC_MESSAGES_URL,
+            headers={
+                "x-api-key": config.anthropic.api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            payload={
+                "model": ANTHROPIC_DOCTOR_MODEL,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+        )
+    except Exception as exc:
+        return DoctorCheck(
+            id="anthropic_api_key",
+            name="Anthropic API key",
+            status=CheckStatus.WARN,
+            message=f"Could not reach Anthropic messages API: {type(exc).__name__}: {exc}",
+            details={
+                "error_class": type(exc).__name__,
+                "model": ANTHROPIC_DOCTOR_MODEL,
+                "configured_model": config.anthropic.model,
+            },
+        )
+
+    details = {
+        "status_code": response.status_code,
+        "model": ANTHROPIC_DOCTOR_MODEL,
+        "configured_model": config.anthropic.model,
+    }
+    if response.status_code == 200:
+        return DoctorCheck(
+            id="anthropic_api_key",
+            name="Anthropic API key",
+            status=CheckStatus.PASS,
+            message=f"Anthropic messages API accepted the key for {ANTHROPIC_DOCTOR_MODEL}.",
+            details=details,
+        )
+    if response.status_code == 401:
+        message = "Anthropic API key was rejected with 401; check ANTHROPIC_API_KEY."
+    elif response.status_code == 403:
+        message = "Anthropic API key is unauthorized for this request (403)."
+    elif response.status_code == 429:
+        return DoctorCheck(
+            id="anthropic_api_key",
+            name="Anthropic API key",
+            status=CheckStatus.WARN,
+            message="Anthropic API is rate limited; the key reached the service.",
+            details=details,
+        )
+    else:
+        message = f"Anthropic messages API returned HTTP {response.status_code}."
+    return DoctorCheck(
+        id="anthropic_api_key",
+        name="Anthropic API key",
+        status=CheckStatus.FAIL,
+        message=message,
+        details=details,
+    )
+
+
+def check_gemini_api_key(
+    config: EngramConfig | None,
+    *,
+    requester: Callable[..., HttpResult] | None = None,
+) -> DoctorCheck:
+    if config is None:
+        return _blocked_by_config("gemini_api_key", "Gemini API key")
+    if not config.embeddings.api_key:
+        return DoctorCheck(
+            id="gemini_api_key",
+            name="Gemini API key",
+            status=CheckStatus.PASS,
+            message="No key configured; Engram will use keyword-only memory.",
+            details={"configured": False},
+        )
+    if config.embeddings.provider != "gemini":
+        return DoctorCheck(
+            id="gemini_api_key",
+            name="Gemini API key",
+            status=CheckStatus.WARN,
+            message=f"Embeddings provider is {config.embeddings.provider}; Gemini check skipped.",
+            details={"provider": config.embeddings.provider},
+        )
+
+    request = requester or _post_json
+    url = GEMINI_EMBED_URL_TEMPLATE.format(
+        model=config.embeddings.model,
+        api_key=config.embeddings.api_key,
+    )
+    try:
+        response = request(
+            url,
+            headers={"Content-Type": "application/json"},
+            payload={"content": {"parts": [{"text": "engram doctor"}]}},
+            timeout=config.embeddings.api_timeout_s,
+        )
+    except Exception as exc:
+        return DoctorCheck(
+            id="gemini_api_key",
+            name="Gemini API key",
+            status=CheckStatus.WARN,
+            message=f"Could not reach Gemini embedding API: {type(exc).__name__}: {exc}",
+            details={"error_class": type(exc).__name__, "model": config.embeddings.model},
+        )
+
+    details = {"status_code": response.status_code, "model": config.embeddings.model}
+    if response.status_code == 200:
+        return DoctorCheck(
+            id="gemini_api_key",
+            name="Gemini API key",
+            status=CheckStatus.PASS,
+            message=f"Gemini embedding API accepted the key for {config.embeddings.model}.",
+            details=details | {"configured": True},
+        )
+    if response.status_code in {401, 403}:
+        message = "Gemini API key was rejected; unset it or provide a valid key."
+    elif response.status_code == 429:
+        return DoctorCheck(
+            id="gemini_api_key",
+            name="Gemini API key",
+            status=CheckStatus.WARN,
+            message="Gemini API is rate limited; the key reached the service.",
+            details=details | {"configured": True},
+        )
+    else:
+        message = f"Gemini embedding API returned HTTP {response.status_code}."
+    return DoctorCheck(
+        id="gemini_api_key",
+        name="Gemini API key",
+        status=CheckStatus.FAIL,
+        message=message,
+        details=details | {"configured": True},
+    )
+
+
+def check_launchd_job(
+    check_id: str,
+    name: str,
+    label: str,
+    *,
+    launchctl_list: Callable[[], str] | None = None,
+) -> DoctorCheck:
+    list_jobs = launchctl_list or _launchctl_list
+    try:
+        output = list_jobs()
+    except FileNotFoundError:
+        return DoctorCheck(
+            id=check_id,
+            name=name,
+            status=CheckStatus.WARN,
+            message="launchctl is not available on this system.",
+            details={"label": label},
+        )
+    except Exception as exc:
+        return DoctorCheck(
+            id=check_id,
+            name=name,
+            status=CheckStatus.WARN,
+            message=f"Could not inspect launchd: {type(exc).__name__}: {exc}",
+            details={"label": label, "error_class": type(exc).__name__},
+        )
+
+    row = _find_launchd_row(output, label)
+    if row is None:
+        return DoctorCheck(
+            id=check_id,
+            name=name,
+            status=CheckStatus.FAIL,
+            message=f"{label} is not installed; load the launchd plist.",
+            details={"label": label, "state": "not_installed"},
+        )
+    pid, status_code = row
+    if pid != "-":
+        return DoctorCheck(
+            id=check_id,
+            name=name,
+            status=CheckStatus.PASS,
+            message=f"{label} is running with pid {pid}.",
+            details={"label": label, "pid": pid, "status_code": status_code},
+        )
+    return DoctorCheck(
+        id=check_id,
+        name=name,
+        status=CheckStatus.WARN,
+        message=f"{label} is installed but not running (status {status_code}).",
+        details={"label": label, "pid": None, "status_code": status_code},
+    )
+
+
+def check_disk_space(
+    engram_dir: Path | None = None,
+    *,
+    min_free_bytes: int = MIN_MEMORY_DB_FREE_BYTES,
+    disk_usage: Callable[[str], Any] | None = None,
+) -> DoctorCheck:
+    target = (engram_dir or (Path.home() / ".engram")).expanduser()
+    probe = _nearest_existing_parent(target)
+    usage_fn = disk_usage or shutil.disk_usage
+    try:
+        usage = usage_fn(str(probe))
+    except Exception as exc:
+        return DoctorCheck(
+            id="memory_db_disk_space",
+            name="Memory DB disk space",
+            status=CheckStatus.WARN,
+            message=f"Could not inspect free disk space at {probe}: {exc}.",
+            details={"path": str(target), "probe_path": str(probe)},
+        )
+    free = _free_bytes(usage)
+    details = {
+        "path": str(target),
+        "probe_path": str(probe),
+        "free_bytes": free,
+        "min_free_bytes": min_free_bytes,
+    }
+    if free >= min_free_bytes:
+        return DoctorCheck(
+            id="memory_db_disk_space",
+            name="Memory DB disk space",
+            status=CheckStatus.PASS,
+            message=f"{_format_bytes(free)} free for memory.db.",
+            details=details,
+        )
+    return DoctorCheck(
+        id="memory_db_disk_space",
+        name="Memory DB disk space",
+        status=CheckStatus.FAIL,
+        message=f"Only {_format_bytes(free)} free; keep at least 1 GB available.",
+        details=details,
+    )
+
+
+def check_log_dir_writable(
+    log_dir: Path | None = None,
+    *,
+    write_probe: Callable[[Path], None] | None = None,
+) -> DoctorCheck:
+    path = (log_dir or (Path.home() / ".engram" / "logs")).expanduser()
+    details = {"path": str(path)}
+    if not path.exists():
+        return DoctorCheck(
+            id="log_dir_writable",
+            name="Log directory writable",
+            status=CheckStatus.FAIL,
+            message=f"{path} is missing; create it or run `engram setup`.",
+            details=details,
+        )
+    if not path.is_dir():
+        return DoctorCheck(
+            id="log_dir_writable",
+            name="Log directory writable",
+            status=CheckStatus.FAIL,
+            message=f"{path} exists but is not a directory.",
+            details=details,
+        )
+    probe = write_probe or _write_probe
+    try:
+        probe(path)
+    except Exception as exc:
+        return DoctorCheck(
+            id="log_dir_writable",
+            name="Log directory writable",
+            status=CheckStatus.FAIL,
+            message=f"{path} is not writable: {type(exc).__name__}: {exc}",
+            details=details | {"error_class": type(exc).__name__},
+        )
+    return DoctorCheck(
+        id="log_dir_writable",
+        name="Log directory writable",
+        status=CheckStatus.PASS,
+        message=f"{path} is writable.",
+        details=details,
+    )
+
+
+def _check_binary_on_path(
+    *,
+    check_id: str,
+    name: str,
+    binary: str,
+    install_hint: str,
+    which: Callable[[str], str | None] | None,
+    version_runner: Callable[[str], str | None] | None,
+) -> DoctorCheck:
+    resolver = which or shutil.which
+    path = resolver(binary)
+    if path is None:
+        return DoctorCheck(
+            id=check_id,
+            name=name,
+            status=CheckStatus.FAIL,
+            message=f"{binary} was not found on PATH. {install_hint}",
+            details={"binary": binary},
+        )
+    runner = version_runner or _run_version
+    version = runner(path)
+    if not version:
+        return DoctorCheck(
+            id=check_id,
+            name=name,
+            status=CheckStatus.WARN,
+            message=f"{binary} found at {path}, but `--version` did not return cleanly.",
+            details={"binary": binary, "path": path},
+        )
+    return DoctorCheck(
+        id=check_id,
+        name=name,
+        status=CheckStatus.PASS,
+        message=f"{binary} found at {path}: {version}",
+        details={"binary": binary, "path": path, "version": version},
+    )
+
+
+def _run_version(path: str) -> str | None:
+    try:
+        completed = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    return (completed.stdout.strip() or completed.stderr.strip()) or None
+
+
+def _post_json(
+    url: str,
+    *,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float = 3.0,
+) -> HttpResult:
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            text = response.read().decode("utf-8", errors="replace")
+            return HttpResult(
+                status_code=response.status,
+                payload=_parse_json_payload(text),
+                text=text,
+            )
+    except urllib.error.HTTPError as exc:
+        text = exc.read().decode("utf-8", errors="replace")
+        return HttpResult(
+            status_code=exc.code,
+            payload=_parse_json_payload(text),
+            text=text,
+        )
+
+
+def _launchctl_list() -> str:
+    completed = subprocess.run(
+        ["launchctl", "list"],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "launchctl list failed")
+    return completed.stdout
+
+
+def _find_launchd_row(output: str, label: str) -> tuple[str, str] | None:
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[-1] == label:
+            return parts[0], parts[1]
+    return None
+
+
+def _configured_slack_team_id(config_path: Path) -> str | None:
+    for env_key in ("ENGRAM_SLACK_TEAM_ID", "SLACK_TEAM_ID"):
+        if value := os.environ.get(env_key):
+            return value
+    if not config_path.exists():
+        return None
+    try:
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    slack = raw.get("slack") if isinstance(raw, dict) else None
+    if not isinstance(slack, dict):
+        return None
+    return _optional_str(slack.get("team_id")) or _optional_str(slack.get("workspace_id"))
+
+
+def _blocked_by_config(check_id: str, name: str) -> DoctorCheck:
+    return DoctorCheck(
+        id=check_id,
+        name=name,
+        status=CheckStatus.FAIL,
+        message="Config did not load; fix config.yaml before validating this dependency.",
+        details={"blocked_by": "config_load"},
+    )
+
+
+def _nearest_existing_parent(path: Path) -> Path:
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return probe
+
+
+def _write_probe(path: Path) -> None:
+    probe = path / f".engram-doctor-write-test-{os.getpid()}"
+    probe.write_text("ok", encoding="utf-8")
+    probe.unlink()
+
+
+def _parse_json_payload(text: str) -> dict[str, Any]:
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _format_bytes(value: int) -> str:
+    gb = value / 1_000_000_000
+    if gb >= 1:
+        return f"{gb:.1f} GB"
+    mb = value / 1_000_000
+    return f"{mb:.0f} MB"
+
+
+def _free_bytes(usage: Any) -> int:
+    free = getattr(usage, "free", None)
+    if free is not None:
+        return int(free)
+    return int(usage[2])

@@ -114,6 +114,21 @@ def status(
 
 
 @app.command()
+def doctor(
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Run pre-flight checks for local dependencies, config, tokens, and launchd."""
+    from engram.doctor import render_report, run_doctor
+
+    report = run_doctor()
+    if json_output:
+        typer.echo(json.dumps(report.to_json(), sort_keys=True))
+    else:
+        render_report(report, console)
+    raise typer.Exit(report.exit_code)
+
+
+@app.command()
 def cost(
     month: bool = typer.Option(False, "--month", help="Show month-to-date spend."),
     today: bool = typer.Option(False, "--today", help="Show today's spend."),
