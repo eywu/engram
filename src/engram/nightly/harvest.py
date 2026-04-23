@@ -222,6 +222,121 @@ def run_harvest(
     return HarvestResult(output_path=output_path, payload=payload)
 
 
+def run_weekly_harvest(
+    *,
+    db_path: Path = DEFAULT_MEMORY_DB,
+    output_root: Path = DEFAULT_OUTPUT_ROOT,
+    target_date: date | None = None,
+    config: NightlyConfig | None = None,
+) -> HarvestResult:
+    """Harvest the seven daily nightly summaries ending on ``target_date``."""
+    cfg = config or NightlyConfig()
+    week_end = target_date or datetime.now(UTC).date()
+    week_start = week_end - timedelta(days=6)
+    expected_days = {
+        (week_start + timedelta(days=offset)).isoformat()
+        for offset in range(7)
+    }
+
+    with closing(open_memory_db(db_path.expanduser())) as conn:
+        rows = load_weekly_harvest_rows(
+            conn,
+            week_start=week_start,
+            week_end=week_end,
+        )
+
+    rows_by_channel = _group_by_channel(rows)
+    excluded_channels = set(cfg.excluded_channels)
+    channels_payload: list[dict[str, object]] = []
+    skipped_payload: list[dict[str, object]] = []
+
+    for channel_id in sorted(rows_by_channel):
+        channel_rows = sorted(rows_by_channel[channel_id], key=lambda row: row.day or "")
+        if channel_id in excluded_channels:
+            skipped_payload.append(
+                {
+                    "channel_id": channel_id,
+                    "reason": "excluded",
+                    "rows_before": len(channel_rows),
+                }
+            )
+            continue
+
+        row_days = {str(row.day) for row in channel_rows}
+        if row_days != expected_days:
+            skipped_payload.append(
+                {
+                    "channel_id": channel_id,
+                    "reason": "weekly_window_incomplete",
+                    "rows_before": len(channel_rows),
+                    "required_days": sorted(expected_days),
+                    "present_days": sorted(row_days),
+                }
+            )
+            log.info(
+                "harvest.weekly_channel_skipped",
+                extra={
+                    "phase": "weekly-harvest",
+                    "channel_id": channel_id,
+                    "reason": "weekly_window_incomplete",
+                    "rows_before": len(channel_rows),
+                    "present_days": sorted(row_days),
+                },
+            )
+            continue
+
+        token_count = sum(row.token_count for row in channel_rows)
+        channels_payload.append(
+            {
+                "channel_id": channel_id,
+                "rows_before": len(channel_rows),
+                "rows_after_dedup": len(channel_rows),
+                "row_count": len(channel_rows),
+                "token_count": token_count,
+                "truncated": False,
+                "rows": [row.to_json() for row in channel_rows],
+            }
+        )
+        log.info(
+            "harvest.weekly_channel_harvested",
+            extra={
+                "phase": "weekly-harvest",
+                "channel_id": channel_id,
+                "row_count": len(channel_rows),
+                "token_count": token_count,
+            },
+        )
+
+    payload: dict[str, object] = {
+        "date": week_end.isoformat(),
+        "trigger": "nightly-weekly",
+        "window": {
+            "start_day": week_start.isoformat(),
+            "end_day": week_end.isoformat(),
+        },
+        "config": {
+            "required_daily_rows": 7,
+            "excluded_channels": list(cfg.excluded_channels),
+        },
+        "channels": channels_payload,
+        "skipped_channels": skipped_payload,
+    }
+
+    output_path = output_root.expanduser() / week_end.isoformat() / "weekly-harvest.json"
+    write_json(output_path, payload)
+    log.info(
+        "harvest.weekly_complete",
+        extra={
+            "phase": "weekly-harvest",
+            "date": week_end.isoformat(),
+            "output_path": str(output_path),
+            "channels": len(channels_payload),
+            "skipped_channels": len(skipped_payload),
+        },
+    )
+    return HarvestResult(output_path=output_path, payload=payload)
+
+
 def load_harvest_rows(
     conn: sqlite3.Connection,
     *,
@@ -269,6 +384,38 @@ def load_harvest_rows(
             window_start.astimezone(UTC).isoformat(),
             window_end.astimezone(UTC).isoformat(),
         ),
+    ).fetchall()
+    return [_row_from_sql(row) for row in rows]
+
+
+def load_weekly_harvest_rows(
+    conn: sqlite3.Connection,
+    *,
+    week_start: date,
+    week_end: date,
+) -> list[HarvestRow]:
+    rows = conn.execute(
+        """
+        SELECT
+            'summary' AS kind,
+            id,
+            session_id,
+            channel_id,
+            ts,
+            NULL AS role,
+            NULL AS message_uuid,
+            NULL AS parent_uuid,
+            summary_text AS text,
+            trigger,
+            day,
+            custom_instructions
+        FROM summaries
+        WHERE trigger = 'nightly'
+          AND day >= ?
+          AND day <= ?
+        ORDER BY channel_id ASC, day ASC, id ASC
+        """,
+        (week_start.isoformat(), week_end.isoformat()),
     ).fetchall()
     return [_row_from_sql(row) for row in rows]
 

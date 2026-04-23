@@ -9,7 +9,7 @@ from pathlib import Path
 
 from engram.config import NightlyConfig
 from engram.memory import insert_summary, insert_transcript, open_memory_db
-from engram.nightly.harvest import run_harvest
+from engram.nightly.harvest import run_harvest, run_weekly_harvest
 
 BASE_DAY = date(2026, 4, 22)
 BASE_TS = datetime(2026, 4, 22, 0, 0, tzinfo=UTC)
@@ -164,6 +164,83 @@ def test_harvest_excludes_configured_channels_and_logs(tmp_path: Path, caplog) -
     assert record.channel_id == "C07SKIP"
 
 
+def test_weekly_harvest_uses_six_prior_days_plus_target_day(tmp_path: Path) -> None:
+    db_path = tmp_path / "memory.db"
+    monday = date(2026, 4, 20)
+    with closing(open_memory_db(db_path)) as conn:
+        for offset in range(7):
+            day = monday - timedelta(days=6 - offset)
+            _seed_summary(
+                conn,
+                "C07WEEK",
+                datetime.combine(day, datetime.min.time(), tzinfo=UTC),
+                f"daily summary {day.isoformat()}",
+                trigger="nightly",
+            )
+        _seed_summary(
+            conn,
+            "C07WEEK",
+            datetime(2026, 4, 13, tzinfo=UTC),
+            "older daily summary",
+            trigger="nightly",
+        )
+        _seed_summary(
+            conn,
+            "C07WEEK",
+            datetime(2026, 4, 20, 12, tzinfo=UTC),
+            "weekly summary ignored",
+            trigger="nightly-weekly",
+        )
+
+    result = run_weekly_harvest(
+        db_path=db_path,
+        output_root=tmp_path / "nightly",
+        target_date=monday,
+        config=NightlyConfig(),
+    )
+
+    channel = result.payload["channels"][0]
+    rows = channel["rows"]
+    assert result.output_path == tmp_path / "nightly" / "2026-04-20" / "weekly-harvest.json"
+    assert channel["row_count"] == 7
+    assert [row["day"] for row in rows] == [
+        "2026-04-14",
+        "2026-04-15",
+        "2026-04-16",
+        "2026-04-17",
+        "2026-04-18",
+        "2026-04-19",
+        "2026-04-20",
+    ]
+    assert rows[-1]["text"] == "daily summary 2026-04-20"
+
+
+def test_weekly_harvest_allows_non_monday_target_dates(tmp_path: Path) -> None:
+    db_path = tmp_path / "memory.db"
+    sunday = date(2026, 4, 19)
+    with closing(open_memory_db(db_path)) as conn:
+        for offset in range(7):
+            day = sunday - timedelta(days=6 - offset)
+            _seed_summary(
+                conn,
+                "C07RETRO",
+                datetime.combine(day, datetime.min.time(), tzinfo=UTC),
+                f"retro summary {day.isoformat()}",
+                trigger="nightly",
+            )
+
+    result = run_weekly_harvest(
+        db_path=db_path,
+        output_root=tmp_path / "nightly",
+        target_date=sunday,
+        config=NightlyConfig(),
+    )
+
+    channel = result.payload["channels"][0]
+    assert channel["row_count"] == 7
+    assert [row["day"] for row in channel["rows"]][-1] == "2026-04-19"
+
+
 def _seed_transcript(
     conn: sqlite3.Connection,
     channel_id: str,
@@ -188,13 +265,15 @@ def _seed_summary(
     channel_id: str,
     ts: datetime,
     text: str,
+    *,
+    trigger: str = "manual",
 ) -> int:
     return insert_summary(
         conn,
         session_id=f"session-{channel_id}",
         channel_id=channel_id,
         ts=ts,
-        trigger="manual",
+        trigger=trigger,
         day=ts.date(),
         custom_instructions=None,
         summary_text=text,

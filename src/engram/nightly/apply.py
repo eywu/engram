@@ -31,6 +31,7 @@ from engram.telemetry import configure_logging
 
 DEFAULT_MEMORY_DB = Path.home() / ".engram" / "memory.db"
 DRY_RUN_ROOT = Path("/tmp")
+APPLY_SUMMARY_TRIGGERS = frozenset({"nightly", "nightly-weekly"})
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ log = logging.getLogger(__name__)
 class ApplyRow:
     channel_id: str
     summary_text: str
+    source_row_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -56,16 +58,21 @@ async def apply_synthesis(
     db_path: Path = DEFAULT_MEMORY_DB,
     config_path: Path = DEFAULT_CONFIG_PATH,
     dry_run: bool = False,
+    summary_trigger: str = "nightly",
     embedding_queue: EmbeddingQueue | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> ApplyResult:
     """Read ``synthesis.json`` and apply synthesized channel summaries."""
+    if summary_trigger not in APPLY_SUMMARY_TRIGGERS:
+        allowed = ", ".join(sorted(APPLY_SUMMARY_TRIGGERS))
+        raise ValueError(f"invalid summary trigger {summary_trigger!r}; expected one of: {allowed}")
+
     clock = clock or (lambda: datetime.now(UTC))
     source_path = synthesis_json.expanduser()
     source_text = source_path.read_text(encoding="utf-8")
     payload = json.loads(source_text)
     run_date = _payload_date(payload, clock=clock)
-    rows = _extract_rows(payload)
+    rows = _extract_rows(payload, summary_trigger=summary_trigger)
 
     if dry_run:
         output_path = DRY_RUN_ROOT / f"engram-nightly-dryrun-{run_date.isoformat()}" / "synthesis.json"
@@ -102,6 +109,7 @@ async def apply_synthesis(
                 channel_id=row.channel_id,
                 day=run_date,
                 ts=applied_at,
+                trigger=summary_trigger,
                 summary_text=row.summary_text,
             )
             if overwritten:
@@ -111,6 +119,7 @@ async def apply_synthesis(
                         "phase": "apply",
                         "date": run_date.isoformat(),
                         "channel_id": row.channel_id,
+                        "trigger": summary_trigger,
                         "summary_id": summary_id,
                     },
                 )
@@ -123,6 +132,7 @@ async def apply_synthesis(
         extra={
             "phase": "apply",
             "date": run_date.isoformat(),
+            "trigger": summary_trigger,
             "channels": len(rows),
             "rows_queued": rows_queued,
             "embedding_queue_depth": queue.depth,
@@ -144,16 +154,20 @@ def upsert_nightly_summary(
     channel_id: str,
     day: date,
     ts: datetime,
+    trigger: str = "nightly",
     summary_text: str,
 ) -> tuple[int, bool]:
     """Upsert one nightly summary and return ``(summary_id, overwritten)``."""
+    if trigger not in APPLY_SUMMARY_TRIGGERS:
+        raise ValueError("nightly apply only supports nightly summary triggers")
+
     existing = conn.execute(
         """
         SELECT id
         FROM summaries
-        WHERE channel_id = ? AND day = ? AND trigger = 'nightly'
+        WHERE channel_id = ? AND day = ? AND trigger = ?
         """,
-        (channel_id, day.isoformat()),
+        (channel_id, day.isoformat(), trigger),
     ).fetchone()
 
     conn.execute(
@@ -167,20 +181,20 @@ def upsert_nightly_summary(
             custom_instructions,
             summary_text
         )
-        VALUES (NULL, ?, ?, 'nightly', ?, NULL, ?)
+        VALUES (NULL, ?, ?, ?, ?, NULL, ?)
         ON CONFLICT(channel_id, day, trigger) DO UPDATE SET
             summary_text=excluded.summary_text,
             ts=excluded.ts
         """,
-        (channel_id, ts.isoformat(), day.isoformat(), summary_text),
+        (channel_id, ts.isoformat(), trigger, day.isoformat(), summary_text),
     )
     row = conn.execute(
         """
         SELECT id
         FROM summaries
-        WHERE channel_id = ? AND day = ? AND trigger = 'nightly'
+        WHERE channel_id = ? AND day = ? AND trigger = ?
         """,
-        (channel_id, day.isoformat()),
+        (channel_id, day.isoformat(), trigger),
     ).fetchone()
     if row is None:
         raise RuntimeError("nightly summary upsert did not produce a row")
@@ -209,6 +223,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Copy synthesis.json to /tmp/engram-nightly-dryrun-<date>/ without touching memory.db.",
     )
+    parser.add_argument(
+        "--weekly",
+        action="store_true",
+        help="Write synthesized rows with trigger='nightly-weekly'.",
+    )
     return parser.parse_args(argv)
 
 
@@ -222,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
                 db_path=args.db,
                 config_path=args.config,
                 dry_run=args.dry_run,
+                summary_trigger="nightly-weekly" if args.weekly else "nightly",
             )
         )
     except (OSError, json.JSONDecodeError, sqlite3.Error, ValueError) as exc:
@@ -266,7 +286,7 @@ def _payload_date(payload: dict[str, Any], *, clock: Callable[[], datetime]) -> 
     return clock().date()
 
 
-def _extract_rows(payload: dict[str, Any]) -> list[ApplyRow]:
+def _extract_rows(payload: dict[str, Any], *, summary_trigger: str) -> list[ApplyRow]:
     rows: list[ApplyRow] = []
     for channel in payload.get("channels") or []:
         if not isinstance(channel, dict):
@@ -296,8 +316,34 @@ def _extract_rows(payload: dict[str, Any]) -> list[ApplyRow]:
         summary_text = synthesis.get("summary")
         if not isinstance(summary_text, str) or not summary_text.strip():
             raise ValueError(f"synthesized channel {channel_id!r} is missing summary text")
-        rows.append(ApplyRow(channel_id=channel_id, summary_text=summary_text))
+        source_row_ids = _source_row_ids(synthesis.get("source_row_ids"))
+        if summary_trigger == "nightly-weekly":
+            if len(source_row_ids) != 7:
+                raise ValueError(
+                    f"synthesized weekly channel {channel_id!r} must reference 7 daily rows"
+                )
+            source_text = ", ".join(str(row_id) for row_id in source_row_ids)
+            summary_text = f"{summary_text.strip()}\n\nSource daily summary row ids: {source_text}"
+        rows.append(
+            ApplyRow(
+                channel_id=channel_id,
+                summary_text=summary_text,
+                source_row_ids=source_row_ids,
+            )
+        )
     return rows
+
+
+def _source_row_ids(raw: Any) -> tuple[int, ...]:
+    if not isinstance(raw, list):
+        return ()
+    ids: list[int] = []
+    for value in raw:
+        try:
+            ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return tuple(ids)
 
 
 if __name__ == "__main__":

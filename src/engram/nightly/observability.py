@@ -53,8 +53,20 @@ def format_failure_dm(*, phase: str | None, exit_code: int | None, log_path: Pat
     )
 
 
-async def run_configured_nightly() -> NightlyRunResult:
-    return await run_nightly(failure_dm=post_configured_failure_dm)
+async def run_configured_nightly(
+    *,
+    weekly: bool = False,
+    target_date: datetime.date | None = None,
+) -> NightlyRunResult:
+    async def configured_synthesize() -> dict[str, Any]:
+        from engram.nightly.pipeline import run_nightly_pipeline
+
+        return await run_nightly_pipeline(weekly=weekly, target_date=target_date)
+
+    return await run_nightly(
+        synthesize=configured_synthesize,
+        failure_dm=post_configured_failure_dm,
+    )
 
 
 async def run_nightly(

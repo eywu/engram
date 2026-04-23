@@ -103,6 +103,7 @@ async def synthesize(
     config_path: Path | None = None,
     output_root: Path = DEFAULT_OUTPUT_ROOT,
     prompt_template_path: Path = DEFAULT_PROMPT_TEMPLATE,
+    weekly: bool = False,
     config: NightlyConfig | None = None,
     contexts_dir: Path | None = None,
     anthropic_runtime: AnthropicRuntime | None = None,
@@ -123,6 +124,7 @@ async def synthesize(
     harvest_path = harvest_json.expanduser()
     harvest = json.loads(harvest_path.read_text(encoding="utf-8"))
     run_date = str(harvest.get("date") or dt.datetime.now(dt.UTC).date().isoformat())
+    trigger = "nightly-weekly" if weekly else "nightly"
     current_dir = output_root.expanduser() / "current"
     archive_dir = output_root.expanduser() / "archive" / run_date
     current_dir.mkdir(parents=True, exist_ok=True)
@@ -140,6 +142,7 @@ async def synthesize(
         extra={
             "phase": "synthesis",
             "date": run_date,
+            "trigger": trigger,
             "cwd": str(current_dir),
             "hitl_disabled": hitl_disabled,
             "hitl_config_enabled": hitl_config.enabled,
@@ -193,6 +196,7 @@ async def synthesize(
             run_date=run_date,
             current_dir=current_dir,
             prompt_template=prompt_template,
+            weekly=weekly,
             config=nightly_config,
             runtime=runtime,
             hitl_config=hitl_config,
@@ -206,6 +210,7 @@ async def synthesize(
     payload: dict[str, Any] = {
         "schema_version": 1,
         "date": run_date,
+        "trigger": trigger,
         "created_at": dt.datetime.now(dt.UTC).isoformat(),
         "harvest_path": str(harvest_path),
         "cwd": str(current_dir),
@@ -223,13 +228,14 @@ async def synthesize(
             "cost_usd": _format_usd(spent_usd),
         },
     }
-    output_path = archive_dir / "synthesis.json"
+    output_path = archive_dir / ("weekly-synthesis.json" if weekly else "synthesis.json")
     write_json(output_path, payload)
     log.info(
         "nightly.synthesis_complete",
         extra={
             "phase": "synthesis",
             "date": run_date,
+            "trigger": trigger,
             "output_path": str(output_path),
             "channels": len(synthesized_channels),
             "skipped_channels": len(skipped_channels),
@@ -340,6 +346,7 @@ async def _synthesize_channel(
     run_date: str,
     current_dir: Path,
     prompt_template: str,
+    weekly: bool,
     config: NightlyConfig,
     runtime: AnthropicRuntime,
     hitl_config: HITLConfig,
@@ -353,6 +360,7 @@ async def _synthesize_channel(
         channel=plan.channel,
         manifest=plan.manifest,
         excluded_channels=config.excluded_channels,
+        weekly=weekly,
     )
     options = build_nightly_options(
         plan=plan,
@@ -445,6 +453,7 @@ async def _synthesize_channel(
         extra={
             "phase": "synthesis",
             "channel_id": plan.channel_id,
+            "trigger": "nightly-weekly" if weekly else "nightly",
             "status": status,
             "model": plan.model,
             "cost_usd": _format_usd(cost_usd),
@@ -507,6 +516,7 @@ def _render_prompt(
     channel: dict[str, Any],
     manifest: ChannelManifest | None,
     excluded_channels: tuple[str, ...],
+    weekly: bool = False,
 ) -> str:
     manifest_json = {}
     if manifest is not None:
@@ -516,13 +526,21 @@ def _render_prompt(
             "label": manifest.label,
             "nightly_model": manifest.nightly.model,
         }
-    return Template(prompt_template).safe_substitute(
+    rendered = Template(prompt_template).safe_substitute(
         date=run_date,
         model=model,
         excluded_channels_json=json.dumps(list(excluded_channels), sort_keys=True),
         manifest_json=json.dumps(manifest_json, indent=2, sort_keys=True),
         channel_json=json.dumps(channel, indent=2, sort_keys=True),
     )
+    if weekly:
+        rendered += (
+            "\n\nWeekly mode: the channel harvest contains exactly seven daily "
+            "nightly summary rows ending on the run date. Synthesize across all "
+            "seven rows and include all seven row id values in top-level "
+            "source_row_ids."
+        )
+    return rendered
 
 
 def _assistant_text(message: AssistantMessage) -> list[str]:
@@ -657,6 +675,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_PROMPT_TEMPLATE,
         help="Prompt template path.",
     )
+    parser.add_argument(
+        "--weekly",
+        action="store_true",
+        help="Synthesize weekly daily-summary harvest rows.",
+    )
     return parser.parse_args(argv)
 
 
@@ -670,6 +693,7 @@ def main(argv: list[str] | None = None) -> int:
                 config_path=args.config,
                 output_root=args.output_root,
                 prompt_template_path=args.prompt_template,
+                weekly=args.weekly,
             )
         )
     except (OSError, json.JSONDecodeError, ValueError) as exc:

@@ -193,11 +193,23 @@ def run() -> None:
 
 
 @app.command()
-def nightly() -> None:
+def nightly(
+    weekly: bool = typer.Option(
+        False,
+        "--weekly",
+        help="After the daily run, synthesize the seven daily rows ending on this date.",
+    ),
+    target_date: str | None = typer.Option(
+        None,
+        "--date",
+        help="Target date as YYYY-MM-DD. Defaults to the current UTC date.",
+    ),
+) -> None:
     """Run nightly synthesis with heartbeat/log observability."""
     from engram.nightly import run_configured_nightly
 
-    result = asyncio.run(run_configured_nightly())
+    parsed_date = _parse_cli_date(target_date)
+    result = asyncio.run(run_configured_nightly(weekly=weekly, target_date=parsed_date))
     raise typer.Exit(result.exit_code)
 
 
@@ -259,6 +271,15 @@ def _fallback_paths() -> PathsConfig:
         contexts_dir=home / "contexts",
         log_dir=home / "logs",
     )
+
+
+def _parse_cli_date(raw: str | None) -> datetime.date | None:
+    if raw is None:
+        return None
+    try:
+        return datetime.date.fromisoformat(raw)
+    except ValueError as exc:
+        raise typer.BadParameter("--date must be YYYY-MM-DD") from exc
 
 
 def _nightly_status(home: Path) -> dict[str, Any]:

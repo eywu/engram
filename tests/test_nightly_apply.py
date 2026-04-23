@@ -185,3 +185,57 @@ async def test_apply_dry_run_copies_identical_artifact_without_touching_db(
     assert result.output_path == Path("/tmp/engram-nightly-dryrun-2099-01-02/synthesis.json")
     assert result.output_path.read_text(encoding="utf-8") == source
     assert not db_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_apply_weekly_writes_nightly_weekly_with_seven_source_rows(
+    tmp_path: Path,
+) -> None:
+    synthesis = tmp_path / "weekly-synthesis.json"
+    synthesis.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "date": "2026-04-20",
+                "trigger": "nightly-weekly",
+                "channels": [
+                    {
+                        "channel_id": "C07TESTA",
+                        "status": "synthesized",
+                        "synthesis": {
+                            "schema_version": 1,
+                            "date": "2026-04-20",
+                            "channel_id": "C07TESTA",
+                            "summary": "weekly durable summary",
+                            "source_row_ids": [11, 12, 13, 14, 15, 16, 17],
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "memory.db"
+
+    result = await apply_synthesis(
+        synthesis,
+        db_path=db_path,
+        embedding_queue=EmbeddingQueue(_FakeEmbedder(), db_path=db_path),
+        summary_trigger="nightly-weekly",
+        clock=_clock,
+    )
+
+    assert result.rows_written == 1
+    with closing(open_memory_db(db_path)) as conn:
+        row = conn.execute(
+            """
+            SELECT trigger, day, summary_text
+            FROM summaries
+            WHERE channel_id = 'C07TESTA'
+            """
+        ).fetchone()
+    assert row["trigger"] == "nightly-weekly"
+    assert row["day"] == "2026-04-20"
+    assert row["summary_text"].endswith(
+        "Source daily summary row ids: 11, 12, 13, 14, 15, 16, 17"
+    )
