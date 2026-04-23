@@ -23,8 +23,17 @@ skills: {}
 # Permission rules (native Claude Code `Tool(specifier)` syntax).
 # Even on your own machine, a small deny list protects against accidental
 # secret exfiltration if Claude decides to grep for config files.
-# These are suggestions — edit freely to match your layout.
+# These are suggestions — edit freely to match your layout. The read-only
+# allow-list removes HITL prompts for safe inspection-only tools; deny still
+# wins when a specific rule matches.
 permissions:
+  allow:
+    - Read
+    - Grep
+    - Glob
+    - WebFetch
+    - WebSearch
+    - TodoWrite
   deny:
     - "Read(~/.ssh/**)"
     - "Read(~/.aws/**)"

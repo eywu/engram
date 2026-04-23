@@ -8,7 +8,13 @@ import pytest
 
 from engram import paths
 from engram.config import HITLConfig
-from engram.manifest import ChannelStatus, IdentityTemplate, dump_manifest
+from engram.manifest import (
+    OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES,
+    ChannelStatus,
+    IdentityTemplate,
+    dump_manifest,
+    load_manifest,
+)
 from engram.router import Router
 
 
@@ -108,6 +114,34 @@ async def test_manifest_mode_loads_existing_manifest(tmp_path: Path):
     s2 = await r2.get("C07TEAM", is_dm=False)
     assert s2.manifest.status == ChannelStatus.ACTIVE
     assert s2.is_active()
+
+
+@pytest.mark.asyncio
+async def test_manifest_mode_migrates_existing_owner_dm_empty_allow_list(
+    tmp_path: Path,
+):
+    r1 = Router(home=tmp_path, owner_dm_channel_id="D07OWNER")
+    await r1.get("D07OWNER", is_dm=True)
+    manifest_path = paths.channel_manifest_path("D07OWNER", tmp_path)
+    manifest = load_manifest(manifest_path)
+    dump_manifest(
+        manifest.model_copy(
+            update={
+                "permissions": manifest.permissions.model_copy(update={"allow": []})
+            }
+        ),
+        manifest_path,
+    )
+
+    r2 = Router(home=tmp_path, owner_dm_channel_id="D07OWNER")
+    s2 = await r2.get("D07OWNER", is_dm=True)
+
+    assert s2.manifest.permissions.allow == list(
+        OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES
+    )
+    assert load_manifest(manifest_path).permissions.allow == list(
+        OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES
+    )
 
 
 @pytest.mark.asyncio

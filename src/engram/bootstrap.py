@@ -24,6 +24,7 @@ from pathlib import Path
 
 from engram import paths
 from engram.manifest import (
+    OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES,
     ChannelManifest,
     ChannelStatus,
     IdentityTemplate,
@@ -109,9 +110,10 @@ def provision_channel(
 ) -> ProvisionResult:
     """Create (or confirm) a channel's context directory.
 
-    If the manifest already exists, we load and return it unchanged. If it
-    doesn't, we render the appropriate manifest template and CLAUDE.md from
-    `templates/manifests/` and `templates/identity/`.
+    If the manifest already exists, we load it, apply idempotent manifest
+    migrations, and return it. If it doesn't, we render the appropriate
+    manifest template and CLAUDE.md from `templates/manifests/` and
+    `templates/identity/`.
 
     Parameters
     ----------
@@ -133,7 +135,10 @@ def provision_channel(
     claude_md_path = paths.channel_claude_md_path(channel_id, home)
 
     if manifest_path.exists():
-        manifest = load_manifest(manifest_path)
+        manifest = apply_manifest_migrations(
+            load_manifest(manifest_path),
+            manifest_path,
+        )
         log.info(
             "channel.already_provisioned channel_id=%s status=%s",
             channel_id,
@@ -200,6 +205,33 @@ def provision_channel(
         manifest_path=manifest_path,
         claude_md_path=claude_md_path,
     )
+
+
+def apply_manifest_migrations(
+    manifest: ChannelManifest,
+    manifest_path: Path,
+) -> ChannelManifest:
+    """Apply idempotent manifest migrations and persist any changes."""
+    if (
+        not manifest.is_owner_dm()
+        or manifest.permissions.allow
+    ):
+        return manifest
+
+    updated_permissions = manifest.permissions.model_copy(
+        update={"allow": list(OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES)}
+    )
+    updated_manifest = manifest.model_copy(
+        update={"permissions": updated_permissions}
+    )
+    dump_manifest(updated_manifest, manifest_path)
+    log.info(
+        "channel.owner_dm_permission_defaults_migrated channel_id=%s path=%s allow=%s",
+        updated_manifest.channel_id,
+        manifest_path,
+        list(OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES),
+    )
+    return updated_manifest
 
 
 # ──────────────────────────────────────────────────────────────────────

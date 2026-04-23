@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from engram import paths
-from engram.bootstrap import provision_channel
+from engram.bootstrap import apply_manifest_migrations, provision_channel
 from engram.config import HITLConfig
 from engram.hitl import HITLRateLimiter, HITLRegistry
 from engram.manifest import (
@@ -174,11 +174,15 @@ class Router:
             # Manifest-driven mode.
             cwd = paths.project_root(self._home)
 
-            # If a manifest already exists on disk, load it unchanged.
+            # If a manifest already exists on disk, load it and apply any
+            # idempotent bootstrap migrations.
             manifest_path = paths.channel_manifest_path(channel_id, self._home)
             if manifest_path.exists():
                 try:
-                    manifest = load_manifest(manifest_path)
+                    manifest = apply_manifest_migrations(
+                        load_manifest(manifest_path),
+                        manifest_path,
+                    )
                 except ManifestError:
                     log.exception(
                         "router.manifest_load_failed channel_id=%s path=%s",

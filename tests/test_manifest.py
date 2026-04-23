@@ -9,6 +9,7 @@ import yaml
 
 from engram import paths
 from engram.manifest import (
+    OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES,
     AskUserQuestion,
     Behavior,
     ChannelManifest,
@@ -204,6 +205,23 @@ def test_manifest_loads_nightly_model_from_templates(tmp_path: Path):
         manifest = load_manifest(manifest_path)
 
         assert manifest.nightly.model == expected_model
+
+
+def test_owner_dm_template_has_read_only_allow_defaults(tmp_path: Path):
+    template = paths.TEMPLATES_MANIFESTS_DIR / "owner-dm.yaml"
+    rendered = (
+        template.read_text()
+        .replace("{{channel_id}}", "D07OWNER")
+        .replace("{{channel_label}}", "DM")
+    )
+    manifest_path = tmp_path / "owner-dm.yaml"
+    manifest_path.write_text(rendered)
+
+    manifest = load_manifest(manifest_path)
+
+    assert manifest.permissions.allow == list(
+        OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES
+    )
 
 
 def test_no_dont_ask_rule_in_templates():

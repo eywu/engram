@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import ToolPermissionContext
 
 from engram.agent import Agent
+from engram.bootstrap import ensure_project_root
 from engram.config import AnthropicConfig, EngramConfig, HITLConfig, SlackConfig
 from engram.egress import post_question, update_question_timeout
 from engram.hitl import PendingQuestion, build_hitl_tool_guard
@@ -54,6 +56,125 @@ class MockClaudeSDKClient:
 @dataclass
 class _TextBlock:
     text: str
+
+
+def _matches_permission_rule(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    rule: str,
+) -> bool:
+    if "(" in rule and rule.endswith(")"):
+        rule_tool, specifier = rule[:-1].split("(", 1)
+    else:
+        rule_tool, specifier = rule, None
+
+    if rule_tool != tool_name:
+        return False
+    if specifier is None:
+        return True
+    if tool_name not in {"Read", "Grep", "Glob"}:
+        return False
+
+    candidate = tool_input.get("file_path") or tool_input.get("path")
+    if not isinstance(candidate, str):
+        return False
+
+    expanded_candidate = str(Path(candidate).expanduser())
+    expanded_specifier = (
+        str(Path(specifier).expanduser())
+        if specifier.startswith("~")
+        else specifier
+    )
+    return fnmatch.fnmatch(expanded_candidate, expanded_specifier)
+
+
+class PermissionAwareToolClient:
+    """Test-only client that mirrors the SDK's permission ordering.
+
+    Native Claude Code permission rules are applied before the runtime
+    `can_use_tool` callback: `disallowed_tools` first, then `allowed_tools`,
+    and only then `can_use_tool` for unresolved requests.
+    """
+
+    def __init__(
+        self,
+        options,
+        *,
+        tool_name: str,
+        tool_input: dict[str, Any],
+    ) -> None:
+        self.options = options
+        self.tool_name = tool_name
+        self.tool_input = tool_input
+        self.events: list[str] = []
+        self.interrupt_calls = 0
+        self.permission_result = None
+        self._session_id = ""
+
+    async def connect(self) -> None:
+        self.events.append("connect")
+
+    async def disconnect(self) -> None:
+        self.events.append("disconnect")
+
+    async def query(self, _prompt: str, session_id: str = "default") -> None:
+        self._session_id = session_id
+        self.events.append("query")
+
+    async def interrupt(self) -> None:
+        self.interrupt_calls += 1
+        self.events.append("interrupt")
+
+    async def tag_session(self, *, session_id: str, tags: dict[str, str]) -> None:
+        self.events.append(f"tag:{session_id}:{tags['channel_id']}")
+
+    async def receive_response(self):
+        result = await self._dispatch_tool()
+        self.permission_result = result
+
+        if isinstance(result, PermissionResultAllow):
+            self.events.append("tool_ran")
+            text = "tool ran"
+        else:
+            if result.interrupt:
+                await self.interrupt()
+            text = result.message or "denied"
+
+        yield AssistantMessage(content=[_TextBlock(text)], model="fake")
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id=self._session_id,
+            total_cost_usd=0.01,
+        )
+
+    async def _dispatch_tool(self):
+        for rule in self.options.disallowed_tools:
+            if _matches_permission_rule(self.tool_name, self.tool_input, rule):
+                self.events.append("sdk_disallowed")
+                return PermissionResultDeny(
+                    message=f"denied by SDK rule: {rule}",
+                    interrupt=False,
+                )
+
+        for rule in self.options.allowed_tools:
+            if _matches_permission_rule(self.tool_name, self.tool_input, rule):
+                self.events.append("sdk_allowed")
+                return PermissionResultAllow(updated_input=self.tool_input)
+
+        if self.options.can_use_tool is None:
+            self.events.append("implicit_allow")
+            return PermissionResultAllow(updated_input=self.tool_input)
+
+        self.events.append("permission_requested")
+        return await self.options.can_use_tool(
+            self.tool_name,
+            self.tool_input,
+            ToolPermissionContext(tool_use_id=f"tool-{self.tool_name.lower()}"),
+        )
 
 
 class ToolGateFakeClient:
@@ -123,6 +244,42 @@ def _agent_cfg() -> EngramConfig:
         slack=SlackConfig(bot_token="xoxb-test", app_token="xapp-test"),
         anthropic=AnthropicConfig(api_key="sk-ant-test"),
     )
+
+
+async def _build_owner_dm_permission_harness(
+    tmp_path: Path,
+    *,
+    tool_name: str,
+    tool_input: dict[str, Any],
+):
+    ensure_project_root(home=tmp_path)
+    owner_dm_id = "D07OWNER477"
+    router = Router(
+        home=tmp_path,
+        owner_dm_channel_id=owner_dm_id,
+        hitl=HITLConfig(timeout_s=30),
+    )
+    questions: list[PendingQuestion] = []
+    clients: list[PermissionAwareToolClient] = []
+
+    async def on_new_question(q: PendingQuestion) -> None:
+        q.slack_channel_ts = THREAD_TS
+        q.slack_thread_ts = THREAD_TS
+        questions.append(q)
+
+    def client_factory(options) -> PermissionAwareToolClient:
+        client = PermissionAwareToolClient(
+            options,
+            tool_name=tool_name,
+            tool_input=tool_input,
+        )
+        clients.append(client)
+        return client
+
+    agent = Agent(_agent_cfg(), client_factory=client_factory, router=router)
+    agent._on_new_question = on_new_question
+    session = await router.get(owner_dm_id, is_dm=True)
+    return agent, session, router, questions, clients
 
 
 class HITLHarness:
@@ -312,6 +469,67 @@ async def test_agent_hitl_deny_button_denies_write_and_interrupts(tmp_path: Path
     assert clients[0].permission_result.interrupt is True
     assert clients[0].interrupt_calls == 1
     assert turn.text == "user denied"
+
+
+@pytest.mark.asyncio
+async def test_owner_dm_webfetch_allow_list_skips_hitl_prompt(tmp_path: Path):
+    agent, session, _router, questions, clients = (
+        await _build_owner_dm_permission_harness(
+            tmp_path,
+            tool_name="WebFetch",
+            tool_input={"url": "https://example.com"},
+        )
+    )
+
+    turn = await agent.run_turn(session, "fetch example.com")
+
+    assert turn.text == "tool ran"
+    assert questions == []
+    assert "permission_requested" not in clients[0].events
+    assert "sdk_allowed" in clients[0].events
+    assert "tool_ran" in clients[0].events
+    assert clients[0].interrupt_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_owner_dm_bash_still_triggers_hitl_prompt(tmp_path: Path):
+    agent, session, router, questions, clients = (
+        await _build_owner_dm_permission_harness(
+            tmp_path,
+            tool_name="Bash",
+            tool_input={"cmd": "pwd"},
+        )
+    )
+
+    turn_task = asyncio.create_task(agent.run_turn(session, "run pwd"))
+    await wait_until(lambda: len(questions) == 1 and len(clients) == 1)
+
+    assert "permission_requested" in clients[0].events
+    assert not turn_task.done()
+
+    router.hitl.resolve(questions[0].permission_request_id, PermissionResultAllow())
+    turn = await asyncio.wait_for(turn_task, timeout=1)
+
+    assert turn.text == "tool ran"
+    assert "tool_ran" in clients[0].events
+
+
+@pytest.mark.asyncio
+async def test_owner_dm_read_secret_path_denied_before_hitl(tmp_path: Path):
+    agent, session, _router, questions, clients = (
+        await _build_owner_dm_permission_harness(
+            tmp_path,
+            tool_name="Read",
+            tool_input={"file_path": str(Path("~/.ssh/id_rsa").expanduser())},
+        )
+    )
+
+    turn = await agent.run_turn(session, "read my ssh key")
+
+    assert turn.text == "denied by SDK rule: Read(~/.ssh/**)"
+    assert questions == []
+    assert "permission_requested" not in clients[0].events
+    assert "sdk_disallowed" in clients[0].events
 
 
 @pytest.mark.asyncio

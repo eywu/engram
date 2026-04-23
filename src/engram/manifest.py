@@ -55,6 +55,16 @@ class ChannelStatus(StrEnum):
     DENIED = "denied"
 
 
+OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES: tuple[str, ...] = (
+    "Read",
+    "Grep",
+    "Glob",
+    "WebFetch",
+    "WebSearch",
+    "TodoWrite",
+)
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Scope sub-blocks (exclusion-first model)
 # ──────────────────────────────────────────────────────────────────────────

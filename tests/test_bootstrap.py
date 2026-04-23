@@ -9,10 +9,12 @@ import pytest
 from engram import paths
 from engram.bootstrap import ensure_project_root, provision_channel
 from engram.manifest import (
+    OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES,
     ChannelManifest,
     ChannelStatus,
     IdentityTemplate,
     ScopeList,
+    dump_manifest,
     load_manifest,
 )
 
@@ -155,8 +157,6 @@ def test_provision_channel_idempotent(tmp_path: Path):
     m2 = ChannelManifest.model_validate(
         {**m.model_dump(mode="json"), "status": "active"}
     )
-    from engram.manifest import dump_manifest
-
     dump_manifest(m2, manifest_path)
 
     second = provision_channel(
@@ -167,6 +167,75 @@ def test_provision_channel_idempotent(tmp_path: Path):
     )
     assert not second.created
     assert second.manifest.status == ChannelStatus.ACTIVE  # preserved
+
+
+def test_provision_channel_migrates_owner_dm_empty_permission_allow(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    result = provision_channel(
+        "D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        label="DM",
+        home=tmp_path,
+    )
+    manifest = load_manifest(result.manifest_path)
+    migrated = manifest.model_copy(
+        update={
+            "permissions": manifest.permissions.model_copy(update={"allow": []})
+        }
+    )
+    dump_manifest(migrated, result.manifest_path)
+
+    caplog.set_level(logging.INFO)
+    reloaded = provision_channel(
+        "D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        label="DM",
+        home=tmp_path,
+    )
+
+    assert not reloaded.created
+    assert reloaded.manifest.permissions.allow == list(
+        OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES
+    )
+    assert load_manifest(reloaded.manifest_path).permissions.allow == list(
+        OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES
+    )
+    assert "channel.owner_dm_permission_defaults_migrated" in caplog.text
+
+
+def test_provision_channel_leaves_owner_dm_custom_permission_allow_alone(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    result = provision_channel(
+        "D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        label="DM",
+        home=tmp_path,
+    )
+    manifest = load_manifest(result.manifest_path)
+    customized = manifest.model_copy(
+        update={
+            "permissions": manifest.permissions.model_copy(
+                update={"allow": ["Read"]}
+            )
+        }
+    )
+    dump_manifest(customized, result.manifest_path)
+
+    caplog.set_level(logging.INFO)
+    reloaded = provision_channel(
+        "D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        label="DM",
+        home=tmp_path,
+    )
+
+    assert not reloaded.created
+    assert reloaded.manifest.permissions.allow == ["Read"]
+    assert "channel.owner_dm_permission_defaults_migrated" not in caplog.text
 
 
 def test_provision_channel_preserves_custom_claude_md(tmp_path: Path):

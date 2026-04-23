@@ -15,11 +15,13 @@ from claude_agent_sdk.types import ToolPermissionContext
 from engram.agent import Agent
 from engram.config import AnthropicConfig, EngramConfig, HITLConfig, SlackConfig
 from engram.manifest import (
+    OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES,
     Behavior,
     ChannelManifest,
     ChannelStatus,
     IdentityTemplate,
     MemoryScope,
+    PermissionsRules,
     ScopeList,
 )
 from engram.mcp import resolve_team_mcp_servers
@@ -111,12 +113,19 @@ def test_owner_dm_manifest_full_inheritance():
         identity=IdentityTemplate.OWNER_DM_FULL,
         status=ChannelStatus.ACTIVE,
         setting_sources=["user"],
+        permissions=PermissionsRules(
+            allow=list(OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES)
+        ),
     )
     a = Agent(_cfg())
     opts = a._build_options(_session(m))
+    expected_tools = set(OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES) | set(
+        MEMORY_SEARCH_FULL_TOOL_NAMES
+    )
     assert opts.setting_sources == ["user"]
     assert opts.disallowed_tools == []
-    assert opts.allowed_tools == MEMORY_SEARCH_FULL_TOOL_NAMES
+    assert set(opts.allowed_tools) == expected_tools
+    assert len(opts.allowed_tools) == len(expected_tools)
     assert set(opts.mcp_servers) == {"engram-memory"}
     assert getattr(opts, "strict_mcp_config", False) is False
     assert "strict-mcp-config" not in opts.extra_args
