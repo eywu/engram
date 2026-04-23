@@ -28,6 +28,7 @@ import yaml
 from claude_agent_sdk import PermissionMode, SettingSource
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from engram import paths
 from engram.config import HITLConfig
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -305,6 +306,13 @@ class ChannelManifest(BaseModel):
         description="Human-readable name (e.g. '#growth-team'). Optional.",
     )
     status: ChannelStatus = ChannelStatus.PENDING
+    acknowledged_pending: bool = Field(
+        default=False,
+        description=(
+            "Whether Engram has already posted the one-time pending-channel "
+            "acknowledgement in Slack for this channel."
+        ),
+    )
     meta_eligible: bool = Field(
         default=True,
         description=(
@@ -428,3 +436,20 @@ def dump_manifest(manifest: ChannelManifest, path: Path) -> None:
             indent=2,
         )
     )
+
+
+def set_channel_status(
+    channel_id: str,
+    new_status: ChannelStatus,
+    *,
+    home: Path | None = None,
+) -> tuple[ChannelManifest, ChannelManifest, Path]:
+    """Load a channel manifest, update ``status``, and persist it."""
+    manifest_path = paths.channel_manifest_path(channel_id, home)
+    manifest = load_manifest(manifest_path)
+    if manifest.status == new_status:
+        return manifest, manifest, manifest_path
+
+    updated = manifest.model_copy(update={"status": new_status})
+    dump_manifest(updated, manifest_path)
+    return manifest, updated, manifest_path

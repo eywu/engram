@@ -17,6 +17,17 @@ from engram.manifest import (
     dump_manifest,
     load_manifest,
 )
+from engram.notifications import notify_pending_channel
+
+
+class FakeSlackClient:
+    def __init__(self) -> None:
+        self.post_calls: list[dict[str, object]] = []
+        self.chat_postMessage = self._chat_post_message
+
+    async def _chat_post_message(self, **kwargs):
+        self.post_calls.append(kwargs)
+        return {"ok": True, "ts": "1713800000.000200"}
 
 # ── Project-root bootstrap ──────────────────────────────────────────────
 
@@ -297,6 +308,37 @@ def test_unknown_mcp_in_manifest_warns_but_allows_boot(
     assert result.manifest.mcp_servers.allowed == ["nonexistent-mcp"]
     assert "channel.mcp_server_missing" in caplog.text
     assert "nonexistent-mcp" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_pending_channel_notification_posts_owner_dm_card(tmp_path: Path):
+    result = provision_channel(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#engram-self",
+        home=tmp_path,
+    )
+    slack = FakeSlackClient()
+
+    await notify_pending_channel(
+        slack_client=slack,
+        owner_dm_channel_id="D07OWNER",
+        channel_id=result.channel_id,
+        channel_label=result.manifest.label or result.channel_id,
+        invited_by_user_id="U07REQUESTER",
+        template=result.manifest.identity.value,
+        first_message="hey engram, what's the status?",
+        source_thread_ts="1713800000.000100",
+    )
+
+    assert len(slack.post_calls) == 1
+    post = slack.post_calls[0]
+    assert post["channel"] == "D07OWNER"
+    assert post["text"] == "New channel awaiting approval"
+    assert "#engram-self (C07TEAM)" in post["blocks"][1]["text"]["text"]
+    assert "<@U07REQUESTER>" in post["blocks"][1]["text"]["text"]
+    assert "task-assistant" in post["blocks"][1]["text"]["text"]
+    assert "hey engram, what's the status?" in post["blocks"][1]["text"]["text"]
 
 
 # ── Path helpers sanity ─────────────────────────────────────────────────

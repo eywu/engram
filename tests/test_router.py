@@ -207,3 +207,21 @@ async def test_manifest_hitl_overrides_router_default(tmp_path: Path):
 
     assert cfg.max_per_day == 3
     assert cfg.timeout_s == 300
+
+
+@pytest.mark.asyncio
+async def test_invalidate_drops_cached_session_and_reloads_manifest(tmp_path: Path):
+    r = Router(home=tmp_path)
+    first = await r.get("C07TEAM", channel_name="#growth", is_dm=False)
+    manifest_path = paths.channel_manifest_path("C07TEAM", tmp_path)
+    dump_manifest(
+        first.manifest.model_copy(update={"status": ChannelStatus.ACTIVE}),
+        manifest_path,
+    )
+
+    invalidated = await r.invalidate("C07TEAM")
+    second = await r.get("C07TEAM", channel_name="#growth", is_dm=False)
+
+    assert invalidated is True
+    assert first is not second
+    assert second.manifest.status == ChannelStatus.ACTIVE
