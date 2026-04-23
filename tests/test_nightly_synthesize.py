@@ -29,6 +29,7 @@ from engram.nightly.synthesize import (
     parse_synthesis_output,
     synthesize,
 )
+from engram.telemetry import configure_logging
 
 
 @dataclass
@@ -349,6 +350,44 @@ async def test_retry_failure_logs_both_raw_outputs_and_aborts(
     assert record.raw_outputs == ["not json", second_raw]
     assert record.raw_output_initial == "not json"
     assert record.raw_output_retry == second_raw
+
+
+@pytest.mark.asyncio
+async def test_retry_failure_writes_raw_outputs_to_nightly_jsonl(tmp_path: Path) -> None:
+    harvest = _write_harvest(tmp_path, [_channel("C07FAILJSONL")])
+    second_raw = json.dumps({"schema_version": 1, "date": "2026-04-22"})
+    factory = _ClientFactory([[("not json", _result()), (second_raw, _result())]])
+    root_logger = logging.getLogger()
+    original_handlers = root_logger.handlers[:]
+    original_level = root_logger.level
+
+    try:
+        configure_logging(tmp_path / "logs", force=True, file_prefix="nightly")
+        with pytest.raises(SynthesisOutputError):
+            await synthesize(
+                harvest,
+                output_root=tmp_path / "nightly",
+                config=NightlyConfig(),
+                contexts_dir=tmp_path / "contexts",
+                anthropic_runtime=AnthropicRuntime(api_key=None, model="sonnet"),
+                budget=_FakeBudget(),
+                client_factory=factory,
+            )
+    finally:
+        for handler in root_logger.handlers:
+            handler.close()
+        root_logger.handlers = original_handlers
+        root_logger.setLevel(original_level)
+
+    log_files = sorted((tmp_path / "logs").glob("nightly-*.jsonl"))
+    assert len(log_files) == 1
+    records = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
+    record = next(item for item in records if item.get("event") == "nightly.parse_fail_final")
+    assert record["channel_id"] == "C07FAILJSONL"
+    assert record["raw_outputs"] == ["not json", second_raw]
+    assert record["raw_output_initial"] == "not json"
+    assert record["raw_output_retry"] == second_raw
+    assert record["error"]
 
 
 @pytest.mark.asyncio
