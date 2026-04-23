@@ -19,6 +19,33 @@ PLIST_SRC="$REPO_ROOT/launchd/com.engram.bridge.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/com.engram.bridge.plist"
 SERVICE_LABEL="com.engram.bridge"
 READY_LOG="/tmp/engram.bridge.out.log"
+NIGHTLY_PLIST_SRC="$REPO_ROOT/launchd/com.engram.v3.nightly.plist"
+NIGHTLY_PLIST_DST="$HOME/Library/LaunchAgents/com.engram.v3.nightly.plist"
+NIGHTLY_SERVICE_LABEL="com.engram.v3.nightly"
+
+MODE="bridge"
+case "${1:-}" in
+    --install-nightly)
+        MODE="nightly"
+        shift
+        ;;
+    --install-bridge|"")
+        [[ "${1:-}" == "--install-bridge" ]] && shift
+        ;;
+    --help|-h)
+        echo "usage: $0 [--install-bridge|--install-nightly]"
+        exit 0
+        ;;
+    *)
+        echo "usage: $0 [--install-bridge|--install-nightly]" >&2
+        exit 2
+        ;;
+esac
+
+if [[ $# -gt 0 ]]; then
+    echo "usage: $0 [--install-bridge|--install-nightly]" >&2
+    exit 2
+fi
 
 # 1. Required binaries
 UV_BIN="$(command -v uv || true)"
@@ -26,6 +53,66 @@ if [[ -z "$UV_BIN" ]]; then
     echo "error: uv not found on PATH. Install with:"
     echo "    curl -LsSf https://astral.sh/uv/install.sh | sh"
     exit 1
+fi
+
+escape_sed_replacement() {
+    printf '%s' "$1" | sed 's/[&|]/\\&/g'
+}
+
+install_nightly() {
+    local wrapper="$REPO_ROOT/scripts/engram_nightly_launchd.sh"
+    local domain="gui/$(id -u)"
+
+    if [[ ! -x "$wrapper" ]]; then
+        echo "error: nightly wrapper is not executable: $wrapper" >&2
+        exit 1
+    fi
+
+    echo "==> repo:      $REPO_ROOT"
+    echo "==> uv:        $UV_BIN"
+    echo "==> plist dst: $NIGHTLY_PLIST_DST"
+
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.engram/logs"
+    sed \
+        -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/uv|$(escape_sed_replacement "$UV_BIN")|g" \
+        -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/engram-repo|$(escape_sed_replacement "$REPO_ROOT")|g" \
+        -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/engram/scripts/engram_nightly_launchd.sh|$(escape_sed_replacement "$wrapper")|g" \
+        -e "s|/REPLACE/WITH/HOME|$(escape_sed_replacement "$HOME")|g" \
+        "$NIGHTLY_PLIST_SRC" > "$NIGHTLY_PLIST_DST"
+    echo "==> wrote $NIGHTLY_PLIST_DST"
+
+    if launchctl list | grep -q "$NIGHTLY_SERVICE_LABEL"; then
+        echo "==> unloading existing nightly job…"
+        launchctl bootout "$domain/$NIGHTLY_SERVICE_LABEL" 2>/dev/null \
+            || launchctl bootout "$domain" "$NIGHTLY_PLIST_DST" 2>/dev/null \
+            || launchctl unload "$NIGHTLY_PLIST_DST" 2>/dev/null \
+            || true
+        sleep 1
+    fi
+
+    echo "==> loading nightly job…"
+    launchctl bootstrap "$domain" "$NIGHTLY_PLIST_DST" 2>/dev/null \
+        || launchctl load "$NIGHTLY_PLIST_DST"
+    launchctl enable "$domain/$NIGHTLY_SERVICE_LABEL" 2>/dev/null || true
+
+    if ! launchctl list | grep -q "$NIGHTLY_SERVICE_LABEL"; then
+        echo "error: nightly job did not register with launchctl" >&2
+        exit 1
+    fi
+
+    echo ""
+    echo "✓ nightly job loaded: $NIGHTLY_SERVICE_LABEL"
+    echo ""
+    echo "Schedule: daily at 02:00 local; wrapper adds --weekly on Mondays."
+    echo "Manual run:"
+    echo "    launchctl kickstart $domain/$NIGHTLY_SERVICE_LABEL"
+    echo "Logs:"
+    echo "    tail -f $HOME/.engram/logs/nightly-stdio-\$(date +%F).log"
+}
+
+if [[ "$MODE" == "nightly" ]]; then
+    install_nightly
+    exit 0
 fi
 
 echo "==> repo:      $REPO_ROOT"

@@ -1,6 +1,7 @@
 """End-to-end nightly pipeline orchestration."""
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -52,6 +53,7 @@ class ApplyFunc(Protocol):
         *,
         db_path: Path,
         config_path: Path,
+        dry_run: bool,
         summary_trigger: str,
         clock: Callable[[], datetime],
     ) -> Awaitable[ApplyResult]:
@@ -60,7 +62,9 @@ class ApplyFunc(Protocol):
 
 async def run_nightly_pipeline(
     *,
+    dry_run: bool = False,
     weekly: bool = False,
+    verbose: bool = False,
     target_date: date | None = None,
     db_path: Path | None = None,
     output_root: Path | None = None,
@@ -80,15 +84,43 @@ async def run_nightly_pipeline(
     cfg_path = config_path.expanduser()
     cfg = load_nightly_config(cfg_path)
     run_date = target_date or clock().date()
+    run_date_text = run_date.isoformat()
 
     cost_usd = 0.0
     channels_covered = 0
 
+    _verbose_event(
+        verbose,
+        "nightly.harvest_started",
+        phase="harvest",
+        date=run_date_text,
+        trigger="nightly",
+        dry_run=dry_run,
+    )
     daily_harvest = harvest_func(
         db_path=memory_db,
         output_root=nightly_root,
         target_date=run_date,
         config=cfg,
+    )
+    _verbose_event(
+        verbose,
+        "nightly.harvest_completed",
+        phase="harvest",
+        date=run_date_text,
+        trigger="nightly",
+        output_path=str(daily_harvest.output_path),
+        channels=len(daily_harvest.payload.get("channels") or []),
+        skipped_channels=len(daily_harvest.payload.get("skipped_channels") or []),
+        dry_run=dry_run,
+    )
+    _verbose_event(
+        verbose,
+        "nightly.synthesis_started",
+        phase="synthesis",
+        date=run_date_text,
+        trigger="nightly",
+        dry_run=dry_run,
     )
     daily_synthesis = await synthesize_func(
         daily_harvest.output_path,
@@ -97,12 +129,42 @@ async def run_nightly_pipeline(
         weekly=False,
         config=cfg,
     )
+    _verbose_event(
+        verbose,
+        "nightly.synthesis_completed",
+        phase="synthesis",
+        date=run_date_text,
+        trigger="nightly",
+        output_path=str(daily_synthesis.output_path),
+        channels=len(daily_synthesis.payload.get("channels") or []),
+        skipped_channels=len(daily_synthesis.payload.get("skipped_channels") or []),
+        dry_run=dry_run,
+    )
+    _verbose_event(
+        verbose,
+        "nightly.apply_started",
+        phase="apply",
+        date=run_date_text,
+        trigger="nightly",
+        dry_run=dry_run,
+    )
     daily_apply = await apply_func(
         daily_synthesis.output_path,
         db_path=memory_db,
         config_path=cfg_path,
+        dry_run=dry_run,
         summary_trigger="nightly",
         clock=clock,
+    )
+    _verbose_event(
+        verbose,
+        "nightly.apply_completed",
+        phase="apply",
+        date=run_date_text,
+        trigger="nightly",
+        rows_written=daily_apply.rows_written,
+        rows_queued=daily_apply.rows_queued,
+        dry_run=dry_run,
     )
     cost_usd += _payload_cost(daily_synthesis.payload)
     channels_covered += daily_apply.rows_written
@@ -118,11 +180,38 @@ async def run_nightly_pipeline(
 
     weekly_payload: dict[str, Any] | None = None
     if weekly:
+        _verbose_event(
+            verbose,
+            "nightly.harvest_started",
+            phase="weekly-harvest",
+            date=run_date_text,
+            trigger="nightly-weekly",
+            dry_run=dry_run,
+        )
         weekly_harvest = weekly_harvest_func(
             db_path=memory_db,
             output_root=nightly_root,
             target_date=run_date,
             config=cfg,
+        )
+        _verbose_event(
+            verbose,
+            "nightly.harvest_completed",
+            phase="weekly-harvest",
+            date=run_date_text,
+            trigger="nightly-weekly",
+            output_path=str(weekly_harvest.output_path),
+            channels=len(weekly_harvest.payload.get("channels") or []),
+            skipped_channels=len(weekly_harvest.payload.get("skipped_channels") or []),
+            dry_run=dry_run,
+        )
+        _verbose_event(
+            verbose,
+            "nightly.synthesis_started",
+            phase="synthesis",
+            date=run_date_text,
+            trigger="nightly-weekly",
+            dry_run=dry_run,
         )
         weekly_synthesis = await synthesize_func(
             weekly_harvest.output_path,
@@ -133,12 +222,42 @@ async def run_nightly_pipeline(
         )
         _attach_weekly_source_row_ids(weekly_synthesis.payload, weekly_harvest.payload)
         write_json(weekly_synthesis.output_path, weekly_synthesis.payload)
+        _verbose_event(
+            verbose,
+            "nightly.synthesis_completed",
+            phase="synthesis",
+            date=run_date_text,
+            trigger="nightly-weekly",
+            output_path=str(weekly_synthesis.output_path),
+            channels=len(weekly_synthesis.payload.get("channels") or []),
+            skipped_channels=len(weekly_synthesis.payload.get("skipped_channels") or []),
+            dry_run=dry_run,
+        )
+        _verbose_event(
+            verbose,
+            "nightly.apply_started",
+            phase="apply",
+            date=run_date_text,
+            trigger="nightly-weekly",
+            dry_run=dry_run,
+        )
         weekly_apply = await apply_func(
             weekly_synthesis.output_path,
             db_path=memory_db,
             config_path=cfg_path,
+            dry_run=dry_run,
             summary_trigger="nightly-weekly",
             clock=clock,
+        )
+        _verbose_event(
+            verbose,
+            "nightly.apply_completed",
+            phase="apply",
+            date=run_date_text,
+            trigger="nightly-weekly",
+            rows_written=weekly_apply.rows_written,
+            rows_queued=weekly_apply.rows_queued,
+            dry_run=dry_run,
         )
         cost_usd += _payload_cost(weekly_synthesis.payload)
         channels_covered += weekly_apply.rows_written
@@ -184,6 +303,12 @@ async def run_nightly_pipeline(
     if weekly_payload is not None:
         result["weekly"] = weekly_payload
     return result
+
+
+def _verbose_event(enabled: bool, event: str, **fields: Any) -> None:
+    if not enabled:
+        return
+    logging.getLogger("engram.nightly").info(event, extra=fields)
 
 
 def _payload_cost(payload: dict[str, Any]) -> float:

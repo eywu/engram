@@ -195,10 +195,20 @@ def run() -> None:
 
 @app.command()
 def nightly(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Run the full nightly pipeline without writing summaries to memory.db.",
+    ),
     weekly: bool = typer.Option(
         False,
         "--weekly",
         help="After the daily run, synthesize the seven daily rows ending on this date.",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        help="Emit per-phase structured progress events to the console.",
     ),
     target_date: str | None = typer.Option(
         None,
@@ -210,7 +220,14 @@ def nightly(
     from engram.nightly import run_configured_nightly
 
     parsed_date = _parse_cli_date(target_date)
-    result = asyncio.run(run_configured_nightly(weekly=weekly, target_date=parsed_date))
+    result = asyncio.run(
+        run_configured_nightly(
+            dry_run=dry_run,
+            weekly=weekly,
+            verbose=verbose,
+            target_date=parsed_date,
+        )
+    )
     raise typer.Exit(result.exit_code)
 
 

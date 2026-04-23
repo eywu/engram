@@ -47,13 +47,20 @@ def nightly_log_path(
 
 async def run_configured_nightly(
     *,
+    dry_run: bool = False,
     weekly: bool = False,
+    verbose: bool = False,
     target_date: datetime.date | None = None,
 ) -> NightlyRunResult:
     async def configured_synthesize() -> dict[str, Any]:
         from engram.nightly.pipeline import run_nightly_pipeline
 
-        return await run_nightly_pipeline(weekly=weekly, target_date=target_date)
+        return await run_nightly_pipeline(
+            dry_run=dry_run,
+            weekly=weekly,
+            verbose=verbose,
+            target_date=target_date,
+        )
 
     return await run_nightly(
         synthesize=configured_synthesize,
