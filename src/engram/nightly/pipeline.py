@@ -285,7 +285,7 @@ async def run_nightly_pipeline(
         run_date=run_date,
         output_root=nightly_root,
         artifacts=report_artifacts,
-        suppress_slack=cfg.report.suppress,
+        suppress_slack=cfg.report.suppress or dry_run,
         success_dm=configured_success_dm,
     )
 
