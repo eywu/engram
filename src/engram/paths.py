@@ -18,6 +18,7 @@ Single source of truth for where things live on disk:
             memory/                    # channel's persistent notes
       state/                # cost ledger, routing state, etc.
       logs/                 # structured logs
+      nightly/              # nightly heartbeat / run state
 """
 from __future__ import annotations
 
@@ -84,3 +85,11 @@ def state_dir(home: Path | None = None) -> Path:
 
 def log_dir(home: Path | None = None) -> Path:
     return engram_home(home) / "logs"
+
+
+def nightly_dir(home: Path | None = None) -> Path:
+    return engram_home(home) / "nightly"
+
+
+def nightly_heartbeat_path(home: Path | None = None) -> Path:
+    return nightly_dir(home) / "last-run.json"

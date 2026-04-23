@@ -20,9 +20,10 @@ logger = logging.getLogger("engram.telemetry")
 class DailyJSONLogHandler(logging.Handler):
     """Write log records to ~/.engram/logs/engram-YYYY-MM-DD.jsonl."""
 
-    def __init__(self, log_dir: Path):
+    def __init__(self, log_dir: Path, *, file_prefix: str = "engram"):
         super().__init__()
         self.log_dir = log_dir
+        self.file_prefix = file_prefix
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
@@ -30,7 +31,7 @@ class DailyJSONLogHandler(logging.Handler):
         try:
             line = self.format(record)
             today = datetime.datetime.now(datetime.UTC).date().isoformat()
-            path = self.log_dir / f"engram-{today}.jsonl"
+            path = self.log_dir / f"{self.file_prefix}-{today}.jsonl"
             with self._lock, path.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except Exception:
@@ -42,6 +43,7 @@ def configure_logging(
     *,
     level: int = logging.INFO,
     force: bool = False,
+    file_prefix: str = "engram",
 ) -> None:
     """Configure JSON logs to daily files and stdout.
 
@@ -79,7 +81,7 @@ def configure_logging(
         foreign_pre_chain=shared_processors,
     )
 
-    file_handler = DailyJSONLogHandler(log_dir)
+    file_handler = DailyJSONLogHandler(log_dir, file_prefix=file_prefix)
     file_handler.setFormatter(formatter)
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setFormatter(formatter)

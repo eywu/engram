@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -69,3 +70,73 @@ def test_status_json_includes_channel_mcp_policy(isolated_home: Path):
     )
     assert channel["mcp"]["strict_mode"] is True
     assert channel["mcp"]["servers"] == ["linear"]
+
+
+def test_status_surfaces_recent_nightly_heartbeat(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 4, 22, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("engram.cli._utc_now", lambda: now)
+    heartbeat_dir = isolated_home / "nightly"
+    heartbeat_dir.mkdir(parents=True)
+    (heartbeat_dir / "last-run.json").write_text(
+        json.dumps(
+            {
+                "started_at": (now - timedelta(hours=2, minutes=5)).isoformat(),
+                "completed_at": (now - timedelta(hours=2)).isoformat(),
+                "phase_reached": "synthesize",
+                "exit_code": 0,
+                "cost_usd": 0.01,
+                "channels_covered": 2,
+                "error_msg": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["status"])
+
+    assert result.exit_code == 0
+    assert "nightly: last ran 2h ago ✓" in result.output
+
+    json_result = CliRunner().invoke(app, ["status", "--json"])
+    payload = json.loads(json_result.output)
+    assert payload["nightly"]["state"] == "ok"
+    assert payload["nightly"]["stale"] is False
+    assert payload["nightly"]["age_hours"] == 2.0
+
+
+def test_status_surfaces_stale_nightly_heartbeat(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 4, 22, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("engram.cli._utc_now", lambda: now)
+    heartbeat_dir = isolated_home / "nightly"
+    heartbeat_dir.mkdir(parents=True)
+    (heartbeat_dir / "last-run.json").write_text(
+        json.dumps(
+            {
+                "started_at": (now - timedelta(hours=72, minutes=5)).isoformat(),
+                "completed_at": (now - timedelta(hours=72)).isoformat(),
+                "phase_reached": "synthesize",
+                "exit_code": 0,
+                "cost_usd": 0.01,
+                "channels_covered": 2,
+                "error_msg": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["status"])
+
+    assert result.exit_code == 0
+    assert "nightly: stale (72h) ⚠️" in result.output
+
+    json_result = CliRunner().invoke(app, ["status", "--json"])
+    payload = json.loads(json_result.output)
+    assert payload["nightly"]["state"] == "stale"
+    assert payload["nightly"]["stale"] is True
+    assert payload["nightly"]["age_hours"] == 72.0

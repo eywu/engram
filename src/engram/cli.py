@@ -27,7 +27,7 @@ from engram.mcp_tools import (
     MEMORY_SEARCH_SERVER_NAME,
     memory_tool_metrics,
 )
-from engram.paths import contexts_dir, engram_home
+from engram.paths import contexts_dir, engram_home, nightly_heartbeat_path
 from engram.runtime import health_path, pid_path, status_path
 from engram.telemetry import process_exists, read_json
 
@@ -69,6 +69,8 @@ def status(
         rprint("[bold]Bridge[/bold] not running")
     if snapshot.get("config_error"):
         rprint(f"[yellow]Config[/yellow] {snapshot['config_error']}")
+    nightly = snapshot["nightly"]
+    rprint(f"nightly: {nightly['summary']}")
     rprint()
 
     memory = snapshot["memory"]
@@ -191,6 +193,15 @@ def run() -> None:
 
 
 @app.command()
+def nightly() -> None:
+    """Run nightly synthesis with heartbeat/log observability."""
+    from engram.nightly import run_configured_nightly
+
+    result = asyncio.run(run_configured_nightly())
+    raise typer.Exit(result.exit_code)
+
+
+@app.command()
 def setup() -> None:
     """Interactive setup wizard for first-time configuration."""
     from engram.setup_wizard import run_wizard
@@ -228,6 +239,7 @@ def _build_status_snapshot() -> dict[str, Any]:
             "pid": pid,
             "health": read_json(health_path(paths.state_dir)),
         },
+        "nightly": _nightly_status(home),
         "channels": channels,
         "memory": memory,
     }
@@ -247,6 +259,82 @@ def _fallback_paths() -> PathsConfig:
         contexts_dir=home / "contexts",
         log_dir=home / "logs",
     )
+
+
+def _nightly_status(home: Path) -> dict[str, Any]:
+    path = nightly_heartbeat_path(home)
+    heartbeat = read_json(path)
+    base: dict[str, Any] = {
+        "heartbeat_path": str(path),
+        "heartbeat": heartbeat,
+        "state": "missing",
+        "stale": False,
+        "age_hours": None,
+        "summary": "no heartbeat",
+    }
+    if heartbeat is None:
+        return base
+
+    completed_at = _parse_iso_datetime(heartbeat.get("completed_at"))
+    if completed_at is None:
+        phase = heartbeat.get("phase_reached") or "unknown"
+        exit_code = heartbeat.get("exit_code")
+        if exit_code not in (None, 0):
+            base.update(
+                {
+                    "state": "failed",
+                    "summary": f"failed at phase={phase} exit={exit_code} ⚠️",
+                }
+            )
+        else:
+            base.update({"state": "incomplete", "summary": "incomplete ⚠️"})
+        return base
+
+    age = max(
+        0.0,
+        (_utc_now() - completed_at.astimezone(datetime.UTC)).total_seconds(),
+    )
+    age_hours = age / 3600
+    base["age_hours"] = round(age_hours, 2)
+    if age_hours > 36:
+        base.update(
+            {
+                "state": "stale",
+                "stale": True,
+                "summary": f"stale ({_format_age(age)}) ⚠️",
+            }
+        )
+    else:
+        base.update(
+            {
+                "state": "ok",
+                "summary": f"last ran {_format_age(age)} ago ✓",
+            }
+        )
+    return base
+
+
+def _utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC)
+
+
+def _parse_iso_datetime(raw: object) -> datetime.datetime | None:
+    if not isinstance(raw, str):
+        return None
+    normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        value = datetime.datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=datetime.UTC)
+    return value.astimezone(datetime.UTC)
+
+
+def _format_age(seconds: float) -> str:
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    return f"{int(seconds // 3600)}h"
 
 
 def _cost_db_path(paths: PathsConfig) -> Path:
