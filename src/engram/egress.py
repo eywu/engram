@@ -2,7 +2,7 @@
 
 M1 scope:
   - Post the response text to the originating channel/thread.
-  - Chunk if message exceeds Slack's 40k-char limit.
+  - Chunk if message exceeds Slack's markdown block limit.
   - Log cost/duration for dev visibility.
 
 Later: redaction, attachment upload, block-kit formatting, per-channel
@@ -20,7 +20,7 @@ from engram.hitl import PendingQuestion
 
 log = logging.getLogger(__name__)
 
-SLACK_MAX_TEXT_LEN = 39_000  # stay well under the 40k limit
+SLACK_MAX_TEXT_LEN = 12_000  # Slack markdown blocks cap text at 12,000 chars
 
 
 @dataclass
@@ -43,14 +43,18 @@ async def post_reply(
     CommonMark emitted by the model renders cleanly in Slack clients.
     """
     text = turn.text or "(empty reply)"
-    chunks = _chunk_text(text, SLACK_MAX_TEXT_LEN)
+    footer = ""
+    if turn.cost_usd is not None:
+        footer = f"\n\ncost: ${turn.cost_usd:.4f} · {turn.duration_ms or 0}ms"
+    chunk_limit = max(1, SLACK_MAX_TEXT_LEN - len(footer)) if footer else SLACK_MAX_TEXT_LEN
+    chunks = _chunk_text(text, chunk_limit)
     posted_ts: str | None = None
     n = 0
     for i, chunk in enumerate(chunks):
         # Keep the cost footer plain text; only the model body relies on markdown conversion.
         body = chunk
-        if i == len(chunks) - 1 and turn.cost_usd is not None:
-            body = f"{chunk}\n\ncost: ${turn.cost_usd:.4f} · {turn.duration_ms or 0}ms"
+        if i == len(chunks) - 1 and footer:
+            body = f"{chunk}{footer}"
         resp = await slack_client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,

@@ -135,6 +135,32 @@ async def test_post_reply_chunks_long_text():
 
 
 @pytest.mark.asyncio
+async def test_reply_chunks_within_slack_markdown_block_limit():
+    """Slack's markdown block caps text at 12,000 chars; chunker must respect that."""
+    slack = FakeSlackClient()
+    long_text = "a" * 20_000
+    turn = AgentTurn(
+        text=long_text,
+        cost_usd=None,
+        duration_ms=None,
+        num_turns=1,
+        is_error=False,
+    )
+
+    await post_reply(
+        slack,
+        "C07TEST123",
+        turn,
+        thread_ts=None,
+        session_label="ch:C1",
+    )
+
+    for call in slack.post_calls:
+        md_text = call["blocks"][0]["text"]
+        assert len(md_text) <= SLACK_MAX_TEXT_LEN
+
+
+@pytest.mark.asyncio
 async def test_reply_preserves_thread_ts():
     slack = FakeSlackClient()
     turn = AgentTurn(

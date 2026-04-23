@@ -292,5 +292,9 @@ async def test_pending_channel_full_bounce_without_restart(tmp_path: Path):
         "U07REQUESTER",
         ChannelStatus.ACTIVE,
     )
-    assert len(say_calls) == 1
-    assert say_calls[0]["text"] == "bot reply"
+    assert say_calls == []
+    assert len(slack.post_calls) == 3
+    agent_post = slack.post_calls[2]
+    assert agent_post["channel"] == "C07TEST123"
+    assert agent_post["blocks"] == [{"type": "markdown", "text": "bot reply"}]
+    assert agent_post["text"] == "bot reply"
