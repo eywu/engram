@@ -50,6 +50,7 @@ def test_nightly_config_defaults():
     assert cfg.excluded_channels == ()
     assert cfg.model is None
     assert cfg.daily_cost_cap_usd == 10.0
+    assert cfg.report.suppress is False
 
 
 def test_load_from_yaml(tmp_path, clean_env):
@@ -68,6 +69,7 @@ def test_load_from_yaml(tmp_path, clean_env):
                 "excluded_channels": ["C07SKIP", "C07SKIP", "C07OTHER"],
                 "model": "sonnet",
                 "daily_cost_cap_usd": 12.50,
+                "report": {"suppress": True},
             },
         },
     )
@@ -86,6 +88,7 @@ def test_load_from_yaml(tmp_path, clean_env):
     assert cfg.nightly.excluded_channels == ("C07SKIP", "C07OTHER")
     assert cfg.nightly.model == "sonnet"
     assert cfg.nightly.daily_cost_cap_usd == 12.5
+    assert cfg.nightly.report.suppress is True
 
 
 def test_load_nightly_config_does_not_require_runtime_secrets(tmp_path, clean_env):
@@ -99,6 +102,7 @@ def test_load_nightly_config_does_not_require_runtime_secrets(tmp_path, clean_en
                 "excluded_channels": ["C07SKIP"],
                 "model": "opus",
                 "daily_cost_cap_usd": 3,
+                "report": {"suppress": True},
             },
         },
     )
@@ -111,6 +115,7 @@ def test_load_nightly_config_does_not_require_runtime_secrets(tmp_path, clean_en
     assert cfg.excluded_channels == ("C07SKIP",)
     assert cfg.model == "opus"
     assert cfg.daily_cost_cap_usd == 3.0
+    assert cfg.report.suppress is True
 
 
 def test_env_fallback(tmp_path, clean_env, monkeypatch):

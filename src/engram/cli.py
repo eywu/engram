@@ -14,6 +14,7 @@ from typing import Any
 import typer
 from rich import print as rprint
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from engram import __version__
@@ -122,7 +123,7 @@ def cost(
         table.add_column("cost", justify="right")
         for channel_id, total in result.per_channel.items():
             table.add_row(
-                channel_id,
+                escape(_cost_channel_label(channel_id)),
                 str(total.turn_count),
                 f"${total.total_cost_usd:.4f}",
             )
@@ -362,6 +363,12 @@ def _cost_db_path(paths: PathsConfig) -> Path:
     if paths.log_dir.name == "logs":
         return paths.log_dir.parent / "cost.db"
     return paths.state_dir.parent / "cost.db"
+
+
+def _cost_channel_label(channel_id: str) -> str:
+    if channel_id == "__nightly__":
+        return "[nightly-synthesis]"
+    return channel_id
 
 
 def _merge_channels(

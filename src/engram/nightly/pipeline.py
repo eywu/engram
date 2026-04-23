@@ -9,6 +9,12 @@ from typing import Any, Protocol
 from engram.config import DEFAULT_CONFIG_PATH, NightlyConfig, load_nightly_config
 from engram.nightly.apply import ApplyResult, apply_synthesis
 from engram.nightly.harvest import HarvestResult, run_harvest, run_weekly_harvest
+from engram.nightly.report import (
+    ReportArtifact,
+    SuccessDMPoster,
+    post_configured_success_dm,
+    write_report_and_notify,
+)
 from engram.nightly.synthesize import SynthesisResult, synthesize
 from engram.paths import engram_home
 from engram.telemetry import write_json
@@ -64,6 +70,7 @@ async def run_nightly_pipeline(
     weekly_harvest_func: HarvestFunc = run_weekly_harvest,
     synthesize_func: SynthesizeFunc = synthesize,
     apply_func: ApplyFunc = apply_synthesis,
+    success_dm: SuccessDMPoster | None = None,
 ) -> dict[str, Any]:
     """Run daily nightly work, optionally followed by weekly meta-synthesis."""
     clock = clock or (lambda: datetime.now(UTC))
@@ -99,6 +106,15 @@ async def run_nightly_pipeline(
     )
     cost_usd += _payload_cost(daily_synthesis.payload)
     channels_covered += daily_apply.rows_written
+    report_artifacts = [
+        ReportArtifact(
+            trigger="nightly",
+            harvest_path=daily_harvest.output_path,
+            synthesis_path=daily_synthesis.output_path,
+            rows_written=daily_apply.rows_written,
+            payload=daily_synthesis.payload,
+        )
+    ]
 
     weekly_payload: dict[str, Any] | None = None
     if weekly:
@@ -126,15 +142,39 @@ async def run_nightly_pipeline(
         )
         cost_usd += _payload_cost(weekly_synthesis.payload)
         channels_covered += weekly_apply.rows_written
+        report_artifacts.append(
+            ReportArtifact(
+                trigger="nightly-weekly",
+                harvest_path=weekly_harvest.output_path,
+                synthesis_path=weekly_synthesis.output_path,
+                rows_written=weekly_apply.rows_written,
+                payload=weekly_synthesis.payload,
+            )
+        )
         weekly_payload = {
             "harvest_path": str(weekly_harvest.output_path),
             "synthesis_path": str(weekly_synthesis.output_path),
             "rows_written": weekly_apply.rows_written,
         }
 
+    configured_success_dm = success_dm
+    if configured_success_dm is None:
+        async def configured_success_dm(text: str) -> None:
+            await post_configured_success_dm(text, config_path=cfg_path)
+
+    report = await write_report_and_notify(
+        run_date=run_date,
+        output_root=nightly_root,
+        artifacts=report_artifacts,
+        suppress_slack=cfg.report.suppress,
+        success_dm=configured_success_dm,
+    )
+
     result: dict[str, Any] = {
         "cost_usd": cost_usd,
         "channels_covered": channels_covered,
+        "flags": report.flag_count,
+        "report_path": str(report.report_path),
         "daily": {
             "harvest_path": str(daily_harvest.output_path),
             "synthesis_path": str(daily_synthesis.output_path),

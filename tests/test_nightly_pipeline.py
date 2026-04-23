@@ -160,6 +160,91 @@ async def test_weekly_pipeline_runs_daily_first_and_includes_todays_row(
     ]
     assert weekly_texts_seen[-1] == "nightly summary"
     assert result["channels_covered"] == 2
+    assert Path(result["report_path"]).exists()
+
+
+async def test_pipeline_report_suppress_skips_success_dm(tmp_path: Path) -> None:
+    db_path = tmp_path / "memory.db"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("nightly:\n  report:\n    suppress: true\n", encoding="utf-8")
+    run_date = date(2026, 4, 22)
+    posts: list[str] = []
+
+    def fake_harvest(**kwargs: Any) -> HarvestResult:
+        output_root = kwargs["output_root"]
+        path = output_root / run_date.isoformat() / "harvest.json"
+        payload = {
+            "date": run_date.isoformat(),
+            "channels": [{"channel_id": "C07TEST123", "rows": []}],
+            "skipped_channels": [],
+        }
+        write_json(path, payload)
+        return HarvestResult(output_path=path, payload=payload)
+
+    async def fake_synthesize(
+        harvest_json: Path,
+        *,
+        output_root: Path,
+        **_: Any,
+    ) -> SynthesisResult:
+        path = output_root / "archive" / run_date.isoformat() / "synthesis.json"
+        payload = {
+            "date": run_date.isoformat(),
+            "trigger": "nightly",
+            "channels": [
+                {
+                    "channel_id": "C07TEST123",
+                    "status": "synthesized",
+                    "cost_usd": "0.040000",
+                    "row_count": 1,
+                    "token_count": 5,
+                    "synthesis": {
+                        "summary": "nightly summary",
+                        "highlights": [],
+                        "decisions": [],
+                        "action_items": [{"text": "follow up"}],
+                        "open_questions": [],
+                    },
+                }
+            ],
+            "skipped_channels": [],
+            "totals": {"cost_usd": "0.040000"},
+            "harvest_path": str(harvest_json),
+        }
+        write_json(path, payload)
+        return SynthesisResult(output_path=path, payload=payload)
+
+    async def fake_apply(synthesis_json: Path, **_: Any) -> ApplyResult:
+        payload = json.loads(synthesis_json.read_text(encoding="utf-8"))
+        return ApplyResult(
+            output_path=None,
+            rows_written=1,
+            rows_queued=0,
+            dry_run=False,
+            payload=payload,
+        )
+
+    async def success_dm(text: str) -> None:
+        posts.append(text)
+
+    result = await run_nightly_pipeline(
+        target_date=run_date,
+        db_path=db_path,
+        output_root=tmp_path / "nightly",
+        config_path=config_path,
+        clock=lambda: datetime(2026, 4, 22, 23, tzinfo=UTC),
+        harvest_func=fake_harvest,
+        synthesize_func=fake_synthesize,
+        apply_func=fake_apply,
+        success_dm=success_dm,
+    )
+
+    report_path = Path(result["report_path"])
+    assert posts == []
+    assert report_path == tmp_path / "nightly" / "archive" / "2026-04-22" / "report.md"
+    report = report_path.read_text(encoding="utf-8")
+    assert "C07TEST123" in report
+    assert "$0.0400" in report
 
 
 def _seed_summary(

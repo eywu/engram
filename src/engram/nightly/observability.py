@@ -18,6 +18,7 @@ from typing import Any
 from slack_sdk.web.async_client import AsyncWebClient
 
 from engram.config import EngramConfig
+from engram.nightly.report import format_failure_dm
 from engram.paths import engram_home, log_dir, nightly_heartbeat_path
 from engram.telemetry import configure_logging, write_json
 
@@ -42,15 +43,6 @@ def nightly_log_path(
 ) -> Path:
     ts = now or datetime.datetime.now(datetime.UTC)
     return (logs_dir or log_dir()) / f"nightly-{ts.astimezone(datetime.UTC).date().isoformat()}.jsonl"
-
-
-def format_failure_dm(*, phase: str | None, exit_code: int | None, log_path: Path) -> str:
-    phase_text = phase or "unknown"
-    exit_text = exit_code if exit_code is not None else "unknown"
-    return (
-        f"⚠️ Engram nightly FAILED at phase={phase_text}, exit={exit_text}. "
-        f"Logs: `{log_path}`."
-    )
 
 
 async def run_configured_nightly(

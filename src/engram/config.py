@@ -105,6 +105,19 @@ class EmbeddingsConfig:
 
 
 @dataclass(frozen=True)
+class NightlyReportConfig:
+    suppress: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "suppress", _bool(self.suppress))
+
+    @classmethod
+    def from_mapping(cls, raw: dict | None) -> NightlyReportConfig:
+        raw = raw or {}
+        return cls(suppress=raw.get("suppress", False))
+
+
+@dataclass(frozen=True)
 class NightlyConfig:
     dedup_overlap: float = 0.85
     min_evidence: int = 10
@@ -112,6 +125,7 @@ class NightlyConfig:
     excluded_channels: tuple[str, ...] = field(default_factory=tuple)
     model: str | None = None
     daily_cost_cap_usd: float = 10.0
+    report: NightlyReportConfig = field(default_factory=NightlyReportConfig)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -136,6 +150,10 @@ class NightlyConfig:
             "daily_cost_cap_usd",
             max(0.0, float(self.daily_cost_cap_usd)),
         )
+        report = self.report
+        if not isinstance(report, NightlyReportConfig):
+            report = NightlyReportConfig.from_mapping(report if isinstance(report, dict) else None)
+        object.__setattr__(self, "report", report)
 
     @classmethod
     def from_mapping(cls, raw: dict | None) -> NightlyConfig:
@@ -147,6 +165,7 @@ class NightlyConfig:
             excluded_channels=tuple(_string_list(raw.get("excluded_channels"))),
             model=raw.get("model"),
             daily_cost_cap_usd=raw.get("daily_cost_cap_usd", 10.0),
+            report=NightlyReportConfig.from_mapping(raw.get("report")),
         )
 
 

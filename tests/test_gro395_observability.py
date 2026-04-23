@@ -190,6 +190,31 @@ def test_engram_cost_by_channel_sums_to_total(isolated_home: Path):
     assert sum(amounts[:-1]) == pytest.approx(total_amount)
 
 
+def test_engram_cost_by_channel_labels_nightly_synthesis(isolated_home: Path):
+    db = CostDatabase(isolated_home / "cost.db")
+    db.record_turn(
+        TurnCost(
+            timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
+            session_label="nightly",
+            session_id="s-nightly",
+            channel_id="__nightly__",
+            is_dm=False,
+            cost_usd=0.12,
+            duration_ms=1,
+            num_turns=1,
+            user_text_len=0,
+            chunks_posted=0,
+            is_error=False,
+        )
+    )
+
+    result = CliRunner().invoke(app, ["cost", "--by-channel"])
+
+    assert result.exit_code == 0
+    assert "[nightly-synthesis]" in result.output
+    assert "__nightly__" not in result.output
+
+
 @pytest.mark.asyncio
 async def test_rate_limit_allowed_warning_fires_dm_and_continues(tmp_path: Path):
     session = SessionState(channel_id="C07TEST123")
