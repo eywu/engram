@@ -59,6 +59,50 @@ escape_sed_replacement() {
     printf '%s' "$1" | sed 's/[&|]/\\&/g'
 }
 
+resolve_absolute_path() {
+    local path="$1"
+
+    if [[ "$path" == "~/"* ]]; then
+        path="$HOME/${path#"~/"}"
+    elif [[ "$path" == "~" ]]; then
+        path="$HOME"
+    fi
+
+    if [[ "$path" != /* ]]; then
+        path="$PWD/$path"
+    fi
+
+    local dir
+    dir="$(cd "$(dirname "$path")" && pwd)"
+    printf '%s/%s\n' "$dir" "$(basename "$path")"
+}
+
+resolve_bridge_env_file() {
+    local candidate
+
+    if [[ -n "${ENGRAM_ENV_FILE:-}" ]]; then
+        candidate="$(resolve_absolute_path "$ENGRAM_ENV_FILE")"
+        if [[ ! -f "$candidate" ]]; then
+            echo "error: ENGRAM_ENV_FILE is set but does not exist: $candidate" >&2
+            echo "Set ENGRAM_ENV_FILE to a readable .env file or run 'engram setup'." >&2
+            exit 1
+        fi
+        printf '%s\n' "$candidate"
+        return
+    fi
+
+    for candidate in "$HOME/.engram/.env" "$REPO_ROOT/.env"; do
+        if [[ -f "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+
+    echo "error: could not find an Engram env file for launchd." >&2
+    echo "Set ENGRAM_ENV_FILE to your secrets file, or run 'engram setup' to create ~/.engram/.env before installing launchd." >&2
+    exit 1
+}
+
 install_nightly() {
     local wrapper="$REPO_ROOT/scripts/engram_nightly_launchd.sh"
     local domain="gui/$(id -u)"
@@ -119,6 +163,9 @@ echo "==> repo:      $REPO_ROOT"
 echo "==> uv:        $UV_BIN"
 echo "==> plist dst: $PLIST_DST"
 
+BRIDGE_ENV_FILE="$(resolve_bridge_env_file)"
+echo "==> env file:  $BRIDGE_ENV_FILE"
+
 # 2. Render the plist
 mkdir -p "$HOME/Library/LaunchAgents"
 cat > "$PLIST_DST" <<PLIST
@@ -152,6 +199,8 @@ cat > "$PLIST_DST" <<PLIST
         <string>en_US.UTF-8</string>
         <key>HOME</key>
         <string>$HOME</string>
+        <key>ENGRAM_ENV_FILE</key>
+        <string>$BRIDGE_ENV_FILE</string>
     </dict>
 
     <key>RunAtLoad</key>

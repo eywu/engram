@@ -212,6 +212,19 @@ go to `/tmp/engram.bridge.out.log` and `/tmp/engram.bridge.err.log`.
 The installed bridge plist also raises launchd's soft open-file limit to
 `4096` so the service has headroom above macOS's low default of `256`.
 
+During install, the script resolves one secrets file for the bridge and
+writes its absolute path into the plist as `ENGRAM_ENV_FILE`. Resolution
+order is:
+
+1. `$ENGRAM_ENV_FILE` from the shell running the installer
+2. `~/.engram/.env`
+3. `<repo>/.env`
+
+That pinned `ENGRAM_ENV_FILE` is how the launchd-managed bridge receives
+`ANTHROPIC_API_KEY` and other secrets after `launchctl kickstart -k`,
+reboots, or crashes. If none of those files exists, the installer stops
+and tells you to either export `ENGRAM_ENV_FILE` or run `engram setup`.
+
 ### Nightly memory synthesis (also recommended)
 
 ```bash
@@ -279,16 +292,23 @@ directory), point Engram at it with:
 export ENGRAM_ENV_FILE=~/secrets/engram.env
 ```
 
-For `launchd`, add it to `~/Library/LaunchAgents/com.engram.bridge.plist`
-inside the `EnvironmentVariables` dict:
+Foreground CLI runs use the lookup order above. For `launchd`, do not rely
+on the shell that happened to run the installer. Instead, export
+`ENGRAM_ENV_FILE` before running `./scripts/install_launchd.sh`; the installer
+will resolve it and write the absolute path into
+`~/Library/LaunchAgents/com.engram.bridge.plist`:
 
 ```xml
 <key>ENGRAM_ENV_FILE</key>
 <string>/Users/YOU/secrets/engram.env</string>
 ```
 
-Then `launchctl bootout gui/$(id -u)/com.engram.bridge &&
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.engram.bridge.plist`.
+If you do edit the plist manually, reload the job with:
+
+```bash
+launchctl bootout gui/$(id -u)/com.engram.bridge
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.engram.bridge.plist
+```
 
 ---
 

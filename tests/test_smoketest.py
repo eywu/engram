@@ -283,6 +283,69 @@ def test_install_launchd_install_nightly_is_idempotent(tmp_path: Path):
     assert "bootout " in call_text
 
 
+def test_install_launchd_bridge_writes_explicit_env_file_into_plist(tmp_path: Path):
+    script, repo_root, home, env = _bridge_install_fixture(tmp_path)
+    secrets_dir = home / "secrets"
+    secrets_dir.mkdir()
+    env_file = secrets_dir / "engram.env"
+    env_file.write_text("ANTHROPIC_API_KEY=sk-test\n", encoding="utf-8")
+    env["ENGRAM_ENV_FILE"] = "~/secrets/engram.env"
+
+    subprocess.run([str(script)], cwd=repo_root, env=env, check=True)
+
+    installed = _plist(home / "Library" / "LaunchAgents" / "com.engram.bridge.plist")
+    assert installed["Label"] == "com.engram.bridge"
+    assert installed["EnvironmentVariables"]["ENGRAM_ENV_FILE"] == str(env_file)
+
+
+def test_install_launchd_bridge_prefers_home_env_file_over_repo_env(tmp_path: Path):
+    script, repo_root, home, env = _bridge_install_fixture(tmp_path)
+    home_env = home / ".engram" / ".env"
+    home_env.parent.mkdir(parents=True)
+    home_env.write_text("ANTHROPIC_API_KEY=sk-home\n", encoding="utf-8")
+    repo_env = repo_root / ".env"
+    repo_env.write_text("ANTHROPIC_API_KEY=sk-repo\n", encoding="utf-8")
+
+    subprocess.run([str(script)], cwd=repo_root, env=env, check=True)
+
+    installed = _plist(home / "Library" / "LaunchAgents" / "com.engram.bridge.plist")
+    assert installed["EnvironmentVariables"]["ENGRAM_ENV_FILE"] == str(home_env)
+
+
+def test_install_launchd_bridge_falls_back_to_repo_env_file(tmp_path: Path):
+    script, repo_root, home, env = _bridge_install_fixture(tmp_path)
+    repo_env = repo_root / ".env"
+    repo_env.write_text("ANTHROPIC_API_KEY=sk-repo\n", encoding="utf-8")
+
+    subprocess.run([str(script)], cwd=repo_root, env=env, check=True)
+
+    installed = _plist(home / "Library" / "LaunchAgents" / "com.engram.bridge.plist")
+    assert installed["EnvironmentVariables"]["ENGRAM_ENV_FILE"] == str(repo_env)
+
+
+def test_install_launchd_bridge_errors_before_overwriting_plist_when_env_missing(
+    tmp_path: Path,
+):
+    script, repo_root, home, env = _bridge_install_fixture(tmp_path)
+    plist_path = home / "Library" / "LaunchAgents" / "com.engram.bridge.plist"
+    plist_path.parent.mkdir(parents=True)
+    plist_path.write_text("manual fix", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(script)],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Set ENGRAM_ENV_FILE" in result.stderr
+    assert "engram setup" in result.stderr
+    assert plist_path.read_text(encoding="utf-8") == "manual fix"
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [
         json.loads(line)
@@ -301,3 +364,67 @@ def _event(events: list[dict[str, Any]], name: str) -> dict[str, Any]:
 def _plist(path: Path) -> dict[str, Any]:
     with path.open("rb") as fh:
         return plistlib.load(fh)
+
+
+def _bridge_install_fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, str]]:
+    repo_root = tmp_path / "repo"
+    script_dir = repo_root / "scripts"
+    script_dir.mkdir(parents=True)
+    script = script_dir / "install_launchd.sh"
+    script.write_text(
+        Path("scripts/install_launchd.sh").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+    home = tmp_path / "home"
+    bin_dir = tmp_path / "bin"
+    home.mkdir()
+    bin_dir.mkdir()
+    calls = tmp_path / "launchctl-calls.txt"
+    state = tmp_path / "launchctl-state.txt"
+
+    uv = bin_dir / "uv"
+    uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    grep = bin_dir / "grep"
+    grep.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$#\" -eq 3 ] && [ \"$1\" = \"-q\" ] && [ \"$2\" = \"engram.ready\" ] "
+        "&& [ \"$3\" = \"/tmp/engram.bridge.out.log\" ]; then\n"
+        "  exit 0\n"
+        "fi\n"
+        "exec /usr/bin/grep \"$@\"\n",
+        encoding="utf-8",
+    )
+    launchctl = bin_dir / "launchctl"
+    launchctl.write_text(
+        "#!/bin/sh\n"
+        "cmd=\"$1\"\n"
+        "shift || true\n"
+        "case \"$cmd\" in\n"
+        "  list)\n"
+        "    printf '%s\\n' 'PID Status Label'\n"
+        "    [ -f \"$LAUNCHCTL_STATE\" ] && cat \"$LAUNCHCTL_STATE\"\n"
+        "    ;;\n"
+        "  load)\n"
+        "    printf '%s\\n' '123 0 com.engram.bridge' > \"$LAUNCHCTL_STATE\"\n"
+        "    printf '%s %s\\n' \"$cmd\" \"$*\" >> \"$LAUNCHCTL_CALLS\"\n"
+        "    ;;\n"
+        "  unload)\n"
+        "    rm -f \"$LAUNCHCTL_STATE\"\n"
+        "    printf '%s %s\\n' \"$cmd\" \"$*\" >> \"$LAUNCHCTL_CALLS\"\n"
+        "    ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    for binary in (uv, grep, launchctl):
+        binary.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "LAUNCHCTL_CALLS": str(calls),
+        "LAUNCHCTL_STATE": str(state),
+    }
+    return script, repo_root, home, env
