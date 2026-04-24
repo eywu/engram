@@ -78,6 +78,7 @@ def test_provision_owner_dm_creates_manifest_and_claude_md(tmp_path: Path):
     assert m.channel_id == "D07OWNER"
     assert m.identity == IdentityTemplate.OWNER_DM_FULL
     assert m.permission_tier == PermissionTier.OWNER_SCOPED
+    assert m.nightly_included is True
     assert m.status == ChannelStatus.ACTIVE  # owner-DM template defaults active
     assert m.setting_sources == ["user"]
     assert m.tools.is_unrestricted()
@@ -118,6 +119,7 @@ def test_provision_task_assistant_defaults_pending(tmp_path: Path):
     assert result.created
     m = load_manifest(result.manifest_path)
     assert m.permission_tier == PermissionTier.TASK_ASSISTANT
+    assert m.nightly_included is False
     assert m.status == ChannelStatus.PENDING  # must be approved before use
     assert m.setting_sources == ["project"]
     # Default exclusions from template

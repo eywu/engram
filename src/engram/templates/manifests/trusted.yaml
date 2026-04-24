@@ -11,7 +11,7 @@ channel_id: "{{channel_id}}"
 identity: owner-dm-full
 label: "DM"
 status: active
-meta_eligible: true
+nightly_included: true
 permission_tier: trusted
 
 setting_sources: [user]

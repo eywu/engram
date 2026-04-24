@@ -70,7 +70,7 @@ def test_status_json_includes_channel_mcp_policy(isolated_home: Path):
     )
     assert channel["mcp"]["strict_mode"] is True
     assert channel["mcp"]["servers"] == ["linear"]
-    assert channel["meta_eligible"] is True
+    assert channel["meta_eligible"] is False
 
 
 def test_scope_audit_surfaces_meta_eligibility(isolated_home: Path):
@@ -82,7 +82,7 @@ def test_scope_audit_surfaces_meta_eligibility(isolated_home: Path):
     )
     manifest_path = paths.channel_manifest_path("C07TEAM", isolated_home)
     manifest = load_manifest(manifest_path)
-    dump_manifest(manifest.model_copy(update={"meta_eligible": False}), manifest_path)
+    dump_manifest(manifest.model_copy(update={"nightly_included": False}), manifest_path)
 
     result = CliRunner().invoke(app, ["scope", "audit", "--json"])
 

@@ -31,7 +31,6 @@ from engram.egress import (
     _always_allow_label,
     _suggestion_label,
     build_footgun_confirmation_modal,
-    post_meta_eligibility_question,
     post_reply,
     post_upgrade_request_dm,
     post_upgrade_result_in_channel,
@@ -54,6 +53,7 @@ from engram.manifest import (
     parse_permission_tier,
     permission_tier_choices_text,
     persist_yolo_demotion,
+    set_channel_nightly_included,
     set_channel_permission_tier,
     validate_upgrade_duration,
 )
@@ -94,6 +94,18 @@ _YOLO_DURATION_PICKER_TEXT = (
     "Choose a duration:"
 )
 _YOLO_DURATION_ALIASES = {"6": "6h", "24": "24h", "72": "72h"}
+SAFE_TIER_NIGHTLY_INCLUDE_ERROR = (
+    "Cannot include a `safe` channel in the nightly summary. "
+    "Safe channels are excluded by default to protect team privacy. "
+    "Upgrade the channel to `trusted` first: `/engram upgrade`"
+)
+NON_OWNER_NIGHTLY_INCLUDE_ERROR = (
+    "Only the owner can include a channel in the nightly summary."
+)
+SAFE_TIER_DOWNGRADE_NOTICE = (
+    "Downgrading to `safe` also excluded this channel from nightly summary "
+    "(required for safe tier)."
+)
 
 
 @dataclass(frozen=True)
@@ -809,7 +821,7 @@ async def handle_meta_eligibility_command(
     eligible: bool,
     target_text: str | None,
 ) -> dict[str, object]:
-    """Create an owner-DM HITL card for OQ31 nightly meta eligibility changes."""
+    """Update nightly cross-channel summary inclusion for a channel."""
     if not source_channel_id:
         return {"ok": False, "error": "missing source channel"}
 
@@ -820,6 +832,12 @@ async def handle_meta_eligibility_command(
         home=home,
     )
     if target_channel_id is None:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text="Could not find that channel.",
+        )
         return {"ok": False, "error": "target channel not found"}
 
     if target_channel_id == source_channel_id:
@@ -838,70 +856,82 @@ async def handle_meta_eligibility_command(
             target_channel_id,
             exc,
         )
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=str(exc),
+        )
         return {"ok": False, "error": "manifest not found"}
 
-    owner_dm_channel_id = config.owner_dm_channel_id or router.owner_dm_channel_id
-    if not owner_dm_channel_id:
-        log.warning(
-            "ingress.meta_eligibility_no_owner_dm source=%s target=%s",
-            source_channel_id,
-            target_channel_id,
+    if target_channel_id != source_channel_id and not _is_owner_user(
+        config=config,
+        user_id=user_id,
+    ):
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text="Owner-only.",
         )
-        return {"ok": False, "error": "owner DM channel is not configured"}
+        return {"ok": False, "error": "not owner"}
 
-    async def apply_confirmed_decision(result) -> None:
-        if not isinstance(result, PermissionResultAllow):
-            return
-        latest = load_manifest(manifest_path)
-        updated = latest.model_copy(update={"meta_eligible": eligible})
-        dump_manifest(updated, manifest_path)
-        router.replace_cached_manifest(updated)
-        log.info(
-            "ingress.meta_eligibility_updated channel=%s meta_eligible=%s",
-            target_channel_id,
-            eligible,
+    if eligible and manifest.tier_effective() == PermissionTier.TASK_ASSISTANT:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=SAFE_TIER_NIGHTLY_INCLUDE_ERROR,
         )
+        return {"ok": False, "error": "safe tier"}
 
-    command_name = "include-in-nightly" if eligible else "exclude-from-nightly"
-    q = PendingQuestion(
-        permission_request_id=str(uuid.uuid4()),
-        channel_id=owner_dm_channel_id,
-        session_id=f"meta-eligibility:{target_channel_id}",
-        turn_id=str(uuid.uuid4()),
-        tool_name=command_name,
-        tool_input={
-            "channel_id": target_channel_id,
-            "source_channel_id": source_channel_id,
-            "requested_by": user_id,
-            "meta_eligible": eligible,
-        },
-        suggestions=[{"name": "Confirm"}],
-        who_can_answer=None,
-        posted_at=datetime.datetime.now(datetime.UTC),
-        timeout_s=config.hitl.timeout_s,
-        on_resolve=apply_confirmed_decision,
-    )
-    router.hitl.register(q)
+    if eligible and not _is_owner_user(config=config, user_id=user_id):
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=NON_OWNER_NIGHTLY_INCLUDE_ERROR,
+        )
+        return {"ok": False, "error": "not owner"}
 
-    # OQ31 locked decision: cards are always sent to the owner DM, even when
-    # the command originates in a channel, so approvals have one consistent
-    # operator-facing surface.
-    channel_ts, thread_ts = await post_meta_eligibility_question(
-        q,
-        slack_client,
-        channel_label=_manifest_display_label(manifest),
-        eligible=eligible,
-    )
-    q.slack_channel_ts = channel_ts
-    q.slack_thread_ts = thread_ts
-    log.info(
-        "ingress.meta_eligibility_question_posted source=%s target=%s owner_dm=%s eligible=%s",
-        source_channel_id,
+    previous, updated, _manifest_path = set_channel_nightly_included(
         target_channel_id,
-        owner_dm_channel_id,
         eligible,
+        home=home,
     )
-    return {"ok": True, "permission_request_id": q.permission_request_id}
+    router.replace_cached_manifest(updated)
+    changed = previous.nightly_included != updated.nightly_included
+    text = (
+        "Channel included in nightly cross-channel summary."
+        if eligible and changed
+        else (
+            "Channel excluded from nightly cross-channel summary."
+            if not eligible and changed
+            else (
+                "Channel is already included. No change."
+                if eligible
+                else "Channel is already excluded. No change."
+            )
+        )
+    )
+    await _post_ephemeral_reply(
+        slack_client,
+        channel_id=source_channel_id,
+        user_id=user_id,
+        text=text,
+    )
+    log.info(
+        "ingress.nightly_inclusion_updated channel=%s nightly_included=%s changed=%s",
+        target_channel_id,
+        updated.nightly_included,
+        changed,
+    )
+    return {
+        "ok": True,
+        "channel_id": target_channel_id,
+        "nightly_included": updated.nightly_included,
+        "changed": changed,
+    }
 
 
 async def handle_engram_command(
@@ -921,7 +951,8 @@ async def handle_engram_command(
             channel_id=source_channel_id,
             user_id=user_id,
             text=(
-                "Usage: /engram channels | /engram upgrade <tier> [reason...] "
+                "Usage: /engram channels | /engram include | /engram exclude "
+                "| /engram upgrade <tier> [reason...] "
                 "| /engram yolo <list|off|extend> ..."
             ),
         )
@@ -935,6 +966,19 @@ async def handle_engram_command(
             slack_client=slack_client,
             source_channel_id=source_channel_id,
             user_id=user_id,
+        )
+
+    if subcommand in {"include", "exclude"}:
+        target_text = " ".join(parts[1:]).strip() or None
+        return await handle_meta_eligibility_command(
+            router=router,
+            config=config,
+            slack_client=slack_client,
+            source_channel_id=source_channel_id,
+            source_channel_name=source_channel_name,
+            user_id=user_id,
+            eligible=(subcommand == "include"),
+            target_text=target_text,
         )
 
     if subcommand == "upgrade":
@@ -1117,13 +1161,34 @@ async def handle_channels_dashboard_action(
                             blocks=blocks,
                         ),
                     }
-                _previous, updated, _manifest_path, _duration = set_channel_permission_tier(
+                previous, updated, _manifest_path, _duration = set_channel_permission_tier(
                     channel_id,
                     target_tier,
                     duration="permanent",
                     home=router.home,
                 )
                 router.replace_cached_manifest(updated)
+                await _maybe_post_safe_tier_downgrade_notice(
+                    slack_client,
+                    channel_id=channel_id,
+                    previous=previous,
+                    updated=updated,
+                )
+    elif action_id == ACTION_ID_YOLO_DURATION:
+        parsed = _decode_channels_dashboard_pair(str(action.get("value") or ""))
+        if parsed is None:
+            notice = "Could not extend YOLO."
+        else:
+            channel_id, duration = parsed
+            result = await _extend_yolo_grant(
+                router=router,
+                config=config,
+                slack_client=slack_client,
+                channel_id=channel_id,
+                duration=duration,
+            )
+            if not result["ok"]:
+                notice = str(result["message"])
     elif action_id == ACTION_ID_NIGHTLY_TOGGLE:
         parsed = _decode_channels_dashboard_pair(str(action.get("value") or ""))
         if parsed is None:
@@ -1134,12 +1199,14 @@ async def handle_channels_dashboard_action(
                 notice = "Could not change nightly inclusion."
             else:
                 try:
-                    await _set_dashboard_meta_eligible(
+                    updated = await _set_dashboard_nightly_included(
                         router=router,
                         channel_id=channel_id,
-                        eligible=(mode == "include"),
+                        nightly_included=(mode == "include"),
                     )
-                except ManifestError as exc:
+                    if mode == "include" and updated.nightly_included:
+                        notice = None
+                except (ManifestError, ValueError) as exc:
                     notice = str(exc)
     else:
         return {"ok": False, "error": "unsupported action"}
@@ -1536,7 +1603,7 @@ async def handle_upgrade_action(
         return {"ok": True, "decision": "deny"}
 
     duration = _upgrade_duration_from_action(action_id)
-    _previous, updated, _manifest_path, normalized_duration = set_channel_permission_tier(
+    previous, updated, _manifest_path, normalized_duration = set_channel_permission_tier(
         request.source_channel_id,
         request.to_tier,
         duration=duration,
@@ -1558,6 +1625,12 @@ async def handle_upgrade_action(
         approved=True,
         tier=request.to_tier,
         approver_user_id=clicker_user_id,
+    )
+    await _maybe_post_safe_tier_downgrade_notice(
+        slack_client,
+        channel_id=request.source_channel_id,
+        previous=previous,
+        updated=updated,
     )
     await update_upgrade_request_dm(
         slack_client,
@@ -1717,6 +1790,13 @@ def parse_meta_eligibility_command(text: str) -> MetaEligibilityCommand | None:
 
     parts = stripped.split(maxsplit=1)
     command = parts[0].lstrip("/").lower()
+    if command == "engram":
+        subparts = [part for part in (parts[1] if len(parts) > 1 else "").split(maxsplit=1) if part]
+        if subparts and subparts[0].lower() in {"exclude", "include"}:
+            return MetaEligibilityCommand(
+                subparts[0].lower() == "include",
+                _normalize_target_text(subparts[1] if len(subparts) > 1 else None),
+            )
     if command == "exclude-from-nightly":
         return MetaEligibilityCommand(False, _normalize_target_text(parts[1] if len(parts) > 1 else None))
     if command == "include-in-nightly":
@@ -1796,6 +1876,25 @@ def _replace_original_ephemeral(
     return payload
 
 
+async def _maybe_post_safe_tier_downgrade_notice(
+    slack_client,
+    *,
+    channel_id: str,
+    previous: ChannelManifest,
+    updated: ChannelManifest,
+) -> None:
+    if (
+        previous.tier_effective() != PermissionTier.TASK_ASSISTANT
+        and updated.tier_effective() == PermissionTier.TASK_ASSISTANT
+        and previous.nightly_included
+        and not updated.nightly_included
+    ):
+        await slack_client.chat_postMessage(
+            channel=channel_id,
+            text=SAFE_TIER_DOWNGRADE_NOTICE,
+        )
+
+
 def _channels_dashboard_replace_original(
     *,
     text: str,
@@ -1804,16 +1903,17 @@ def _channels_dashboard_replace_original(
     return _replace_original_ephemeral(text=text, blocks=blocks)
 
 
-async def _set_dashboard_meta_eligible(
+async def _set_dashboard_nightly_included(
     *,
     router: Router,
     channel_id: str,
-    eligible: bool,
+    nightly_included: bool,
 ) -> ChannelManifest:
-    manifest_path = paths.channel_manifest_path(channel_id, router.home)
-    manifest = load_manifest(manifest_path)
-    updated = manifest.model_copy(update={"meta_eligible": eligible})
-    dump_manifest(updated, manifest_path)
+    _previous, updated, _manifest_path = set_channel_nightly_included(
+        channel_id,
+        nightly_included,
+        home=router.home,
+    )
     router.replace_cached_manifest(updated)
     return updated
 
@@ -2062,7 +2162,7 @@ def _channels_dashboard_row_text(row: ChannelDashboardRow) -> str:
     if tier == PermissionTier.YOLO and row.manifest.yolo_until is not None:
         nightly = (
             "Included in nightly ✓"
-            if row.manifest.meta_eligible
+            if row.manifest.nightly_included
             else "Nightly: excluded"
         )
         return (
@@ -2077,7 +2177,7 @@ def _channels_dashboard_row_text(row: ChannelDashboardRow) -> str:
         )
     nightly = (
         "Included in nightly ✓"
-        if row.manifest.meta_eligible
+        if row.manifest.nightly_included
         else "Nightly: excluded"
     )
     return (
@@ -2121,6 +2221,13 @@ def _channels_dashboard_row_actions(
                 style="primary",
             )
         )
+        buttons.append(
+            _dashboard_button(
+                text="Exclude from nightly ✓",
+                action_id=ACTION_ID_NIGHTLY_TOGGLE,
+                value=f"{channel_id}|exclude",
+            )
+        )
         return buttons
 
     if tier == PermissionTier.YOLO:
@@ -2156,15 +2263,14 @@ def _channels_dashboard_row_actions(
             )
         )
 
-    if not row.is_owner_dm:
-        include = not row.manifest.meta_eligible
-        buttons.append(
-            _dashboard_button(
-                text="Include in nightly" if include else "Exclude from nightly",
-                action_id=ACTION_ID_NIGHTLY_TOGGLE,
-                value=f"{channel_id}|{'include' if include else 'exclude'}",
-            )
+    include = not row.manifest.nightly_included
+    buttons.append(
+        _dashboard_button(
+            text="Include in nightly" if include else "Exclude from nightly",
+            action_id=ACTION_ID_NIGHTLY_TOGGLE,
+            value=f"{channel_id}|{'include' if include else 'exclude'}",
         )
+    )
     return buttons
 
 
@@ -2433,6 +2539,12 @@ async def _revoke_yolo_grant(
     router.replace_cached_manifest(updated)
     label = _manifest_display_label(previous)
     await slack_client.chat_postMessage(channel=channel_id, text="YOLO ended by owner")
+    await _maybe_post_safe_tier_downgrade_notice(
+        slack_client,
+        channel_id=channel_id,
+        previous=previous,
+        updated=updated,
+    )
 
     owner_dm_channel_id = config.owner_dm_channel_id or router.owner_dm_channel_id
     if owner_dm_channel_id:

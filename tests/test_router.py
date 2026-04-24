@@ -74,6 +74,7 @@ async def test_manifest_mode_auto_provisions_team_channel(tmp_path: Path):
     assert s.manifest.channel_id == "C07TEAM"
     assert s.manifest.identity == IdentityTemplate.TASK_ASSISTANT
     assert s.manifest.status == ChannelStatus.PENDING  # needs approval
+    assert s.manifest.nightly_included is False
     assert not s.is_active()
     # cwd should be project root so Claude inherits .claude/
     assert s.cwd == paths.project_root(tmp_path)
@@ -86,6 +87,7 @@ async def test_manifest_mode_auto_provisions_owner_dm(tmp_path: Path):
     assert s.manifest is not None
     assert s.manifest.identity == IdentityTemplate.OWNER_DM_FULL
     assert s.manifest.status == ChannelStatus.ACTIVE
+    assert s.manifest.nightly_included is True
     assert s.is_active()
 
 

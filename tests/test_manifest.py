@@ -144,11 +144,20 @@ def test_status_defaults_to_pending():
     assert m.status == ChannelStatus.PENDING
 
 
-def test_meta_eligible_defaults_to_true():
+def test_nightly_included_defaults_to_false_for_safe():
     m = ChannelManifest(
         channel_id="C07ABC", identity=IdentityTemplate.TASK_ASSISTANT
     )
-    assert m.meta_eligible is True
+    assert m.nightly_included is False
+
+
+def test_nightly_included_defaults_to_true_for_trusted():
+    m = ChannelManifest(
+        channel_id="D07ABC",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        permission_tier=PermissionTier.OWNER_SCOPED,
+    )
+    assert m.nightly_included is True
 
 
 def test_acknowledged_pending_defaults_to_false():
@@ -174,17 +183,25 @@ def test_ask_user_question_defaults():
 
 def test_manifest_loads_hitl_section(tmp_path: Path):
     templates = [
-        ("trusted.yaml", "D07OWNER", "DM", PermissionTier.OWNER_SCOPED, 1000),
+        ("trusted.yaml", "D07OWNER", "DM", PermissionTier.OWNER_SCOPED, 1000, True),
         (
             "safe.yaml",
             "C07TEAM",
             "#test-team",
             PermissionTier.TASK_ASSISTANT,
             1000,
+            False,
         ),
     ]
 
-    for template_name, channel_id, label, permission_tier, max_per_day in templates:
+    for (
+        template_name,
+        channel_id,
+        label,
+        permission_tier,
+        max_per_day,
+        nightly_included,
+    ) in templates:
         template = paths.TEMPLATES_MANIFESTS_DIR / template_name
         rendered = (
             template.read_text()
@@ -200,7 +217,7 @@ def test_manifest_loads_hitl_section(tmp_path: Path):
         assert manifest.hitl.enabled is True
         assert manifest.hitl.timeout_s == 300
         assert manifest.hitl.max_per_day == max_per_day
-        assert manifest.meta_eligible is True
+        assert manifest.nightly_included is nightly_included
 
 
 def test_manifest_loads_nightly_model_from_templates(tmp_path: Path):
@@ -349,7 +366,10 @@ cost_budget:
     )
     m = load_manifest(p)
     assert m.permission_tier == PermissionTier.TASK_ASSISTANT
-    assert m.meta_eligible is False
+    assert m.nightly_included is False
+    rendered = p.read_text()
+    assert "nightly_included: false" in rendered
+    assert "meta_eligible" not in rendered
     assert m.tools.disallowed == ["Bash", "Write", "Edit"]
     assert m.mcp_servers.disallowed == ["personal-notes"]
     assert m.memory.excluded_channels == ["C07OPTEDOUT"]

@@ -668,7 +668,7 @@ def _merge_channels(
         )
         channel.setdefault("manifest_status", str(manifest.status))
         channel.setdefault("identity", str(manifest.identity))
-        channel.setdefault("meta_eligible", manifest.meta_eligible)
+        channel.setdefault("meta_eligible", manifest.nightly_included)
         channel["mcp"] = _manifest_mcp_policy(manifest)
         channel["tools"] = _merge_registered_tools(
             channel.get("tools"),
@@ -709,7 +709,7 @@ def _manifest_audit_rows(home: Path) -> list[dict[str, Any]]:
                 "label": manifest.label,
                 "identity": str(manifest.identity),
                 "status": str(manifest.status),
-                "meta_eligible": manifest.meta_eligible,
+                "meta_eligible": manifest.nightly_included,
                 "mcp": _scope_summary(manifest.mcp_servers.allowed, manifest.mcp_servers.disallowed),
                 "tools": _scope_summary(manifest.tools.allowed, manifest.tools.disallowed),
             }

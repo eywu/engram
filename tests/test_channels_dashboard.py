@@ -82,7 +82,7 @@ def write_manifest(
     status: ChannelStatus = ChannelStatus.ACTIVE,
     label: str | None = None,
     tier: PermissionTier | None = None,
-    meta_eligible: bool = True,
+    nightly_included: bool = True,
     yolo_hours: int | None = None,
     pre_yolo_tier: PermissionTier | None = None,
 ) -> None:
@@ -105,7 +105,7 @@ def write_manifest(
             status=status,
             label=label,
             permission_tier=effective_tier,
-            meta_eligible=meta_eligible,
+            nightly_included=nightly_included,
             yolo_granted_at=(
                 now - timedelta(hours=1)
                 if effective_tier == PermissionTier.YOLO and yolo_hours is not None
@@ -260,6 +260,7 @@ async def test_channels_dashboard_one_channel_renders_owner_dm_row(tmp_path: Pat
     assert dashboard_action_labels(slack.ephemeral_calls[0]["blocks"], "D07OWNER") == [
         "Upgrade to YOLO",
         "Downgrade to Safe",
+        "Exclude from nightly",
     ]
     assert dashboard_nav_labels(slack.ephemeral_calls[0]["blocks"]) == []
 
@@ -283,7 +284,7 @@ async def test_channels_dashboard_sorts_rows_and_shows_expected_buttons(tmp_path
         label="#growth-team",
         tier=PermissionTier.OWNER_SCOPED,
     )
-    write_manifest(home, "C07SAFE", label="#random", meta_eligible=False)
+    write_manifest(home, "C07SAFE", label="#random", nightly_included=False)
     write_manifest(
         home,
         "C07ARCH",
@@ -323,6 +324,7 @@ async def test_channels_dashboard_sorts_rows_and_shows_expected_buttons(tmp_path
     assert rows[4] == "💬 archive-room [archived] [✨ trusted]\nIncluded in nightly ✓"
     assert dashboard_action_labels(slack.ephemeral_calls[0]["blocks"], "G07PRIVATE") == [
         "Upgrade",
+        "Exclude from nightly ✓",
     ]
     assert dashboard_action_labels(slack.ephemeral_calls[0]["blocks"], "C07TRUST") == [
         "Upgrade to YOLO",
@@ -490,6 +492,53 @@ async def test_channels_dashboard_tier_pick_action_shows_yolo_duration_picker(
 
 
 @pytest.mark.asyncio
+async def test_channels_dashboard_safe_downgrade_auto_excludes_and_notifies(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_manifest(
+        home,
+        "D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        label="Alice (DM)",
+    )
+    write_manifest(
+        home,
+        "C07TEAM",
+        label="#growth-team",
+        tier=PermissionTier.OWNER_SCOPED,
+        nightly_included=True,
+    )
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient(
+        conversation_info={
+            "D07OWNER": {"is_im": True},
+            "C07TEAM": {"name": "growth-team", "is_private": False},
+        }
+    )
+
+    result = await handle_channels_dashboard_action(
+        payload=dashboard_action_payload(
+            action_id=ACTION_ID_TIER_PICK,
+            value="C07TEAM|safe",
+        ),
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+    )
+
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result["ok"] is True
+    assert manifest.permission_tier == PermissionTier.TASK_ASSISTANT
+    assert manifest.nightly_included is False
+    assert slack.post_calls[-1]["channel"] == "C07TEAM"
+    assert (
+        slack.post_calls[-1]["text"]
+        == "Downgrading to `safe` also excluded this channel from nightly summary (required for safe tier)."
+    )
+
+
+@pytest.mark.asyncio
 async def test_channels_dashboard_nightly_toggle_action_rerenders(
     tmp_path: Path,
 ) -> None:
@@ -505,7 +554,7 @@ async def test_channels_dashboard_nightly_toggle_action_rerenders(
         "C07TEAM",
         label="#growth-team",
         tier=PermissionTier.OWNER_SCOPED,
-        meta_eligible=True,
+        nightly_included=True,
     )
     router = Router(home=home, owner_dm_channel_id="D07OWNER")
     slack = FakeSlackClient(
@@ -527,7 +576,7 @@ async def test_channels_dashboard_nightly_toggle_action_rerenders(
 
     manifest = load_manifest(channel_manifest_path("C07TEAM", home))
     assert result["ok"] is True
-    assert manifest.meta_eligible is False
+    assert manifest.nightly_included is False
     assert result["response"]["replace_original"] is True
     assert "Nightly: excluded" in dashboard_row_texts(result["response"]["blocks"])[1]
     action_block = next(

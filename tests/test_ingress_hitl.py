@@ -23,6 +23,7 @@ from engram.ingress import (
     YOLO_EXTEND_ACTION_ID_PATTERN,
     YOLO_REVOKE_ACTION_ID_PATTERN,
     handle_block_action,
+    handle_engram_command,
     handle_footgun_confirm_closed,
     handle_footgun_confirm_open,
     handle_footgun_confirm_submit,
@@ -35,6 +36,7 @@ from engram.manifest import (
     ChannelManifest,
     ChannelStatus,
     IdentityTemplate,
+    PermissionTier,
     dump_manifest,
     load_manifest,
 )
@@ -235,6 +237,7 @@ def make_config() -> EngramConfig:
 def make_config_with_owner_dm(owner_dm_channel_id: str = "D07OWNER") -> EngramConfig:
     cfg = make_config()
     cfg.owner_dm_channel_id = owner_dm_channel_id
+    cfg.owner_user_id = "U07OWNER"
     return cfg
 
 
@@ -251,8 +254,9 @@ def _write_channel_manifest(
     home,
     channel_id: str,
     *,
-    meta_eligible: bool = True,
+    nightly_included: bool = True,
     identity: IdentityTemplate = IdentityTemplate.TASK_ASSISTANT,
+    tier: PermissionTier = PermissionTier.TASK_ASSISTANT,
 ) -> None:
     path = channel_manifest_path(channel_id, home)
     path.parent.mkdir(parents=True)
@@ -262,7 +266,8 @@ def _write_channel_manifest(
             identity=identity,
             status=ChannelStatus.ACTIVE,
             label="#growth",
-            meta_eligible=meta_eligible,
+            permission_tier=tier,
+            nightly_included=nightly_included,
         ),
         path,
     )
@@ -316,7 +321,8 @@ def test_register_listeners_attaches_hitl_action_handler():
 
 def test_parse_meta_eligibility_commands():
     exclude = parse_meta_eligibility_command("please exclude this channel from nightly")
-    include = parse_meta_eligibility_command("/include-in-nightly <#C07TEAM|growth>")
+    include = parse_meta_eligibility_command("/engram include <#C07TEAM|growth>")
+    legacy = parse_meta_eligibility_command("/include-in-nightly <#C07TEAM|growth>")
 
     assert exclude is not None
     assert exclude.eligible is False
@@ -324,12 +330,88 @@ def test_parse_meta_eligibility_commands():
     assert include is not None
     assert include.eligible is True
     assert include.target == "<#C07TEAM|growth>"
+    assert legacy is not None
+    assert legacy.eligible is True
+    assert legacy.target == "<#C07TEAM|growth>"
 
 
 @pytest.mark.asyncio
-async def test_exclusion_command_posts_owner_dm_card_and_confirm_updates_manifest(tmp_path):
+@pytest.mark.parametrize(
+    ("tier", "eligible", "initial_included", "user_id", "ok", "expected_text", "expected_included"),
+    [
+        (
+            PermissionTier.TASK_ASSISTANT,
+            False,
+            False,
+            "U123",
+            True,
+            "Channel is already excluded. No change.",
+            False,
+        ),
+        (
+            PermissionTier.TASK_ASSISTANT,
+            True,
+            False,
+            "U07OWNER",
+            False,
+            "Cannot include a `safe` channel in the nightly summary. Safe channels are excluded by default to protect team privacy. Upgrade the channel to `trusted` first: `/engram upgrade`",
+            False,
+        ),
+        (
+            PermissionTier.OWNER_SCOPED,
+            False,
+            True,
+            "U123",
+            True,
+            "Channel excluded from nightly cross-channel summary.",
+            False,
+        ),
+        (
+            PermissionTier.OWNER_SCOPED,
+            True,
+            False,
+            "U07OWNER",
+            True,
+            "Channel included in nightly cross-channel summary.",
+            True,
+        ),
+        (
+            PermissionTier.YOLO,
+            False,
+            True,
+            "U123",
+            True,
+            "Channel excluded from nightly cross-channel summary.",
+            False,
+        ),
+        (
+            PermissionTier.YOLO,
+            True,
+            False,
+            "U07OWNER",
+            True,
+            "Channel included in nightly cross-channel summary.",
+            True,
+        ),
+    ],
+)
+async def test_nightly_inclusion_command_tier_matrix(
+    tmp_path,
+    tier: PermissionTier,
+    eligible: bool,
+    initial_included: bool,
+    user_id: str,
+    ok: bool,
+    expected_text: str,
+    expected_included: bool,
+):
     home = tmp_path / ".engram"
-    _write_channel_manifest(home, "C07TEAM", meta_eligible=True)
+    _write_channel_manifest(
+        home,
+        "C07TEAM",
+        nightly_included=initial_included,
+        tier=tier,
+    )
     router = Router(home=home, owner_dm_channel_id="D07OWNER")
     slack = FakeSlackClient()
 
@@ -339,39 +421,27 @@ async def test_exclusion_command_posts_owner_dm_card_and_confirm_updates_manifes
         slack_client=slack,
         source_channel_id="C07TEAM",
         source_channel_name="growth",
-        user_id="U123",
-        eligible=False,
+        user_id=user_id,
+        eligible=eligible,
         target_text=None,
     )
 
-    assert result["ok"] is True
-    assert len(slack.post_calls) == 1
-    post = slack.post_calls[0]
-    assert post["channel"] == "D07OWNER"
-    assert post["text"] == "Exclude #growth from nightly meta-summary?"
-    button_texts = [
-        element["text"]["text"]
-        for element in post["blocks"][1]["elements"]
-    ]
-    assert button_texts == ["Confirm", "Deny"]
-
-    permission_request_id = result["permission_request_id"]
-    ack = await handle_block_action(
-        block_action_payload(f"{permission_request_id}|0"),
-        router,
-        slack,
-    )
-
-    assert ack == {"ok": True}
-    await wait_until(lambda: len(slack.update_calls) == 1)
     manifest = load_manifest(channel_manifest_path("C07TEAM", home))
-    assert manifest.meta_eligible is False
+    assert result["ok"] is ok
+    assert manifest.nightly_included is expected_included
+    assert slack.ephemeral_calls[-1]["text"] == expected_text
 
 
 @pytest.mark.asyncio
-async def test_include_command_deny_leaves_manifest_unchanged(tmp_path):
+@pytest.mark.parametrize("tier", [PermissionTier.OWNER_SCOPED, PermissionTier.YOLO])
+async def test_include_command_requires_owner(tmp_path, tier: PermissionTier):
     home = tmp_path / ".engram"
-    _write_channel_manifest(home, "C07TEAM", meta_eligible=False)
+    _write_channel_manifest(
+        home,
+        "C07TEAM",
+        nightly_included=False,
+        tier=tier,
+    )
     router = Router(home=home, owner_dm_channel_id="D07OWNER")
     slack = FakeSlackClient()
 
@@ -379,25 +449,114 @@ async def test_include_command_deny_leaves_manifest_unchanged(tmp_path):
         router=router,
         config=make_config_with_owner_dm(),
         slack_client=slack,
-        source_channel_id="D07OWNER",
-        source_channel_name=None,
-        user_id="U123",
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OTHER",
         eligible=True,
-        target_text="#growth",
+        target_text=None,
     )
 
-    assert result["ok"] is True
-    permission_request_id = result["permission_request_id"]
-    ack = await handle_block_action(
-        block_action_payload(f"{permission_request_id}|deny"),
-        router,
-        slack,
-    )
-
-    assert ack == {"ok": True}
-    await wait_until(lambda: len(slack.update_calls) == 1)
     manifest = load_manifest(channel_manifest_path("C07TEAM", home))
-    assert manifest.meta_eligible is False
+    assert result == {"ok": False, "error": "not owner"}
+    assert manifest.nightly_included is False
+    assert slack.ephemeral_calls[-1] == {
+        "channel": "C07TEAM",
+        "user": "U07OTHER",
+        "text": "Only the owner can include a channel in the nightly summary.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_engram_include_and_exclude_subcommands_route_to_same_handler(tmp_path):
+    home = tmp_path / ".engram"
+    _write_channel_manifest(
+        home,
+        "C07TEAM",
+        nightly_included=False,
+        tier=PermissionTier.OWNER_SCOPED,
+    )
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    include = await handle_engram_command(
+        router=router,
+        config=make_config_with_owner_dm(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OWNER",
+        command_text="include",
+    )
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert include["ok"] is True
+    assert manifest.nightly_included is True
+    assert slack.ephemeral_calls[-1]["text"] == "Channel included in nightly cross-channel summary."
+
+    exclude = await handle_engram_command(
+        router=router,
+        config=make_config_with_owner_dm(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07REQUESTER",
+        command_text="exclude",
+    )
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert exclude["ok"] is True
+    assert manifest.nightly_included is False
+    assert slack.ephemeral_calls[-1]["text"] == "Channel excluded from nightly cross-channel summary."
+
+
+@pytest.mark.asyncio
+async def test_legacy_nightly_aliases_route_to_direct_toggle_behavior(tmp_path):
+    home = tmp_path / ".engram"
+    _write_channel_manifest(
+        home,
+        "C07TEAM",
+        nightly_included=False,
+        tier=PermissionTier.OWNER_SCOPED,
+    )
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+    app = DecoratorApp()
+    ack_calls = 0
+
+    async def ack():
+        nonlocal ack_calls
+        ack_calls += 1
+
+    register_listeners(app, make_config_with_owner_dm(), router, agent=object())
+    commands = dict(app.commands)
+
+    await commands["/include-in-nightly"](
+        ack=ack,
+        body={
+            "channel_id": "C07TEAM",
+            "channel_name": "growth",
+            "user_id": "U07OWNER",
+            "text": "",
+        },
+        client=slack,
+    )
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert ack_calls == 1
+    assert manifest.nightly_included is True
+    assert slack.ephemeral_calls[-1]["text"] == "Channel included in nightly cross-channel summary."
+
+    await commands["/exclude-from-nightly"](
+        ack=ack,
+        body={
+            "channel_id": "C07TEAM",
+            "channel_name": "growth",
+            "user_id": "U07REQUESTER",
+            "text": "",
+        },
+        client=slack,
+    )
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert ack_calls == 2
+    assert manifest.nightly_included is False
+    assert slack.ephemeral_calls[-1]["text"] == "Channel excluded from nightly cross-channel summary."
 
 
 @pytest.mark.asyncio

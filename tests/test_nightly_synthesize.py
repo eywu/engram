@@ -17,6 +17,7 @@ from engram.manifest import (
     ChannelNightly,
     ChannelStatus,
     IdentityTemplate,
+    PermissionTier,
     dump_manifest,
 )
 from engram.mcp_tools import MEMORY_SEARCH_FULL_TOOL_NAMES
@@ -436,6 +437,7 @@ async def test_weekly_meta_synthesis_excludes_ineligible_channel_from_prompt_and
             identity=IdentityTemplate.TASK_ASSISTANT,
             status=ChannelStatus.ACTIVE,
             label="#keep",
+            permission_tier=PermissionTier.OWNER_SCOPED,
         ),
     )
     _write_manifest(
@@ -445,7 +447,7 @@ async def test_weekly_meta_synthesis_excludes_ineligible_channel_from_prompt_and
             identity=IdentityTemplate.TASK_ASSISTANT,
             status=ChannelStatus.ACTIVE,
             label="#private",
-            meta_eligible=False,
+            nightly_included=False,
         ),
     )
     captured_mcp: list[dict[str, Any]] = []

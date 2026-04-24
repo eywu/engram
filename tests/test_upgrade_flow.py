@@ -68,18 +68,26 @@ def make_config() -> EngramConfig:
     return cfg
 
 
-def write_active_manifest(home: Path, channel_id: str, *, label: str = "#growth") -> None:
+def write_active_manifest(
+    home: Path,
+    channel_id: str,
+    *,
+    label: str = "#growth",
+    tier: PermissionTier = PermissionTier.TASK_ASSISTANT,
+    nightly_included: bool | None = None,
+) -> None:
     path = channel_manifest_path(channel_id, home)
     path.parent.mkdir(parents=True, exist_ok=True)
-    dump_manifest(
-        ChannelManifest(
-            channel_id=channel_id,
-            identity=IdentityTemplate.TASK_ASSISTANT,
-            status=ChannelStatus.ACTIVE,
-            label=label,
-        ),
-        path,
-    )
+    payload: dict[str, Any] = {
+        "channel_id": channel_id,
+        "identity": IdentityTemplate.TASK_ASSISTANT,
+        "status": ChannelStatus.ACTIVE,
+        "label": label,
+        "permission_tier": tier,
+    }
+    if nightly_included is not None:
+        payload["nightly_included"] = nightly_included
+    dump_manifest(ChannelManifest(**payload), path)
 
 
 def owner_action_payload(*, action_id: str, value: str, user_id: str = "U07OWNER") -> dict[str, Any]:
@@ -175,6 +183,7 @@ async def test_upgrade_approve_permanent_updates_manifest_and_messages(
     manifest = load_manifest(channel_manifest_path("C07TEAM", home))
     assert result == {"ok": True, "decision": "approve", "duration": "permanent"}
     assert manifest.permission_tier == PermissionTier.OWNER_SCOPED
+    assert manifest.nightly_included is False
     assert manifest.yolo_until is None
     assert manifest.pre_yolo_tier is None
     assert [call["channel"] for call in slack.update_calls] == ["C07TEAM", "D07OWNER"]
@@ -186,6 +195,54 @@ async def test_upgrade_approve_permanent_updates_manifest_and_messages(
     assert record.channel == "C07TEAM"
     assert record.approver == "U07OWNER"
     assert record.duration == "permanent"
+
+
+@pytest.mark.asyncio
+async def test_upgrade_to_safe_auto_excludes_and_posts_notice(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_active_manifest(
+        home,
+        "C07TEAM",
+        tier=PermissionTier.OWNER_SCOPED,
+        nightly_included=True,
+    )
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    await handle_upgrade_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07REQUESTER",
+        requested_tier=PermissionTier.TASK_ASSISTANT,
+        reason="lock it down",
+    )
+    approve_value = slack.post_calls[1]["blocks"][1]["elements"][0]["value"]
+
+    result = await handle_upgrade_action(
+        payload=owner_action_payload(
+            action_id="upgrade_decision_approve_permanent",
+            value=approve_value,
+        ),
+        router=router,
+        slack_client=slack,
+        owner_user_id="U07OWNER",
+    )
+
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result == {"ok": True, "decision": "approve", "duration": "permanent"}
+    assert manifest.permission_tier == PermissionTier.TASK_ASSISTANT
+    assert manifest.nightly_included is False
+    assert slack.update_calls[0]["text"] == "✅ Upgraded to safe by <@U07OWNER>."
+    assert slack.post_calls[-1]["channel"] == "C07TEAM"
+    assert (
+        slack.post_calls[-1]["text"]
+        == "Downgrading to `safe` also excluded this channel from nightly summary (required for safe tier)."
+    )
 
 
 @pytest.mark.asyncio

@@ -564,7 +564,7 @@ def _build_meta_plan(
     eligible = [
         plan
         for plan in planned
-        if plan.channel_id and _is_meta_eligible(plan.manifest)
+        if plan.channel_id and _is_nightly_included(plan.manifest)
     ]
     if not eligible:
         return None
@@ -587,7 +587,7 @@ def _build_meta_plan(
     ineligible_channel_ids = tuple(
         plan.channel_id
         for plan in planned
-        if plan.channel_id and not _is_meta_eligible(plan.manifest)
+        if plan.channel_id and not _is_nightly_included(plan.manifest)
     )
     channel = {
         "channel_id": META_CHANNEL_ID,
@@ -608,8 +608,8 @@ def _build_meta_plan(
     )
 
 
-def _is_meta_eligible(manifest: ChannelManifest | None) -> bool:
-    return True if manifest is None else manifest.meta_eligible
+def _is_nightly_included(manifest: ChannelManifest | None) -> bool:
+    return True if manifest is None else manifest.nightly_included
 
 
 def _load_channel_manifest(
@@ -649,7 +649,7 @@ def _render_prompt(
             "channel_id": manifest.channel_id,
             "identity": str(manifest.identity),
             "label": manifest.label,
-            "meta_eligible": manifest.meta_eligible,
+            "nightly_included": manifest.nightly_included,
             "nightly_model": manifest.nightly.model,
         }
     rendered = Template(prompt_template).safe_substitute(

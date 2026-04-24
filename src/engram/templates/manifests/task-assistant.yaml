@@ -5,7 +5,7 @@ channel_id: "{{channel_id}}"
 identity: task-assistant
 label: "{{channel_label}}"
 status: pending        # operator must approve before bot responds
-meta_eligible: true
+nightly_included: false
 permission_tier: safe
 
 # Team channels use project-level priming, NOT user-level.

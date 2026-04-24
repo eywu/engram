@@ -33,7 +33,7 @@ from typing import Literal
 
 import yaml
 from claude_agent_sdk import PermissionMode, SettingSource
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from engram import paths
 from engram.config import HITLConfig
@@ -156,6 +156,12 @@ _TIER_DEFAULTS: dict[PermissionTier, dict[str, tuple[str, ...] | int]] = {
         "deny_rules": ABSOLUTE_DENY_RULES,
         "hitl_max_per_day": 1000,
     },
+}
+
+_TIER_DEFAULT_NIGHTLY_INCLUDED: dict[PermissionTier, bool] = {
+    PermissionTier.TASK_ASSISTANT: False,
+    PermissionTier.OWNER_SCOPED: True,
+    PermissionTier.YOLO: True,
 }
 
 OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES: tuple[str, ...] = tuple(
@@ -428,11 +434,11 @@ class ChannelManifest(BaseModel):
             "acknowledgement in Slack for this channel."
         ),
     )
-    meta_eligible: bool = Field(
+    nightly_included: bool = Field(
         default=True,
         description=(
-            "Whether this channel may be included in the weekly cross-channel "
-            "nightly meta-summary. Defaults true per OQ31 opt-in."
+            "Whether this channel may be included in the nightly cross-channel "
+            "summary. Safe-tier channels are always excluded."
         ),
     )
     permission_tier: PermissionTier = Field(
@@ -529,6 +535,19 @@ class ChannelManifest(BaseModel):
         ):
             raise ValueError("yolo timestamps must be timezone-aware")
         return value
+
+    @model_validator(mode="after")
+    def _apply_nightly_included_policy(self) -> ChannelManifest:
+        if "nightly_included" not in self.model_fields_set:
+            self.nightly_included = _TIER_DEFAULT_NIGHTLY_INCLUDED[
+                self.permission_tier
+            ]
+        if (
+            self.permission_tier == PermissionTier.TASK_ASSISTANT
+            and self.nightly_included
+        ):
+            self.nightly_included = False
+        return self
 
     # ── Helpers ──────────────────────────────────────────────────
     def is_owner_dm(self) -> bool:
@@ -647,6 +666,19 @@ def _apply_tier_defaults(
         tier = PermissionTier(permission_tier)
     except (TypeError, ValueError):
         return data, changed
+
+    if "nightly_included" not in data:
+        if "meta_eligible" in data:
+            data["nightly_included"] = data.pop("meta_eligible")
+        else:
+            data["nightly_included"] = _TIER_DEFAULT_NIGHTLY_INCLUDED[tier]
+        changed = True
+    if (
+        tier == PermissionTier.TASK_ASSISTANT
+        and data.get("nightly_included") is not False
+    ):
+        data["nightly_included"] = False
+        changed = True
 
     defaults = _TIER_DEFAULTS[tier]
 
@@ -1047,6 +1079,8 @@ def set_channel_permission_tier(
     )
 
     update_data: dict[str, object] = {"permission_tier": new_tier}
+    if new_tier == PermissionTier.TASK_ASSISTANT:
+        update_data["nightly_included"] = False
     if expires_at is None:
         update_data["yolo_until"] = None
         update_data["yolo_granted_at"] = None
@@ -1079,3 +1113,25 @@ def set_channel_permission_tier(
 
     _write_manifest_atomic(updated, manifest_path)
     return manifest, updated, manifest_path, normalized_duration
+
+
+def set_channel_nightly_included(
+    channel_id: str,
+    nightly_included: bool,
+    *,
+    home: Path | None = None,
+) -> tuple[ChannelManifest, ChannelManifest, Path]:
+    """Load a channel manifest, update ``nightly_included``, and persist it."""
+    manifest_path = paths.channel_manifest_path(channel_id, home)
+    manifest = load_manifest(manifest_path)
+    if (
+        nightly_included
+        and manifest.tier_effective() == PermissionTier.TASK_ASSISTANT
+    ):
+        raise ValueError("safe-tier channels cannot be included in nightly summary")
+    if manifest.nightly_included == nightly_included:
+        return manifest, manifest, manifest_path
+
+    updated = manifest.model_copy(update={"nightly_included": nightly_included})
+    _write_manifest_atomic(updated, manifest_path)
+    return manifest, updated, manifest_path
