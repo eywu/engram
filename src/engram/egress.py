@@ -14,10 +14,11 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import timedelta
 
 from engram.agent import AgentTurn
 from engram.hitl import PendingQuestion
-from engram.manifest import PermissionTier
+from engram.manifest import YOLO_DEFAULT_DURATION_TEXT, PermissionTier
 
 log = logging.getLogger(__name__)
 
@@ -414,6 +415,42 @@ async def post_upgrade_result_in_channel(
     )
 
 
+async def post_yolo_expired_notification(
+    slack_client,
+    *,
+    owner_dm_channel_id: str,
+    channel_id: str,
+    channel_label: str | None,
+    pre_yolo_tier: PermissionTier,
+    duration_used: timedelta | None,
+) -> str | None:
+    label = _channel_label(channel_id, channel_label)
+    duration_text = _format_duration_used(duration_used)
+    text = (
+        f"YOLO expired on {label} — reverted to {pre_yolo_tier.value}. "
+        f"Duration used: {duration_text}."
+    )
+    extend_command = f"`/engram upgrade {channel_id} yolo --until {YOLO_DEFAULT_DURATION_TEXT}`"
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"To extend, run {extend_command}.",
+                }
+            ],
+        },
+    ]
+    response = await slack_client.chat_postMessage(
+        channel=owner_dm_channel_id,
+        blocks=blocks,
+        text=_notification_fallback(text),
+    )
+    return response.get("ts") if isinstance(response, dict) else None
+
+
 async def update_question_resolved(
     q: PendingQuestion,
     answer_text: str,
@@ -560,6 +597,23 @@ def _escape_mrkdwn(text: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+def _channel_label(channel_id: str, channel_label: str | None) -> str:
+    label = (channel_label or channel_id).strip()
+    if label.startswith(("#", "@")):
+        return label
+    if channel_id.startswith("D"):
+        return label
+    return f"#{label}"
+
+
+def _format_duration_used(duration: timedelta | None) -> str:
+    if duration is None:
+        return "unknown"
+    total_minutes = max(0, int(duration.total_seconds() // 60))
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{hours}h {minutes}m"
 
 
 def _chunk_text(text: str, limit: int) -> list[str]:

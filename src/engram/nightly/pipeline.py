@@ -17,6 +17,7 @@ from engram.nightly.report import (
     write_report_and_notify,
 )
 from engram.nightly.synthesize import SynthesisResult, synthesize
+from engram.nightly.yolo import sweep_expired_yolo
 from engram.paths import engram_home
 from engram.telemetry import write_json
 
@@ -60,6 +61,17 @@ class ApplyFunc(Protocol):
         ...
 
 
+class YoloSweepFunc(Protocol):
+    def __call__(
+        self,
+        *,
+        home: Path | None,
+        config_path: Path,
+        now: datetime,
+    ) -> Awaitable[object]:
+        ...
+
+
 async def run_nightly_pipeline(
     *,
     dry_run: bool = False,
@@ -75,6 +87,7 @@ async def run_nightly_pipeline(
     synthesize_func: SynthesizeFunc = synthesize,
     apply_func: ApplyFunc = apply_synthesis,
     success_dm: SuccessDMPoster | None = None,
+    yolo_sweep_func: YoloSweepFunc = sweep_expired_yolo,
 ) -> dict[str, Any]:
     """Run daily nightly work, optionally followed by weekly meta-synthesis."""
     clock = clock or (lambda: datetime.now(UTC))
@@ -88,6 +101,12 @@ async def run_nightly_pipeline(
 
     cost_usd = 0.0
     channels_covered = 0
+
+    await yolo_sweep_func(
+        home=root,
+        config_path=cfg_path,
+        now=clock(),
+    )
 
     _verbose_event(
         verbose,

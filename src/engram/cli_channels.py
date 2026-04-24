@@ -228,10 +228,10 @@ def reset(
 def upgrade(
     channel_id: str = typer.Argument(..., help="Slack channel ID."),
     tier: str = typer.Argument(..., help="Target tier."),
-    until: str = typer.Option(
-        "permanent",
+    until: str | None = typer.Option(
+        None,
         "--until",
-        help="Upgrade duration: 24h, 30d, or permanent.",
+        help="Upgrade duration: 6h, 24h, 72h, 30d, or permanent.",
     ),
 ) -> None:
     """Upgrade a channel tier immediately, bypassing the Slack approval flow."""
@@ -242,7 +242,9 @@ def upgrade(
         raise typer.Exit(code=2) from exc
 
     try:
-        normalized_duration = validate_upgrade_duration(until)
+        normalized_duration = validate_upgrade_duration(
+            until or ("24h" if target_tier == PermissionTier.YOLO else "permanent")
+        )
     except ValueError as exc:
         rprint(f"[red]{exc}[/red]")
         raise typer.Exit(code=2) from exc
@@ -261,6 +263,9 @@ def upgrade(
                 duration=normalized_duration,
             )
         )
+    except ValueError as exc:
+        rprint(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
     except ManifestError as exc:
         rprint(f"[red]Failed to load manifest: {exc}[/red]")
         raise typer.Exit(code=2) from exc

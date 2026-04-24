@@ -4,7 +4,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
 import yaml
 
 from engram.manifest import (
@@ -96,9 +95,8 @@ def test_tier_effective_lazy_yolo_demotion():
     assert active_manifest.tier_effective() == PermissionTier.YOLO
 
 
-def test_load_manifest_expires_past_yolo(
+def test_load_manifest_leaves_expired_yolo_for_lazy_demotion(
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ):
     path = tmp_path / "channel-manifest.yaml"
     expired = datetime(2026, 4, 22, 12, 0, tzinfo=UTC).isoformat()
@@ -115,13 +113,11 @@ setting_sources: [user]
 """
     )
 
-    with caplog.at_level("INFO", logger="engram.manifest"):
-        manifest = load_manifest(path)
+    manifest = load_manifest(path)
 
-    assert manifest.permission_tier == PermissionTier.OWNER_SCOPED
-    assert manifest.yolo_until is None
-    assert manifest.pre_yolo_tier is None
-    assert "channel.yolo_expired" in caplog.text
+    assert manifest.permission_tier == PermissionTier.YOLO
+    assert manifest.yolo_until == datetime.fromisoformat(expired)
+    assert manifest.pre_yolo_tier == PermissionTier.OWNER_SCOPED
 
 
 def test_absolute_deny_list_enforced_on_load(tmp_path: Path):

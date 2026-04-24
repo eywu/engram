@@ -31,6 +31,7 @@ from engram.egress import (
     post_upgrade_request_dm,
     post_upgrade_result_in_channel,
     post_upgrade_waiting_message,
+    post_yolo_expired_notification,
     update_question_resolved,
     update_upgrade_request_dm,
 )
@@ -41,6 +42,7 @@ from engram.manifest import (
     PermissionTier,
     dump_manifest,
     load_manifest,
+    persist_yolo_demotion,
     set_channel_permission_tier,
 )
 from engram.notifications import (
@@ -322,6 +324,13 @@ def register_listeners(
                 )
                 return
 
+        await _maybe_demote_expired_yolo(
+            session=session,
+            router=router,
+            config=config,
+            slack_client=client,
+        )
+
         log.info(
             "ingress.received session=%s user=%s len=%d",
             session.label(),
@@ -377,6 +386,71 @@ def register_listeners(
         # Bolt will also fire on_message for these, so we dedupe here by
         # just logging; the message handler above does the real work.
         log.debug("ingress.app_mention channel=%s user=%s", event.get("channel"), event.get("user"))
+
+
+async def _maybe_demote_expired_yolo(
+    *,
+    session,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+) -> None:
+    if session.manifest is None or router.home is None:
+        return
+    if session.manifest.permission_tier != PermissionTier.YOLO:
+        return
+
+    manifest_path = paths.channel_manifest_path(session.channel_id, router.home)
+    async with session.agent_lock:
+        try:
+            latest = load_manifest(manifest_path)
+        except ManifestError:
+            log.warning(
+                "ingress.yolo_manifest_refresh_failed channel=%s path=%s",
+                session.channel_id,
+                manifest_path,
+                exc_info=True,
+            )
+            return
+        router.replace_cached_manifest(latest)
+        session.manifest = latest
+
+        demotion = persist_yolo_demotion(
+            manifest_path,
+            trigger="lazy",
+        )
+        if demotion is None:
+            return
+        router.replace_cached_manifest(demotion.manifest)
+        session.manifest = demotion.manifest
+
+    owner_dm_channel_id = config.owner_dm_channel_id or router.owner_dm_channel_id
+    if owner_dm_channel_id:
+        try:
+            await post_yolo_expired_notification(
+                slack_client,
+                owner_dm_channel_id=owner_dm_channel_id,
+                channel_id=demotion.channel_id,
+                channel_label=demotion.manifest.label,
+                pre_yolo_tier=demotion.pre_yolo_tier,
+                duration_used=demotion.duration_used,
+            )
+        except Exception:
+            log.warning(
+                "ingress.yolo_expired_notification_failed channel=%s",
+                demotion.channel_id,
+                exc_info=True,
+            )
+    else:
+        log.warning(
+            "ingress.yolo_expired_notification_dropped channel=%s reason=no_owner_dm",
+            demotion.channel_id,
+        )
+    log.info(
+        "channel.yolo_demoted channel_id=%s restored_tier=%s",
+        demotion.channel_id,
+        demotion.effective_tier,
+    )
 
 
 async def handle_block_action(payload: dict, router, slack_client) -> dict:

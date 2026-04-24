@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -227,7 +228,9 @@ async def test_upgrade_approve_bounded_yolo_sets_expiry(
     manifest = load_manifest(channel_manifest_path("C07TEAM", home))
     assert result == {"ok": True, "decision": "approve", "duration": "24h"}
     assert manifest.permission_tier == PermissionTier.YOLO
+    assert manifest.yolo_granted_at is not None
     assert manifest.yolo_until is not None
+    assert manifest.yolo_until - manifest.yolo_granted_at == timedelta(hours=24)
     assert manifest.pre_yolo_tier == PermissionTier.TASK_ASSISTANT
     assert slack.update_calls[0]["text"] == "✅ Upgraded to yolo by <@U07OWNER>."
     assert slack.update_calls[1]["text"] == "✅ Approved by <@U07OWNER>."

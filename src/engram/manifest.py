@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import tempfile
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -121,6 +122,24 @@ _TIER_DEFAULTS: dict[PermissionTier, dict[str, tuple[str, ...] | int]] = {
 OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES: tuple[str, ...] = tuple(
     _TIER_DEFAULTS[PermissionTier.OWNER_SCOPED]["allow_rules"]
 )
+
+YOLO_MIN_DURATION = timedelta(hours=6)
+YOLO_DEFAULT_DURATION = timedelta(hours=24)
+YOLO_MAX_DURATION = timedelta(hours=72)
+YOLO_DEFAULT_DURATION_TEXT = "24h"
+YOLO_DURATION_CHOICES = frozenset({"6h", "24h", "72h"})
+
+
+@dataclass(frozen=True)
+class YoloDemotion:
+    channel_id: str
+    previous_tier: PermissionTier
+    effective_tier: PermissionTier
+    pre_yolo_tier: PermissionTier
+    expired_at: datetime | None
+    duration_used: timedelta | None
+    trigger: Literal["lazy", "sweep"]
+    manifest: ChannelManifest
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -389,6 +408,13 @@ class ChannelManifest(BaseModel):
             "Optional expiry for a time-boxed tier upgrade. Must be timezone-aware."
         ),
     )
+    yolo_granted_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Timestamp when the active YOLO window started. Used for expiry "
+            "notifications and duration accounting."
+        ),
+    )
     pre_yolo_tier: PermissionTier | None = Field(
         default=None,
         description="Tier to restore when a temporary upgrade window expires.",
@@ -454,15 +480,15 @@ class ChannelManifest(BaseModel):
             )
         return v
 
-    @field_validator("yolo_until")
+    @field_validator("yolo_until", "yolo_granted_at")
     @classmethod
-    def _yolo_until_must_be_timezone_aware(
+    def _yolo_timestamps_must_be_timezone_aware(
         cls, value: datetime | None
     ) -> datetime | None:
         if value is not None and (
             value.tzinfo is None or value.utcoffset() is None
         ):
-            raise ValueError("yolo_until must be timezone-aware")
+            raise ValueError("yolo timestamps must be timezone-aware")
         return value
 
     # ── Helpers ──────────────────────────────────────────────────
@@ -576,6 +602,8 @@ def _demote_expired_temporary_tier(
     *,
     path: Path | None = None,
 ) -> tuple[ChannelManifest, bool]:
+    if manifest.permission_tier == PermissionTier.YOLO:
+        return manifest, False
     effective_tier = manifest.tier_effective()
     if manifest.yolo_until is None:
         return manifest, False
@@ -587,6 +615,7 @@ def _demote_expired_temporary_tier(
         {
             **manifest.model_dump(mode="json"),
             "permission_tier": effective_tier.value,
+            "yolo_granted_at": None,
             "yolo_until": None,
             "pre_yolo_tier": None,
         },
@@ -601,6 +630,58 @@ def _demote_expired_temporary_tier(
         effective_tier,
     )
     return updated_manifest, True
+
+
+def expired_yolo_demotion(
+    manifest: ChannelManifest,
+    *,
+    now: datetime | None = None,
+    trigger: Literal["lazy", "sweep"],
+    path: Path | None = None,
+) -> YoloDemotion | None:
+    current_time = now or datetime.now(UTC)
+    effective_tier = manifest.tier_effective(now=current_time)
+    if manifest.permission_tier != PermissionTier.YOLO:
+        return None
+    if effective_tier == PermissionTier.YOLO:
+        return None
+
+    expired_at = manifest.yolo_until
+    pre_yolo_tier = manifest.pre_yolo_tier or PermissionTier.TASK_ASSISTANT
+    duration_used: timedelta | None = None
+    if expired_at is not None and manifest.yolo_granted_at is not None:
+        duration_used = max(expired_at - manifest.yolo_granted_at, timedelta())
+
+    rematerialized_raw, _ = _apply_tier_defaults(
+        {
+            **manifest.model_dump(mode="json"),
+            "permission_tier": effective_tier.value,
+            "yolo_granted_at": None,
+            "yolo_until": None,
+            "pre_yolo_tier": None,
+        },
+        infer_legacy_tier=False,
+    )
+    updated_manifest = ChannelManifest.model_validate(rematerialized_raw)
+    log.info(
+        "channel.yolo_expired channel_id=%s path=%s expired_at=%s pre_yolo_tier=%s duration_used_s=%s trigger=%s",
+        manifest.channel_id,
+        path,
+        expired_at.isoformat() if expired_at is not None else None,
+        pre_yolo_tier,
+        int(duration_used.total_seconds()) if duration_used is not None else None,
+        trigger,
+    )
+    return YoloDemotion(
+        channel_id=manifest.channel_id,
+        previous_tier=manifest.permission_tier,
+        effective_tier=effective_tier,
+        pre_yolo_tier=pre_yolo_tier,
+        expired_at=expired_at,
+        duration_used=duration_used,
+        trigger=trigger,
+        manifest=updated_manifest,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -655,6 +736,25 @@ def load_manifest(path: Path) -> ChannelManifest:
 def dump_manifest(manifest: ChannelManifest, path: Path) -> None:
     """Write a manifest to YAML. Parent dir must exist."""
     path.write_text(_manifest_yaml(manifest))
+
+
+def persist_yolo_demotion(
+    path: Path,
+    *,
+    now: datetime | None = None,
+    trigger: Literal["lazy", "sweep"],
+) -> YoloDemotion | None:
+    manifest = load_manifest(path)
+    demotion = expired_yolo_demotion(
+        manifest,
+        now=now,
+        trigger=trigger,
+        path=path,
+    )
+    if demotion is None:
+        return None
+    dump_manifest(demotion.manifest, path)
+    return demotion
 
 
 def _manifest_yaml(manifest: ChannelManifest) -> str:
@@ -774,11 +874,13 @@ def add_allow_rule(
 UPGRADE_DURATION_DELTAS: dict[str, timedelta] = {
     "6h": timedelta(hours=6),
     "24h": timedelta(hours=24),
+    "72h": timedelta(hours=72),
     "30d": timedelta(days=30),
 }
 UPGRADE_DURATION_CHOICES: tuple[str, ...] = (
     "6h",
     "24h",
+    "72h",
     "30d",
     "permanent",
 )
@@ -816,11 +918,21 @@ def set_channel_permission_tier(
 ) -> tuple[ChannelManifest, ChannelManifest, Path, str]:
     """Load a channel manifest, update ``permission_tier``, and persist it."""
     normalized_duration = validate_upgrade_duration(duration)
+    if new_tier == PermissionTier.YOLO and normalized_duration not in YOLO_DURATION_CHOICES:
+        raise ValueError(
+            "yolo upgrades must use a bounded duration of 6h, 24h, or 72h"
+        )
     current_time = now or datetime.now(UTC)
     manifest_path = paths.channel_manifest_path(channel_id, home)
     manifest = load_manifest(manifest_path)
 
     expires_at = upgrade_expires_at(normalized_duration, now=current_time)
+    is_active_yolo_extension = (
+        new_tier == PermissionTier.YOLO
+        and manifest.permission_tier == PermissionTier.YOLO
+        and manifest.yolo_until is not None
+        and manifest.yolo_until > current_time
+    )
     restore_tier = (
         manifest.pre_yolo_tier
         if (
@@ -835,14 +947,33 @@ def set_channel_permission_tier(
     update_data: dict[str, object] = {"permission_tier": new_tier}
     if expires_at is None:
         update_data["yolo_until"] = None
+        update_data["yolo_granted_at"] = None
         update_data["pre_yolo_tier"] = None
+    elif is_active_yolo_extension:
+        update_data["yolo_until"] = manifest.yolo_until + UPGRADE_DURATION_DELTAS[normalized_duration]
+        update_data["yolo_granted_at"] = manifest.yolo_granted_at or current_time
+        update_data["pre_yolo_tier"] = (
+            manifest.pre_yolo_tier or PermissionTier.TASK_ASSISTANT
+        )
     else:
         update_data["yolo_until"] = expires_at
+        update_data["yolo_granted_at"] = (
+            current_time if new_tier == PermissionTier.YOLO else None
+        )
         update_data["pre_yolo_tier"] = restore_tier
 
     updated = manifest.model_copy(update=update_data)
     if updated == manifest:
         return manifest, manifest, manifest_path, normalized_duration
+
+    if new_tier == PermissionTier.YOLO:
+        log.info(
+            "channel.yolo_granted channel_id=%s duration_s=%s pre_yolo_tier=%s yolo_until=%s",
+            updated.channel_id,
+            int(UPGRADE_DURATION_DELTAS[normalized_duration].total_seconds()),
+            updated.pre_yolo_tier,
+            updated.yolo_until.isoformat() if updated.yolo_until is not None else None,
+        )
 
     _write_manifest_atomic(updated, manifest_path)
     return manifest, updated, manifest_path, normalized_duration
