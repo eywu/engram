@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from engram.agent import AgentTurn
+from engram.footguns import match_footgun
 from engram.hitl import PendingQuestion
 from engram.manifest import YOLO_DEFAULT_DURATION_TEXT, PermissionTier
 
@@ -135,12 +136,16 @@ async def post_question(q: PendingQuestion, slack_client) -> tuple[str, str]:
     Returns (channel_ts, thread_ts), which are stored on the question for later
     message updates.
     """
+    if q.footgun_match is not None:
+        return await post_footgun_confirmation_card(q, slack_client)
+
     header = f"🤔 Can I proceed with `{q.tool_name}`?"
     input_summary = json.dumps(q.tool_input, indent=2)[:800]
     action_elements = []
     sticky_eligible = _is_sticky_eligible(
         q.tool_name,
         getattr(q, "channel_manifest", None),
+        tool_input=q.tool_input,
     )
 
     # Always include a primary "Allow" button (index 0), even when the SDK
@@ -211,6 +216,103 @@ async def post_question(q: PendingQuestion, slack_client) -> tuple[str, str]:
         text=header,
     )
     return (response["ts"], response["ts"])
+
+
+async def post_footgun_confirmation_card(
+    q: PendingQuestion,
+    slack_client,
+) -> tuple[str, str]:
+    """Post the destructive-action confirmation card for a footgun match."""
+    match = q.footgun_match
+    if match is None:
+        raise ValueError("footgun confirmation card requires q.footgun_match")
+
+    header = "⚠️ Destructive action confirmation required"
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": header}},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Matched rule:* {match.description}",
+            },
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"```{match.command}```"},
+        },
+        {
+            "type": "actions",
+            "block_id": "footgun_actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Confirm..."},
+                    "value": q.permission_request_id,
+                    "action_id": "footgun_confirm_open",
+                    "style": "danger",
+                }
+            ],
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "_Requires a fresh typed confirmation. Times out in 5 minutes._",
+                }
+            ],
+        },
+    ]
+
+    response = await slack_client.chat_postMessage(
+        channel=q.channel_id,
+        blocks=blocks,
+        text=header,
+    )
+    return (response["ts"], response["ts"])
+
+
+def build_footgun_confirmation_modal(q: PendingQuestion) -> dict:
+    """Build the Slack modal for typed destructive-action confirmation."""
+    match = q.footgun_match
+    if match is None:
+        raise ValueError("footgun confirmation modal requires q.footgun_match")
+
+    return {
+        "type": "modal",
+        "callback_id": "footgun_confirm_submit",
+        "notify_on_close": True,
+        "private_metadata": q.permission_request_id,
+        "title": {"type": "plain_text", "text": "Confirm Action"},
+        "submit": {"type": "plain_text", "text": "Submit"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Matched rule:* {match.description}",
+                },
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"```{match.command}```"},
+            },
+            {
+                "type": "input",
+                "block_id": "footgun_confirm_input",
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "confirmation_text",
+                },
+                "label": {
+                    "type": "plain_text",
+                    "text": "Type CONFIRM to proceed",
+                },
+            },
+        ],
+    }
 
 
 async def post_meta_eligibility_question(
@@ -547,6 +649,24 @@ async def update_question_resolved(
 
 async def update_question_timeout(q: PendingQuestion, slack_client) -> None:
     """Edit the original question message to show timeout."""
+    if q.footgun_match is not None:
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "⏱️ Destructive action confirmation timed out - command denied.",
+                },
+            },
+        ]
+        await slack_client.chat_update(
+            channel=q.channel_id,
+            ts=q.slack_channel_ts,
+            blocks=blocks,
+            text="Timed out",
+        )
+        return
+
     blocks = [
         {
             "type": "section",
@@ -640,7 +760,12 @@ def _always_allow_label(tool_name: str | None) -> str:
     return "Always allow"
 
 
-def _is_sticky_eligible(tool_name: str, channel_manifest) -> bool:
+def _is_sticky_eligible(
+    tool_name: str,
+    channel_manifest,
+    *,
+    tool_input: dict | None = None,
+) -> bool:
     """Return True iff a HITL prompt may offer channel-scoped sticky allow."""
     if (
         channel_manifest is None
@@ -648,6 +773,8 @@ def _is_sticky_eligible(tool_name: str, channel_manifest) -> bool:
     ):
         return False
     if tool_name.startswith("mcp__"):
+        return False
+    if tool_input is not None and match_footgun(tool_name, tool_input) is not None:
         return False
     return tool_name not in _STICKY_INELIGIBLE_TOOLS
 

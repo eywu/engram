@@ -10,13 +10,18 @@ from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import PermissionRuleValue, PermissionUpdate
 
 from engram.config import AnthropicConfig, EngramConfig, SlackConfig
+from engram.footguns import match_footgun
 from engram.hitl import PendingQuestion
 from engram.ingress import (
+    FOOTGUN_CONFIRM_OPEN_ACTION_ID,
     HITL_ACTION_ID_PATTERN,
     UPGRADE_ACTION_ID_PATTERN,
     YOLO_EXTEND_ACTION_ID_PATTERN,
     YOLO_REVOKE_ACTION_ID_PATTERN,
     handle_block_action,
+    handle_footgun_confirm_closed,
+    handle_footgun_confirm_open,
+    handle_footgun_confirm_submit,
     handle_meta_eligibility_command,
     handle_thread_reply,
     parse_meta_eligibility_command,
@@ -39,6 +44,8 @@ class DecoratorApp:
         self.actions = []
         self.commands = []
         self.events = []
+        self.views = []
+        self.view_closed_handlers = []
 
     def action(self, pattern):
         def decorator(func):
@@ -61,11 +68,27 @@ class DecoratorApp:
 
         return decorator
 
+    def view(self, callback_id):
+        def decorator(func):
+            self.views.append((callback_id, func))
+            return func
+
+        return decorator
+
+    def view_closed(self, callback_id):
+        def decorator(func):
+            self.view_closed_handlers.append((callback_id, func))
+            return func
+
+        return decorator
+
 
 class FakeSlackClient:
     def __init__(self) -> None:
         self.post_calls = []
         self.update_calls = []
+        self.ephemeral_calls = []
+        self.view_open_calls = []
         self.chat_postMessage = self._chat_post_message
 
     async def _chat_post_message(self, **kwargs):
@@ -76,6 +99,14 @@ class FakeSlackClient:
         self.update_calls.append(kwargs)
         return {"ok": True}
 
+    async def chat_postEphemeral(self, **kwargs):
+        self.ephemeral_calls.append(kwargs)
+        return {"ok": True}
+
+    async def views_open(self, **kwargs):
+        self.view_open_calls.append(kwargs)
+        return {"ok": True}
+
 
 def make_question(
     permission_request_id: str = "prq-1",
@@ -83,6 +114,8 @@ def make_question(
     channel_id: str = "C07TEST123",
     suggestions=None,
     who_can_answer: str | None = None,
+    tool_input=None,
+    footgun_match=None,
 ) -> PendingQuestion:
     return PendingQuestion(
         permission_request_id=permission_request_id,
@@ -90,13 +123,14 @@ def make_question(
         session_id="session-1",
         turn_id="turn-1",
         tool_name="Bash",
-        tool_input={"cmd": "pytest", "timeout": 30},
+        tool_input=dict(tool_input or {"cmd": "pytest", "timeout": 30}),
         suggestions=list(suggestions or []),
         who_can_answer=who_can_answer,
         posted_at=datetime(2026, 4, 22, tzinfo=UTC),
         timeout_s=300,
         slack_channel_ts="1713800000.000100",
         slack_thread_ts="1713800000.000100",
+        footgun_match=footgun_match,
     )
 
 
@@ -117,6 +151,64 @@ def block_action_payload(value: str, *, user_id: str = "U123") -> dict:
             }
         ],
         "user": {"id": user_id},
+    }
+
+
+def footgun_open_payload(
+    permission_request_id: str = "prq-1",
+    *,
+    user_id: str = "U123",
+    trigger_id: str = "trigger-1",
+) -> dict:
+    return {
+        "type": "block_actions",
+        "trigger_id": trigger_id,
+        "actions": [
+            {
+                "action_id": FOOTGUN_CONFIRM_OPEN_ACTION_ID,
+                "block_id": "footgun_actions",
+                "value": permission_request_id,
+            }
+        ],
+        "user": {"id": user_id},
+    }
+
+
+def footgun_submit_payload(
+    permission_request_id: str = "prq-1",
+    *,
+    typed_value: str,
+    user_id: str = "U123",
+) -> dict:
+    return {
+        "type": "view_submission",
+        "user": {"id": user_id},
+        "view": {
+            "callback_id": "footgun_confirm_submit",
+            "private_metadata": permission_request_id,
+            "state": {
+                "values": {
+                    "footgun_confirm_input": {
+                        "confirmation_text": {"value": typed_value}
+                    }
+                }
+            },
+        },
+    }
+
+
+def footgun_closed_payload(
+    permission_request_id: str = "prq-1",
+    *,
+    user_id: str = "U123",
+) -> dict:
+    return {
+        "type": "view_closed",
+        "user": {"id": user_id},
+        "view": {
+            "callback_id": "footgun_confirm_submit",
+            "private_metadata": permission_request_id,
+        },
     }
 
 
@@ -177,13 +269,14 @@ def test_register_listeners_attaches_hitl_action_handler():
 
     register_listeners(app, make_config(), Router(), agent=object())
 
-    assert len(app.actions) == 5
+    assert len(app.actions) == 6
     patterns = [pattern for pattern, _handler in app.actions]
     assert HITL_ACTION_ID_PATTERN in patterns
     assert PENDING_CHANNEL_ACTION_ID_PATTERN in patterns
     assert UPGRADE_ACTION_ID_PATTERN in patterns
     assert YOLO_EXTEND_ACTION_ID_PATTERN in patterns
     assert YOLO_REVOKE_ACTION_ID_PATTERN in patterns
+    assert FOOTGUN_CONFIRM_OPEN_ACTION_ID in patterns
     assert HITL_ACTION_ID_PATTERN.match("hitl_choice_0")
     assert HITL_ACTION_ID_PATTERN.match("hitl_choice_4")
     assert HITL_ACTION_ID_PATTERN.match("hitl_choice_always_0")
@@ -204,6 +297,12 @@ def test_register_listeners_attaches_hitl_action_handler():
         "/engram",
         "/exclude-from-nightly",
         "/include-in-nightly",
+    ]
+    assert [callback_id for callback_id, _handler in app.views] == [
+        "footgun_confirm_submit"
+    ]
+    assert [callback_id for callback_id, _handler in app.view_closed_handlers] == [
+        "footgun_confirm_submit"
     ]
 
 
@@ -447,6 +546,133 @@ async def test_block_action_wrong_user_rejected():
 
 
 @pytest.mark.asyncio
+async def test_footgun_confirm_open_opens_modal_for_owner():
+    router = Router()
+    slack = FakeSlackClient()
+    q = make_question(
+        who_can_answer="U123",
+        tool_input={"cmd": "rm -rf /tmp/demo"},
+        footgun_match=match_footgun("Bash", {"cmd": "rm -rf /tmp/demo"}),
+    )
+    router.hitl.register(q)
+
+    ack = await handle_footgun_confirm_open(
+        footgun_open_payload(),
+        router,
+        slack,
+    )
+
+    assert ack == {"ok": True}
+    assert slack.ephemeral_calls == []
+    assert len(slack.view_open_calls) == 1
+    call = slack.view_open_calls[0]
+    assert call["trigger_id"] == "trigger-1"
+    assert call["view"]["callback_id"] == "footgun_confirm_submit"
+    assert call["view"]["private_metadata"] == "prq-1"
+
+
+@pytest.mark.asyncio
+async def test_footgun_confirm_open_rejects_non_owner():
+    router = Router()
+    slack = FakeSlackClient()
+    q = make_question(
+        who_can_answer="U_ALLOWED",
+        tool_input={"cmd": "rm -rf /tmp/demo"},
+        footgun_match=match_footgun("Bash", {"cmd": "rm -rf /tmp/demo"}),
+    )
+    router.hitl.register(q)
+
+    ack = await handle_footgun_confirm_open(
+        footgun_open_payload(user_id="U_OTHER"),
+        router,
+        slack,
+    )
+
+    assert ack == {"ok": False, "error": "not authorized"}
+    assert slack.view_open_calls == []
+    assert slack.ephemeral_calls == [
+        {
+            "channel": "C07TEST123",
+            "user": "U_OTHER",
+            "text": "Owner approval required for destructive actions.",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_footgun_confirm_submit_requires_exact_CONFIRM():
+    router = Router()
+    slack = FakeSlackClient()
+    q = make_question(
+        who_can_answer="U123",
+        tool_input={"cmd": "rm -rf /tmp/demo"},
+        footgun_match=match_footgun("Bash", {"cmd": "rm -rf /tmp/demo"}),
+    )
+    router.hitl.register(q)
+
+    ack = await handle_footgun_confirm_submit(
+        footgun_submit_payload(typed_value="CONFIRM"),
+        router,
+        slack,
+    )
+
+    assert ack == {"ok": True}
+    assert q.future.done()
+    result = q.future.result()
+    assert isinstance(result, PermissionResultAllow)
+    assert slack.update_calls[0]["text"] == "Answered: Confirmed destructive action"
+
+
+@pytest.mark.asyncio
+async def test_footgun_confirm_submit_wrong_text_denies():
+    router = Router()
+    slack = FakeSlackClient()
+    q = make_question(
+        who_can_answer="U123",
+        tool_input={"cmd": "rm -rf /tmp/demo"},
+        footgun_match=match_footgun("Bash", {"cmd": "rm -rf /tmp/demo"}),
+    )
+    router.hitl.register(q)
+
+    ack = await handle_footgun_confirm_submit(
+        footgun_submit_payload(typed_value="confirm"),
+        router,
+        slack,
+    )
+
+    assert ack == {"ok": True}
+    assert q.future.done()
+    result = q.future.result()
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True
+    assert slack.update_calls[0]["text"] == "Answered: Destructive action denied"
+
+
+@pytest.mark.asyncio
+async def test_footgun_confirm_close_denies():
+    router = Router()
+    slack = FakeSlackClient()
+    q = make_question(
+        who_can_answer="U123",
+        tool_input={"cmd": "rm -rf /tmp/demo"},
+        footgun_match=match_footgun("Bash", {"cmd": "rm -rf /tmp/demo"}),
+    )
+    router.hitl.register(q)
+
+    ack = await handle_footgun_confirm_closed(
+        footgun_closed_payload(),
+        router,
+        slack,
+    )
+
+    assert ack == {"ok": True}
+    assert q.future.done()
+    result = q.future.result()
+    assert isinstance(result, PermissionResultDeny)
+    assert slack.update_calls[0]["text"] == "Answered: Destructive action denied"
+
+
+@pytest.mark.asyncio
 async def test_block_action_missing_question_ok():
     router = Router()
     slack = FakeSlackClient()
@@ -520,6 +746,31 @@ async def test_thread_reply_wrong_channel_ignored():
             "channel": "C07OTHER",
             "thread_ts": "1713800000.000100",
             "text": "This should not resolve the question.",
+            "user": "U123",
+        },
+        router,
+        slack,
+    )
+
+    assert not q.future.done()
+    assert slack.update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_thread_reply_ignored_for_footgun_confirmation():
+    router = Router()
+    slack = FakeSlackClient()
+    q = make_question(
+        tool_input={"cmd": "rm -rf /tmp/demo"},
+        footgun_match=match_footgun("Bash", {"cmd": "rm -rf /tmp/demo"}),
+    )
+    router.hitl.register(q)
+
+    await handle_thread_reply(
+        {
+            "channel": "C07TEST123",
+            "thread_ts": "1713800000.000100",
+            "text": "CONFIRM",
             "user": "U123",
         },
         router,

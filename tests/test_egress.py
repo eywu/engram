@@ -1,6 +1,7 @@
 """Egress tests — chunking + post shape, no real Slack calls."""
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 
@@ -18,6 +19,7 @@ from engram.egress import (
     update_question_resolved,
     update_question_timeout,
 )
+from engram.footguns import match_footgun
 from engram.hitl import PendingQuestion
 from engram.manifest import ChannelManifest, IdentityTemplate, PermissionTier
 
@@ -42,6 +44,8 @@ def make_question(
     suggestions=None,
     tool_name: str = "Bash",
     channel_manifest=None,
+    tool_input=None,
+    footgun_match=None,
 ) -> PendingQuestion:
     return PendingQuestion(
         permission_request_id="prq-1",
@@ -49,7 +53,7 @@ def make_question(
         session_id="session-1",
         turn_id="turn-1",
         tool_name=tool_name,
-        tool_input={"cmd": "pytest", "timeout": 30},
+        tool_input=dict(tool_input or {"cmd": "pytest", "timeout": 30}),
         suggestions=list(suggestions or []),
         who_can_answer=None,
         posted_at=datetime(2026, 4, 22, tzinfo=UTC),
@@ -57,6 +61,7 @@ def make_question(
         slack_channel_ts="1713800000.000100",
         slack_thread_ts="1713800000.000100",
         channel_manifest=channel_manifest,
+        footgun_match=footgun_match,
     )
 
 
@@ -427,6 +432,34 @@ async def test_post_question_team_channel_webfetch_keeps_two_button_layout():
 
 
 @pytest.mark.asyncio
+async def test_post_question_renders_footgun_confirmation_card():
+    slack = FakeSlackClient()
+    command = "rm -rf /tmp/demo"
+    q = make_question(
+        suggestions=[],
+        tool_name="Bash",
+        channel_manifest=owner_dm_manifest(),
+        tool_input={"cmd": command},
+        footgun_match=match_footgun("Bash", {"cmd": command}),
+    )
+
+    await post_question(q, slack)
+
+    call = slack.post_calls[0]
+    blocks = call["blocks"]
+    assert call["text"] == "⚠️ Destructive action confirmation required"
+    assert blocks[0]["text"]["text"] == "⚠️ Destructive action confirmation required"
+    assert blocks[1]["text"]["text"] == "*Matched rule:* recursive rm command"
+    assert blocks[2]["text"]["text"] == f"```{command}```"
+    assert blocks[3]["block_id"] == "footgun_actions"
+    assert [element["text"]["text"] for element in blocks[3]["elements"]] == [
+        "Confirm..."
+    ]
+    assert blocks[3]["elements"][0]["action_id"] == "footgun_confirm_open"
+    assert "Always allow" not in json.dumps(blocks)
+
+
+@pytest.mark.asyncio
 async def test_update_question_resolved_strips_buttons():
     slack = FakeSlackClient()
     q = make_question()
@@ -452,6 +485,21 @@ async def test_update_question_timeout_has_clock_emoji():
     call = slack.update_calls[0]
     assert call["text"] == "Timed out"
     assert "⏱️ Question timed out" in call["blocks"][0]["text"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_update_footgun_question_timeout_denies_command():
+    slack = FakeSlackClient()
+    q = make_question(
+        tool_input={"cmd": "rm -rf /tmp/demo"},
+        footgun_match=match_footgun("Bash", {"cmd": "rm -rf /tmp/demo"}),
+    )
+
+    await update_question_timeout(q, slack)
+
+    call = slack.update_calls[0]
+    assert call["text"] == "Timed out"
+    assert "command denied" in call["blocks"][0]["text"]["text"]
 
 
 def test_suggestion_label_extraction():

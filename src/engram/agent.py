@@ -31,6 +31,8 @@ from claude_agent_sdk import (
     CLIJSONDecodeError,
     CLINotFoundError,
     HookMatcher,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ProcessError,
     RateLimitEvent,
     RateLimitStatus,
@@ -42,6 +44,7 @@ from engram.budget import BUDGET_PAUSE_MESSAGE, Budget, CheckResult
 from engram.config import EngramConfig
 from engram.costs import CostDatabase, RateLimitRecord
 from engram.embeddings import EmbeddingQueue
+from engram.footguns import match_footgun
 from engram.hitl import build_hitl_tool_guard
 from engram.hooks import build_hooks
 from engram.manifest import PermissionTier
@@ -127,6 +130,7 @@ class Agent:
 
         await session.agent_lock.acquire()
         try:
+            session.current_user_id = user_id
             if self._is_rate_limited(session):
                 reset = _format_reset_at(session.rate_limit_reset_at)
                 log.info(
@@ -218,6 +222,7 @@ class Agent:
                 "agent.run_turn failed for session=%s", session.label()
             )
         finally:
+            session.current_user_id = None
             session.agent_last_active_at = time.monotonic()
             session.agent_lock.release()
 
@@ -543,6 +548,114 @@ class Agent:
             and hitl_config is not None
             and hitl_config.enabled
         ):
+            scope_can_use_tool = can_use_tool
+
+            async def _scope_and_footgun_precheck(tool_name, tool_input, context):
+                effective_input = tool_input
+                effective_tier = (
+                    manifest.tier_effective() if manifest is not None else None
+                )
+
+                def _log_footgun_match(footgun_match) -> None:
+                    if effective_tier is None:
+                        return
+                    log.info(
+                        "footgun.matched",
+                        extra={
+                            "pattern": footgun_match.pattern.pattern,
+                            "command": footgun_match.command,
+                            "tier": effective_tier.value,
+                        },
+                    )
+
+                initial_footgun_match = (
+                    match_footgun(tool_name, tool_input)
+                    if manifest is not None
+                    else None
+                )
+                if initial_footgun_match is not None:
+                    _log_footgun_match(initial_footgun_match)
+                    if effective_tier == PermissionTier.TASK_ASSISTANT:
+                        log.info(
+                            "footgun.denied_task_assistant",
+                            extra={
+                                "pattern": initial_footgun_match.pattern.pattern,
+                                "command": initial_footgun_match.command,
+                                "tier": effective_tier.value,
+                            },
+                        )
+                        return PermissionResultDeny(
+                            message=(
+                                "Destructive command blocked in task-assistant tier. "
+                                "Request upgrade to owner-scoped."
+                            ),
+                        )
+
+                if scope_can_use_tool is not None:
+                    scope_result = await scope_can_use_tool(
+                        tool_name,
+                        tool_input,
+                        context,
+                    )
+                    if isinstance(scope_result, PermissionResultDeny):
+                        return scope_result
+                    if scope_result.updated_input is not None:
+                        effective_input = scope_result.updated_input
+
+                if manifest is None:
+                    if effective_input is tool_input:
+                        return PermissionResultAllow()
+                    return PermissionResultAllow(updated_input=effective_input)
+
+                footgun_match = initial_footgun_match or match_footgun(
+                    tool_name,
+                    effective_input,
+                )
+                if footgun_match is None:
+                    if effective_input is tool_input:
+                        return PermissionResultAllow()
+                    return PermissionResultAllow(updated_input=effective_input)
+
+                if initial_footgun_match is None:
+                    _log_footgun_match(footgun_match)
+                if effective_tier == PermissionTier.TASK_ASSISTANT:
+                    log.info(
+                        "footgun.denied_task_assistant",
+                        extra={
+                            "pattern": footgun_match.pattern.pattern,
+                            "command": footgun_match.command,
+                            "tier": effective_tier.value,
+                        },
+                    )
+                    return PermissionResultDeny(
+                        message=(
+                            "Destructive command blocked in task-assistant tier. "
+                            "Request upgrade to owner-scoped."
+                        ),
+                    )
+
+                if effective_input is tool_input:
+                    return PermissionResultAllow()
+                return PermissionResultAllow(updated_input=effective_input)
+
+            def _question_metadata(tool_name, tool_input, _context):
+                if manifest is None:
+                    return {}
+                effective_tier = manifest.tier_effective()
+                if effective_tier not in {
+                    PermissionTier.OWNER_SCOPED,
+                    PermissionTier.YOLO,
+                }:
+                    return {}
+                footgun_match = match_footgun(tool_name, tool_input)
+                if footgun_match is None:
+                    return {}
+                metadata = {"footgun_match": footgun_match}
+                if self._config.owner_user_id:
+                    metadata["who_can_answer"] = self._config.owner_user_id
+                elif session.current_user_id:
+                    metadata["who_can_answer"] = session.current_user_id
+                return metadata
 
             async def _noop_on_new_question(q) -> None:
                 log.warning(
@@ -563,7 +676,8 @@ class Agent:
                 ),
                 default_timeout_s=hitl_config.timeout_s,
                 max_per_day=hitl_config.max_per_day,
-                precheck=can_use_tool,
+                precheck=_scope_and_footgun_precheck,
+                question_metadata_provider=_question_metadata,
             )
 
         session_kwargs = (

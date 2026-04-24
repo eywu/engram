@@ -66,6 +66,7 @@ class SessionState:
     agent_session_tagged: bool = False
     agent_last_active_at: float = field(default_factory=time.monotonic)
     turn_count: int = 0
+    current_user_id: str | None = None
     manifest: ChannelManifest | None = None
     rate_limit_status: str = "allowed"
     rate_limit_reset_at: int | None = None

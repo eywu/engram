@@ -9,6 +9,7 @@ M2 replaces the allowlist with manifest-driven provisioning.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import logging
 import re
@@ -27,6 +28,7 @@ from engram.egress import (
     ActiveYoloGrantRow,
     _always_allow_label,
     _suggestion_label,
+    build_footgun_confirmation_modal,
     post_meta_eligibility_question,
     post_reply,
     post_upgrade_request_dm,
@@ -68,6 +70,7 @@ UPGRADE_ACTION_ID_PATTERN = re.compile(
 )
 YOLO_EXTEND_ACTION_ID_PATTERN = re.compile(r"^yolo_extend_[A-Z0-9]+$")
 YOLO_REVOKE_ACTION_ID_PATTERN = re.compile(r"^yolo_revoke_[A-Z0-9]+$")
+FOOTGUN_CONFIRM_OPEN_ACTION_ID = "footgun_confirm_open"
 CHANNEL_REF_PATTERN = re.compile(r"<#(?P<id>[A-Z0-9]+)(?:\|[^>]+)?>")
 CHANNEL_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]+$")
 _PENDING_UPGRADE_REQUESTS: dict[str, PendingUpgradeRequest] = {}
@@ -115,6 +118,45 @@ def register_listeners(
                 )
         except Exception:
             log.exception("ingress.hitl_action_handler_failed")
+
+    @app.action(FOOTGUN_CONFIRM_OPEN_ACTION_ID)
+    async def on_footgun_confirm_open(ack, body, client):
+        await ack()
+        try:
+            result = await handle_footgun_confirm_open(body, router, client)
+            if not result.get("ok"):
+                log.warning(
+                    "ingress.footgun_confirm_open_failed error=%s",
+                    result.get("error", "unknown"),
+                )
+        except Exception:
+            log.exception("ingress.footgun_confirm_open_handler_failed")
+
+    @app.view("footgun_confirm_submit")
+    async def on_footgun_confirm_submit(ack, body, client):
+        await ack()
+        try:
+            result = await handle_footgun_confirm_submit(body, router, client)
+            if not result.get("ok"):
+                log.warning(
+                    "ingress.footgun_confirm_submit_failed error=%s",
+                    result.get("error", "unknown"),
+                )
+        except Exception:
+            log.exception("ingress.footgun_confirm_submit_handler_failed")
+
+    @app.view_closed("footgun_confirm_submit")
+    async def on_footgun_confirm_closed(ack, body, client):
+        await ack()
+        try:
+            result = await handle_footgun_confirm_closed(body, router, client)
+            if not result.get("ok"):
+                log.warning(
+                    "ingress.footgun_confirm_closed_failed error=%s",
+                    result.get("error", "unknown"),
+                )
+        except Exception:
+            log.exception("ingress.footgun_confirm_closed_handler_failed")
 
     @app.action(PENDING_CHANNEL_ACTION_ID_PATTERN)
     async def on_pending_channel_action(ack, body, client):
@@ -546,6 +588,107 @@ async def handle_block_action(payload: dict, router, slack_client) -> dict:
     )
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return {"ok": True}
+
+
+async def handle_footgun_confirm_open(payload: dict, router, slack_client) -> dict:
+    """Open the type-to-confirm modal for a pending footgun question."""
+    actions = payload.get("actions") or []
+    if not actions:
+        return {"ok": False, "error": "no actions"}
+
+    permission_request_id = str(actions[0].get("value") or "").strip()
+    if not permission_request_id:
+        return {"ok": False, "error": "missing permission request id"}
+
+    q = router.hitl.get_by_id(permission_request_id)
+    if q is None:
+        return {"ok": False, "error": "question not found (may be resolved)"}
+    if q.future.done():
+        return {"ok": True, "info": "already resolved"}
+    if q.footgun_match is None:
+        return {"ok": False, "error": "question is not a footgun confirmation"}
+
+    clicker_user_id = payload.get("user", {}).get("id")
+    if q.who_can_answer and clicker_user_id != q.who_can_answer:
+        with contextlib.suppress(Exception):
+            await slack_client.chat_postEphemeral(
+                channel=q.channel_id,
+                user=clicker_user_id,
+                text="Owner approval required for destructive actions.",
+            )
+        return {"ok": False, "error": "not authorized"}
+
+    trigger_id = payload.get("trigger_id")
+    if not trigger_id:
+        return {"ok": False, "error": "missing trigger id"}
+
+    await slack_client.views_open(
+        trigger_id=trigger_id,
+        view=build_footgun_confirmation_modal(q),
+    )
+    return {"ok": True}
+
+
+async def handle_footgun_confirm_submit(payload: dict, router, slack_client) -> dict:
+    """Resolve a pending footgun confirmation from modal submission."""
+    view = payload.get("view") or {}
+    permission_request_id = str(view.get("private_metadata") or "").strip()
+    if not permission_request_id:
+        return {"ok": False, "error": "missing permission request id"}
+
+    q = router.hitl.get_by_id(permission_request_id)
+    if q is None:
+        return {"ok": False, "error": "question not found (may be resolved)"}
+    if q.future.done():
+        return {"ok": True, "info": "already resolved"}
+    if q.footgun_match is None:
+        return {"ok": False, "error": "question is not a footgun confirmation"}
+
+    submitter_user_id = payload.get("user", {}).get("id")
+    if q.who_can_answer and submitter_user_id != q.who_can_answer:
+        return {"ok": False, "error": "not authorized"}
+
+    typed_value = _footgun_confirmation_value(view)
+    confirmed = typed_value == "CONFIRM"
+    await _resolve_footgun_question(
+        q,
+        router,
+        slack_client,
+        confirmed=confirmed,
+        user_id=submitter_user_id,
+        reason="submitted" if confirmed else "invalid_confirmation",
+    )
+    return {"ok": True}
+
+
+async def handle_footgun_confirm_closed(payload: dict, router, slack_client) -> dict:
+    """Resolve a pending footgun confirmation when the modal is cancelled."""
+    view = payload.get("view") or {}
+    permission_request_id = str(view.get("private_metadata") or "").strip()
+    if not permission_request_id:
+        return {"ok": False, "error": "missing permission request id"}
+
+    q = router.hitl.get_by_id(permission_request_id)
+    if q is None:
+        return {"ok": False, "error": "question not found (may be resolved)"}
+    if q.future.done():
+        return {"ok": True, "info": "already resolved"}
+    if q.footgun_match is None:
+        return {"ok": False, "error": "question is not a footgun confirmation"}
+
+    closer_user_id = payload.get("user", {}).get("id")
+    if q.who_can_answer and closer_user_id != q.who_can_answer:
+        return {"ok": False, "error": "not authorized"}
+
+    await _resolve_footgun_question(
+        q,
+        router,
+        slack_client,
+        confirmed=False,
+        user_id=closer_user_id,
+        reason="cancelled",
+    )
     return {"ok": True}
 
 
@@ -1657,6 +1800,75 @@ async def _resolve_block_action(
         log.exception("resolve_block_action failed")
 
 
+def _footgun_confirmation_value(view: dict) -> str:
+    state_values = view.get("state", {}).get("values", {})
+    input_block = state_values.get("footgun_confirm_input", {})
+    input_value = input_block.get("confirmation_text", {}).get("value")
+    return str(input_value or "")
+
+
+async def _resolve_footgun_question(
+    q: PendingQuestion,
+    router,
+    slack_client,
+    *,
+    confirmed: bool,
+    user_id: str | None,
+    reason: str,
+) -> None:
+    if confirmed:
+        result = _resolve_question(q, choice="allow")
+        answer_text = "Confirmed destructive action"
+    else:
+        result = _resolve_question(q, choice="deny")
+        answer_text = "Destructive action denied"
+
+    resolved = router.hitl.resolve(q.permission_request_id, result)
+    if not resolved:
+        return
+
+    match = q.footgun_match
+    if match is not None:
+        if confirmed:
+            hitl_log.info(
+                "footgun.confirmed",
+                extra={
+                    "pattern": match.pattern.pattern,
+                    "command": match.command,
+                    "user": user_id,
+                    "duration_ms": max(
+                        0,
+                        int(
+                            (
+                                datetime.datetime.now(datetime.UTC) - q.posted_at
+                            ).total_seconds()
+                            * 1000
+                        ),
+                    ),
+                },
+            )
+        else:
+            hitl_log.info(
+                "footgun.cancelled_or_timed_out",
+                extra={
+                    "pattern": match.pattern.pattern,
+                    "command": match.command,
+                    "user": user_id,
+                    "reason": reason,
+                },
+            )
+
+    if q.on_resolve is not None:
+        await q.on_resolve(result)
+
+    await update_question_resolved(
+        q,
+        answer_text,
+        slack_client,
+        allowed=confirmed,
+    )
+
+
 async def handle_thread_reply(event: dict, router, slack_client) -> None:
     """Resolve a pending question when a Slack thread reply provides an answer."""
     thread_ts = event.get("thread_ts")
@@ -1675,6 +1887,8 @@ async def handle_thread_reply(event: dict, router, slack_client) -> None:
 
     q = candidates[0]
     if q.future.done():
+        return
+    if q.footgun_match is not None:
         return
 
     replier_user_id = event.get("user")

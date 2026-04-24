@@ -5,11 +5,12 @@ the agent would construct for various sessions.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
-from claude_agent_sdk import PermissionResultDeny
+from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import ToolPermissionContext
 
 from engram.agent import Agent
@@ -393,3 +394,115 @@ async def test_runtime_guard_integrates_with_agent():
     assert opts.can_use_tool is not None
     r = await opts.can_use_tool("Bash", {"cmd": "ls"}, Mock())
     assert isinstance(r, PermissionResultDeny)
+
+
+@pytest.mark.asyncio
+async def test_task_assistant_footgun_is_flat_denied_without_prompt():
+    router = Router(hitl=HITLConfig(timeout_s=30))
+    questions = []
+    m = ChannelManifest(
+        channel_id="C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        permission_tier=PermissionTier.TASK_ASSISTANT,
+        tools=ScopeList(allowed=["Bash"]),
+    )
+    a = Agent(_cfg(), router=router)
+
+    async def on_new_question(q):
+        questions.append(q)
+
+    a._on_new_question = on_new_question
+    opts = a._build_options(_session(m))
+
+    result = await opts.can_use_tool(
+        "Bash",
+        {"cmd": "rm -rf /tmp/demo"},
+        ToolPermissionContext(tool_use_id="tool-1"),
+    )
+
+    assert isinstance(result, PermissionResultDeny)
+    assert result.message == (
+        "Destructive command blocked in task-assistant tier. "
+        "Request upgrade to owner-scoped."
+    )
+    assert questions == []
+    assert router.hitl.pending_for_channel("C1") == []
+
+
+@pytest.mark.asyncio
+async def test_yolo_footgun_still_requires_confirmation():
+    router = Router(hitl=HITLConfig(timeout_s=30))
+    questions = []
+    m = ChannelManifest(
+        channel_id="D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        permission_tier=PermissionTier.YOLO,
+        tools=ScopeList(allowed=["Bash"]),
+    )
+    session = _session(m)
+    session.current_user_id = "U_REQUESTER"
+    cfg = _cfg()
+    cfg.owner_user_id = "U_OWNER"
+    a = Agent(cfg, router=router)
+
+    async def on_new_question(q):
+        questions.append(q)
+
+    a._on_new_question = on_new_question
+    opts = a._build_options(session)
+
+    guard_task = asyncio.create_task(
+        opts.can_use_tool(
+            "Bash",
+            {"cmd": "rm -rf /tmp/demo"},
+            ToolPermissionContext(tool_use_id="tool-1"),
+        )
+    )
+
+    for _ in range(50):
+        if questions:
+            break
+        await asyncio.sleep(0.001)
+    assert len(questions) == 1
+    q = questions[0]
+    assert q.footgun_match is not None
+    assert q.footgun_match.description == "recursive rm command"
+    assert q.who_can_answer == "U_OWNER"
+
+    router.hitl.resolve(q.permission_request_id, PermissionResultAllow())
+    result = await asyncio.wait_for(guard_task, timeout=1.0)
+    assert isinstance(result, PermissionResultAllow)
+
+
+@pytest.mark.asyncio
+async def test_owner_scoped_footgun_timeout_denies_with_interrupt():
+    router = Router(hitl=HITLConfig(timeout_s=0))
+    questions = []
+    m = ChannelManifest(
+        channel_id="D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        permission_tier=PermissionTier.OWNER_SCOPED,
+        tools=ScopeList(allowed=["Bash"]),
+    )
+    cfg = _cfg()
+    cfg.owner_user_id = "U_OWNER"
+    a = Agent(cfg, router=router)
+
+    async def on_new_question(q):
+        questions.append(q)
+
+    a._on_new_question = on_new_question
+    opts = a._build_options(_session(m))
+
+    result = await opts.can_use_tool(
+        "Bash",
+        {"cmd": "rm -rf /tmp/demo"},
+        ToolPermissionContext(tool_use_id="tool-1"),
+    )
+
+    assert len(questions) == 1
+    assert questions[0].footgun_match is not None
+    assert isinstance(result, PermissionResultDeny)
+    assert result.message == "question timed out after 0s"
+    assert result.interrupt is True
+    assert router.hitl.pending_for_channel("C1") == []

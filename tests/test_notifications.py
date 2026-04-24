@@ -22,6 +22,8 @@ class DecoratorApp:
         self.actions = []
         self.commands = []
         self.events = []
+        self.views = []
+        self.view_closed_handlers = []
 
     def action(self, pattern):
         def decorator(func):
@@ -40,6 +42,20 @@ class DecoratorApp:
     def event(self, event_name):
         def decorator(func):
             self.events.append((event_name, func))
+            return func
+
+        return decorator
+
+    def view(self, callback_id):
+        def decorator(func):
+            self.views.append((callback_id, func))
+            return func
+
+        return decorator
+
+    def view_closed(self, callback_id):
+        def decorator(func):
+            self.view_closed_handlers.append((callback_id, func))
             return func
 
         return decorator
@@ -126,7 +142,7 @@ def pending_action_handler(app: DecoratorApp):
     return next(
         handler
         for pattern, handler in app.actions
-        if pattern.match("pending_channel_approve")
+        if hasattr(pattern, "match") and pattern.match("pending_channel_approve")
     )
 
 

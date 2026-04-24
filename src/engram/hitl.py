@@ -20,12 +20,17 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 
+from engram.footguns import FootgunMatch
 from engram.manifest import add_allow_rule
 
 PermissionResult = PermissionResultAllow | PermissionResultDeny
 ToolPrecheck = Callable[
     [str, dict[str, Any], ToolPermissionContext],
     Awaitable[PermissionResult],
+]
+QuestionMetadataProvider = Callable[
+    [str, dict[str, Any], ToolPermissionContext],
+    dict[str, Any],
 ]
 log = logging.getLogger(__name__)
 
@@ -56,6 +61,7 @@ class PendingQuestion:
     slack_channel_ts: str | None = None
     slack_thread_ts: str | None = None
     channel_manifest: Any | None = None
+    footgun_match: FootgunMatch | None = None
 
 
 class HITLRegistry:
@@ -159,6 +165,7 @@ def build_hitl_tool_guard(
     default_timeout_s: int = 300,
     max_per_day: int | None = None,
     precheck: ToolPrecheck | None = None,
+    question_metadata_provider: QuestionMetadataProvider | None = None,
 ) -> CanUseTool:
     """Build a blocking can_use_tool callback backed by HITL.
 
@@ -173,12 +180,22 @@ def build_hitl_tool_guard(
         context: ToolPermissionContext,
     ) -> PermissionResult:
         effective_input = tool_input
+        question_metadata: dict[str, Any] = {}
         if precheck is not None:
             precheck_result = await precheck(tool_name, tool_input, context)
             if isinstance(precheck_result, PermissionResultDeny):
                 return precheck_result
             if precheck_result.updated_input is not None:
                 effective_input = precheck_result.updated_input
+        if question_metadata_provider is not None:
+            question_metadata = (
+                question_metadata_provider(
+                    tool_name,
+                    effective_input,
+                    context,
+                )
+                or {}
+            )
 
         return await _request_hitl_decision(
             router=router,
@@ -194,6 +211,7 @@ def build_hitl_tool_guard(
             max_per_day=max_per_day,
             fired_event="hitl.tool_guard_fired",
             returned_event="hitl.tool_guard_returned",
+            question_metadata=question_metadata,
         )
 
     return can_use_tool
@@ -257,6 +275,7 @@ async def _request_hitl_decision(
     max_per_day: int | None,
     fired_event: str,
     returned_event: str,
+    question_metadata: dict[str, Any] | None = None,
 ) -> PermissionResult:
     started_at = time.monotonic()
     result: PermissionResult | None = None
@@ -270,6 +289,7 @@ async def _request_hitl_decision(
         },
     )
     try:
+        question_metadata = question_metadata or {}
         daily_limit = max_per_day
         if daily_limit is None:
             daily_limit = router.hitl_config_for_channel(channel_id).max_per_day
@@ -294,7 +314,7 @@ async def _request_hitl_decision(
             tool_name=tool_name,
             tool_input=tool_input,
             suggestions=suggestions,
-            who_can_answer=None,
+            who_can_answer=question_metadata.get("who_can_answer"),
             posted_at=datetime.now(UTC),
             timeout_s=default_timeout_s,
             channel_manifest=(
@@ -302,6 +322,7 @@ async def _request_hitl_decision(
                 if hasattr(router, "cached_manifest")
                 else None
             ),
+            footgun_match=question_metadata.get("footgun_match"),
         )
 
         router.hitl.register(q)
@@ -340,6 +361,20 @@ async def _request_hitl_decision(
         try:
             result = await asyncio.wait_for(q.future, timeout=q.timeout_s)
         except TimeoutError:
+            if q.footgun_match is not None:
+                log.info(
+                    "footgun.cancelled_or_timed_out",
+                    extra={
+                        "pattern": q.footgun_match.pattern.pattern,
+                        "command": q.footgun_match.command,
+                        "tier": (
+                            q.channel_manifest.tier_effective().value
+                            if q.channel_manifest is not None
+                            else None
+                        ),
+                        "reason": "timeout",
+                    },
+                )
             log.info(
                 "hitl.question_timed_out",
                 extra={
