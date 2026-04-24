@@ -60,6 +60,7 @@ from engram.notifications import (
     notify_pending_channel,
     post_pending_channel_ack,
 )
+from engram.permissions.authorization import can_change_tier, classify_transition
 from engram.router import Router
 
 log = logging.getLogger(__name__)
@@ -1455,18 +1456,6 @@ async def handle_upgrade_command(
     if not source_channel_id:
         return {"ok": False, "error": "missing source channel"}
 
-    if not config.owner_user_id:
-        await _post_ephemeral_reply(
-            slack_client,
-            channel_id=source_channel_id,
-            user_id=user_id,
-            text=(
-                "Permission upgrades are not configured yet. "
-                "Ask the operator to set owner_user_id."
-            ),
-        )
-        return {"ok": False, "error": "owner user is not configured"}
-
     result = await _set_channel_tier_from_request(
         router=router,
         config=config,
@@ -1594,29 +1583,47 @@ async def handle_tier_pick_action(
         if manifest is not None
         else PermissionTier.TASK_ASSISTANT
     )
+    transition_kind = _classify_tier_transition(
+        current_tier=current_tier,
+        target_tier=target_tier,
+    )
 
     if target_tier == PermissionTier.YOLO:
-        if not _is_owner_user(config=config, user_id=clicker_user_id):
+        if transition_kind == "upgrade" and not config.owner_user_id:
+            return {
+                "ok": False,
+                "error": "owner user is not configured",
+                "response": _replace_original_ephemeral(
+                    text=(
+                        "Permission upgrades are not configured yet. "
+                        "Ask the operator to set owner_user_id."
+                    )
+                ),
+            }
+        decision = _tier_change_decision(
+            config=config,
+            current_tier=current_tier,
+            target_tier=target_tier,
+            user_id=clicker_user_id,
+        )
+        if not decision.allowed:
             return {
                 "ok": False,
                 "error": "not owner",
                 "response": _replace_original_ephemeral(
-                    text="Only the channel owner can upgrade."
+                    text=decision.reason
                 ),
+            }
+        if transition_kind == "no-op":
+            return {
+                "ok": True,
+                "changed": False,
+                "response": _replace_original_ephemeral(text=decision.reason),
             }
         text, blocks = _render_yolo_duration_picker(channel_id=channel_id)
         return {
             "ok": True,
             "response": _replace_original_ephemeral(text=text, blocks=blocks),
-        }
-
-    if target_tier == current_tier:
-        return {
-            "ok": True,
-            "changed": False,
-            "response": _replace_original_ephemeral(
-                text=f"Already on `{current_tier.value}` — no change."
-            ),
         }
 
     result = await _set_channel_tier_from_request(
@@ -2044,14 +2051,29 @@ async def _set_channel_tier_from_request(
         if manifest is not None
         else PermissionTier.TASK_ASSISTANT
     )
-    is_owner = _is_owner_user(config=config, user_id=clicker_user_id)
-
-    if _is_tier_upgrade(current_tier, target_tier) and not is_owner:
+    transition_kind = _classify_tier_transition(
+        current_tier=current_tier,
+        target_tier=target_tier,
+    )
+    if transition_kind == "upgrade" and not config.owner_user_id:
         return {
             "ok": False,
-            "error": "not owner",
-            "message": "Only the channel owner can upgrade.",
+            "error": "owner user is not configured",
+            "message": (
+                "Permission upgrades are not configured yet. "
+                "Ask the operator to set owner_user_id."
+            ),
         }
+    decision = _tier_change_decision(
+        config=config,
+        current_tier=current_tier,
+        target_tier=target_tier,
+        user_id=clicker_user_id,
+    )
+    if not decision.allowed:
+        return {"ok": False, "error": "not owner", "message": decision.reason}
+    if transition_kind == "no-op":
+        return {"ok": True, "changed": False, "ack_text": decision.reason}
 
     if target_tier == PermissionTier.YOLO:
         return await _activate_yolo_grant(
@@ -2061,13 +2083,6 @@ async def _set_channel_tier_from_request(
             duration=yolo_duration or _YOLO_DURATION_ALIASES["24"],
             clicker_user_id=clicker_user_id,
         )
-
-    if target_tier == current_tier:
-        return {
-            "ok": True,
-            "changed": False,
-            "ack_text": f"Already on `{current_tier.value}` — no change.",
-        }
 
     try:
         previous, updated, _manifest_path, _normalized_duration = set_channel_permission_tier(
@@ -2387,16 +2402,27 @@ def _channels_dashboard_tier_label(tier: PermissionTier) -> str:
     return "✨ trusted"
 
 
-def _tier_rank(tier: PermissionTier) -> int:
-    return {
-        PermissionTier.TASK_ASSISTANT: 0,
-        PermissionTier.OWNER_SCOPED: 1,
-        PermissionTier.YOLO: 2,
-    }[tier]
+def _classify_tier_transition(
+    *,
+    current_tier: PermissionTier,
+    target_tier: PermissionTier,
+) -> str:
+    return classify_transition(current_tier.value, target_tier.value)
 
 
-def _is_tier_upgrade(current_tier: PermissionTier, target_tier: PermissionTier) -> bool:
-    return _tier_rank(target_tier) > _tier_rank(current_tier)
+def _tier_change_decision(
+    *,
+    config: EngramConfig,
+    current_tier: PermissionTier,
+    target_tier: PermissionTier,
+    user_id: str | None,
+):
+    return can_change_tier(
+        current_tier=current_tier.value,
+        target_tier=target_tier.value,
+        invoker_user_id=user_id or "",
+        channel_owner_user_id=config.owner_user_id or "",
+    )
 
 
 def _tier_picker_button_text(
@@ -2410,9 +2436,13 @@ def _tier_picker_button_text(
         PermissionTier.OWNER_SCOPED: "✨ Trusted",
         PermissionTier.YOLO: "🚀 YOLO",
     }[tier]
-    if tier == current_tier:
+    transition_kind = _classify_tier_transition(
+        current_tier=current_tier,
+        target_tier=tier,
+    )
+    if transition_kind == "no-op":
         return f"{base} (current)"
-    if not is_owner and _is_tier_upgrade(current_tier, tier):
+    if not is_owner and transition_kind == "upgrade":
         return f"{base} (owner only)"
     return base
 
@@ -2423,9 +2453,13 @@ def _tier_picker_button_style(
     current_tier: PermissionTier,
     is_owner: bool,
 ) -> str | None:
-    if tier == current_tier:
+    transition_kind = _classify_tier_transition(
+        current_tier=current_tier,
+        target_tier=tier,
+    )
+    if transition_kind == "no-op":
         return None
-    if not is_owner and _is_tier_upgrade(current_tier, tier):
+    if not is_owner and transition_kind == "upgrade":
         return None
     return "primary"
 
@@ -2440,10 +2474,19 @@ def build_tier_picker_blocks(
     current_text = f"Current tier: {current_tier.value}"
     if is_owner:
         intro = "Pick a new tier:"
-    elif current_tier == PermissionTier.TASK_ASSISTANT:
-        intro = "Only the channel owner can upgrade. This channel is already on the lowest tier."
     else:
-        intro = "Only the channel owner can upgrade. You can downgrade:"
+        has_downgrade = any(
+            _classify_tier_transition(current_tier=current_tier, target_tier=tier)
+            == "downgrade"
+            for tier in PermissionTier
+        )
+        if has_downgrade:
+            intro = "Only the channel owner can upgrade. You can downgrade:"
+        else:
+            intro = (
+                "Only the channel owner can upgrade. "
+                "This channel is already on the lowest tier."
+            )
 
     buttons = [
         _dashboard_button(
@@ -2523,7 +2566,15 @@ def _tier_change_public_notice(
     clicker_user_id: str | None,
 ) -> str:
     actor = f"<@{clicker_user_id}>" if clicker_user_id else "Someone"
-    verb = "upgraded" if _is_tier_upgrade(previous_tier, target_tier) else "downgraded"
+    verb = (
+        "upgraded"
+        if _classify_tier_transition(
+            current_tier=previous_tier,
+            target_tier=target_tier,
+        )
+        == "upgrade"
+        else "downgraded"
+    )
     return (
         f"{_tier_change_icon(target_tier)} {actor} {verb} this channel to "
         f"`{target_tier.value}`. {_tier_change_summary(target_tier)} "

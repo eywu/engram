@@ -105,3 +105,16 @@ def test_add_allow_rule_refuses_to_persist_bash(tmp_path):
 def test_add_allow_rule_refuses_mcp_tools(tmp_path):
     with pytest.raises(ValueError, match="mcp tool"):
         add_allow_rule("D07OWNER", "mcp__gmail__send_email", home=tmp_path)
+
+
+def test_add_allow_rule_refuses_safe_tier_channels(tmp_path):
+    path = tmp_path / "contexts" / "C07SAFE" / ".claude" / "channel-manifest.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = ChannelManifest(
+        channel_id="C07SAFE",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+    )
+    path.write_text(manifest.model_dump_json())
+
+    with pytest.raises(ValueError, match="outside `trusted` tier"):
+        add_allow_rule("C07SAFE", "WebFetch", home=tmp_path)

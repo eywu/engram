@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 from engram import paths
 from engram.config import HITLConfig
+from engram.permissions.authorization import classify_transition
 
 log = logging.getLogger(__name__)
 
@@ -971,6 +972,19 @@ def _assert_sticky_eligible(tool_name: str) -> None:
         )
 
 
+def _assert_sticky_tier(manifest: ChannelManifest) -> None:
+    """Raise ValueError if sticky allow would persist outside the trusted tier."""
+    current_tier = manifest.tier_effective().value
+    if (
+        classify_transition(current_tier, PermissionTier.OWNER_SCOPED.value)
+        != "no-op"
+    ):
+        raise ValueError(
+            "refusing to persist sticky allow outside `trusted` tier: "
+            f"channel is currently `{current_tier}`"
+        )
+
+
 def add_allow_rule(
     channel_id: str,
     tool_name: str,
@@ -987,6 +1001,7 @@ def add_allow_rule(
     _assert_sticky_eligible(tool_name)
     manifest_path = paths.channel_manifest_path(channel_id, home)
     manifest = load_manifest(manifest_path)
+    _assert_sticky_tier(manifest)
     normalized_rule = _validate_rule(tool_name)
     allow_rules = list(
         dict.fromkeys([*manifest.permissions.allow, normalized_rule])

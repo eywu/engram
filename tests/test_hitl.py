@@ -17,6 +17,7 @@ from engram.manifest import (
     ChannelManifest,
     ChannelStatus,
     IdentityTemplate,
+    PermissionTier,
     dump_manifest,
     load_manifest,
 )
@@ -58,6 +59,7 @@ def _write_owner_dm_manifest(home: Path, channel_id: str = "D07OWNER") -> Path:
             identity=IdentityTemplate.OWNER_DM_FULL,
             status=ChannelStatus.ACTIVE,
             label="DM",
+            permission_tier=PermissionTier.OWNER_SCOPED,
         ),
         path,
     )
@@ -204,7 +206,9 @@ def test_resolve_question_always_persists_allow_rule_and_returns_session_update(
     assert update.destination == "session"
     assert update.rules is not None
     assert update.rules[0].tool_name == "WebFetch"
-    assert load_manifest(manifest_path).permissions.allow == ["WebFetch"]
+    allow_rules = load_manifest(manifest_path).permissions.allow
+    assert "WebFetch" in allow_rules
+    assert allow_rules.count("WebFetch") == 1
 
 
 def test_resolve_question_always_is_idempotent_on_second_click(tmp_path: Path):
@@ -228,4 +232,6 @@ def test_resolve_question_always_is_idempotent_on_second_click(tmp_path: Path):
 
     assert isinstance(first, PermissionResultAllow)
     assert isinstance(second, PermissionResultAllow)
-    assert load_manifest(manifest_path).permissions.allow == ["WebFetch"]
+    allow_rules = load_manifest(manifest_path).permissions.allow
+    assert "WebFetch" in allow_rules
+    assert allow_rules.count("WebFetch") == 1

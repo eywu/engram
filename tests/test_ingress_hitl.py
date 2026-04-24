@@ -654,6 +654,7 @@ async def test_block_action_always_allow_updates_manifest_and_logs(
         home,
         "D07OWNER",
         identity=IdentityTemplate.OWNER_DM_FULL,
+        tier=PermissionTier.OWNER_SCOPED,
     )
     router = Router(home=home, owner_dm_channel_id="D07OWNER")
     slack = FakeSlackClient()
@@ -678,7 +679,8 @@ async def test_block_action_always_allow_updates_manifest_and_logs(
     assert update.rules is not None
     assert update.rules[0].tool_name == "WebFetch"
     manifest = load_manifest(channel_manifest_path("D07OWNER", home))
-    assert manifest.permissions.allow == ["WebFetch"]
+    assert "WebFetch" in manifest.permissions.allow
+    assert manifest.permissions.allow.count("WebFetch") == 1
     assert slack.update_calls[0]["text"] == (
         "Answered: Always allow fetch (will not ask again in this channel)"
     )

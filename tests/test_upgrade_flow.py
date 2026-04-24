@@ -299,7 +299,10 @@ async def test_non_owner_upgrade_via_picker_is_rejected(
     manifest = load_manifest(channel_manifest_path("C07TEAM", home))
     assert result["ok"] is False
     assert result["error"] == "not owner"
-    assert result["response"]["text"] == "Only the channel owner can upgrade."
+    assert result["response"]["text"] == (
+        "Only the channel owner can upgrade to `trusted`. "
+        "Ask owner to run `/engram upgrade`."
+    )
     assert manifest.permission_tier == PermissionTier.TASK_ASSISTANT
     assert slack.post_calls == []
 
@@ -359,7 +362,40 @@ async def test_current_tier_click_is_noop_without_public_notice(
     assert result["ok"] is True
     assert manifest.permission_tier == PermissionTier.TASK_ASSISTANT
     assert result["changed"] is False
-    assert result["response"]["text"] == "Already on `safe` — no change."
+    assert result["response"]["text"] == "Already on `safe`."
+    assert slack.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_arg_upgrade_yolo_to_current_tier_is_noop(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.YOLO)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OWNER",
+        command_text="upgrade yolo working on docs",
+    )
+
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result["ok"] is True
+    assert result["changed"] is False
+    assert manifest.permission_tier == PermissionTier.YOLO
+    assert slack.ephemeral_calls == [
+        {
+            "channel": "C07TEAM",
+            "user": "U07OWNER",
+            "text": "Already on `yolo`.",
+        }
+    ]
     assert slack.post_calls == []
 
 

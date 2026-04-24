@@ -44,6 +44,16 @@ Only the configured owner can approve upgrade buttons.
 - The owner-DM card is edited to show the decision.
 - If a newer request is made in the same channel before approval, the older DM card is marked `Superseded by newer request.`
 
+## Authorization
+
+Tier changes follow one rule everywhere Engram checks authorization:
+
+- Only the channel owner can upgrade to a more permissive tier (`safe` → `trusted`, `trusted` → `yolo`, or `safe` → `yolo`).
+- Anyone in the channel can downgrade to a less permissive tier.
+- Changing to the current tier is a no-op, not an upgrade or downgrade.
+
+We chose "anyone can downgrade" because reducing attack surface is always safe. "Only owner upgrades" prevents social-engineering paths where a team member convinces the bot to elevate permissions.
+
 ## CLI shortcuts
 
 The owner can bypass Slack approval with:
