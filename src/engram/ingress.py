@@ -1816,8 +1816,15 @@ async def _resolve_footgun_question(
     user_id: str | None,
     reason: str,
 ) -> None:
+    tier = (
+        q.channel_manifest.tier_effective().value
+        if q.channel_manifest is not None
+        else None
+    )
     if confirmed:
-        result = _resolve_question(q, choice="allow")
+        # Preserve the exact reviewed input so typed-confirm confirmations do
+        # not accidentally drop a pre-sanitized updated_input.
+        result = PermissionResultAllow(updated_input=q.tool_input)
         answer_text = "Confirmed destructive action"
     else:
         result = _resolve_question(q, choice="deny")
@@ -1836,7 +1843,8 @@ async def _resolve_footgun_question(
                     "pattern": match.pattern.pattern,
                     "command": match.command,
                     "user": user_id,
-                    "duration_ms": max(
+                    "tier": tier,
+                    "duration_to_confirm_ms": max(
                         0,
                         int(
                             (
@@ -1854,6 +1862,7 @@ async def _resolve_footgun_question(
                     "pattern": match.pattern.pattern,
                     "command": match.command,
                     "user": user_id,
+                    "tier": tier,
                     "reason": reason,
                 },
             )

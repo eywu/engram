@@ -49,7 +49,7 @@ _DD_PATTERN = re.compile(r"\bdd\s+if=", _FLAGS)
 _MKFS_PATTERN = re.compile(r"\bmkfs\b", _FLAGS)
 _FDISK_PATTERN = re.compile(r"\bfdisk\b", _FLAGS)
 _CHMOD_777_PATTERN = re.compile(r"\bchmod\s+-R\s+777\b", _FLAGS)
-_BLOCK_DEVICE_PATTERN = re.compile(r">\s*/dev/sd[a-z]\b", _FLAGS)
+_BLOCK_DEVICE_PATTERN = re.compile(r">\s*/dev/sd[a-z](?:\d+)?\b", _FLAGS)
 _GIT_FORCE_PUSH_PATTERN = re.compile(r"\bgit\s+push\s+--force\b", _FLAGS)
 _SQL_PATTERN = re.compile(r"\b(drop|truncate)\s+(table|database)\b", _FLAGS)
 

@@ -18,7 +18,7 @@ POSITIVE_CASES = [
     ("Bash", {"cmd": "mkfs.ext4 /dev/sdb1"}, "filesystem formatting command"),
     ("Bash", {"cmd": "fdisk /dev/sdb"}, "disk partitioning command"),
     ("Bash", {"cmd": "chmod -R 777 ./tmp"}, "recursive world-writable chmod"),
-    ("Bash", {"cmd": "echo x > /dev/sda"}, "direct write to a block device"),
+    ("Bash", {"cmd": "echo x > /dev/sda1"}, "direct write to a block device"),
     ("Bash", {"cmd": "git push --force origin main"}, "force push"),
     ("Bash", {"cmd": "psql -c 'drop table users'"}, "destructive SQL command"),
 ]

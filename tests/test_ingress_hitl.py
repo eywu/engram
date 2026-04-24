@@ -603,10 +603,11 @@ async def test_footgun_confirm_open_rejects_non_owner():
 async def test_footgun_confirm_submit_requires_exact_CONFIRM():
     router = Router()
     slack = FakeSlackClient()
+    tool_input = {"cmd": "rm -rf /tmp/demo", "cwd": "/tmp/demo"}
     q = make_question(
         who_can_answer="U123",
-        tool_input={"cmd": "rm -rf /tmp/demo"},
-        footgun_match=match_footgun("Bash", {"cmd": "rm -rf /tmp/demo"}),
+        tool_input=tool_input,
+        footgun_match=match_footgun("Bash", tool_input),
     )
     router.hitl.register(q)
 
@@ -620,6 +621,7 @@ async def test_footgun_confirm_submit_requires_exact_CONFIRM():
     assert q.future.done()
     result = q.future.result()
     assert isinstance(result, PermissionResultAllow)
+    assert result.updated_input == tool_input
     assert slack.update_calls[0]["text"] == "Answered: Confirmed destructive action"
 
 
