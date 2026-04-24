@@ -330,7 +330,8 @@ async def _runtime_snapshot_loop(
                 now = asyncio.get_running_loop().time()
                 if now >= state.next_fd_snapshot_at:
                     try:
-                        write_fd_snapshot(log_dir=log_dir)
+                        # `lsof` can stall under FD pressure; keep the bridge loop responsive.
+                        await asyncio.to_thread(write_fd_snapshot, log_dir=log_dir)
                     except Exception:
                         loop_log.warning("engram.fd_snapshot_write_failed", exc_info=True)
                     finally:
@@ -377,6 +378,11 @@ async def _maybe_alert_on_fd_pressure(
 
 
 def _fd_pressure_thresholds(soft_limit: int | None) -> tuple[int, int]:
+    # Keep the default 150/200 thresholds for normal bridge deployments,
+    # including launchd contexts with NumberOfFiles=4096. GRO-481's leak grew to
+    # 245 FDs before EMFILE; percentage-based thresholds at 4096 would alert far
+    # too late to catch that class of leak. Only scale down for genuinely small
+    # per-process limits where 150/200 would already exceed available headroom.
     if soft_limit is not None and 0 < soft_limit < 256:
         return max(1, (soft_limit * 3 + 4) // 5), max(1, (soft_limit * 4 + 4) // 5)
     return 150, 200

@@ -139,6 +139,67 @@ async def test_runtime_snapshot_loop_sends_critical_alert_independently(
     assert alerts[1].startswith("🚨 Engram FD pressure CRITICAL")
 
 
+@pytest.mark.asyncio
+async def test_runtime_snapshot_loop_offloads_fd_snapshot_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    processed = 0
+    to_thread_calls: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
+    yielded = asyncio.Event()
+    heartbeat_ran = False
+    real_sleep = asyncio.sleep
+
+    async def fake_write_runtime_snapshot(**_kwargs):
+        nonlocal processed
+        processed += 1
+        if processed == 1:
+            return _bridge_snapshot(80)
+        raise asyncio.CancelledError
+
+    async def fake_sleep(_interval: float) -> None:
+        return None
+
+    def fake_write_fd_snapshot(*, log_dir: Path) -> dict[str, object]:
+        return {"log_dir": log_dir}
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        to_thread_calls.append((func, args, kwargs))
+        yielded.set()
+        await real_sleep(0)
+        return func(*args, **kwargs)
+
+    async def heartbeat() -> None:
+        nonlocal heartbeat_ran
+        await yielded.wait()
+        heartbeat_ran = True
+
+    monkeypatch.setattr(main, "write_runtime_snapshot", fake_write_runtime_snapshot)
+    monkeypatch.setattr(main, "write_fd_snapshot", fake_write_fd_snapshot)
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main.asyncio, "to_thread", fake_to_thread)
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    with pytest.raises(asyncio.CancelledError):
+        await main._runtime_snapshot_loop(
+            state_dir=tmp_path,
+            router=Router(),
+            cost_db=None,
+            interval_seconds=0,
+            fd_snapshots_enabled=True,
+            fd_snapshot_interval_seconds=0,
+            log_dir=tmp_path,
+        )
+    await asyncio.wait_for(heartbeat_task, timeout=0.1)
+
+    assert heartbeat_ran is True
+    assert to_thread_calls == [(fake_write_fd_snapshot, (), {"log_dir": tmp_path})]
+
+
+def test_fd_pressure_thresholds_keep_absolute_alerts_for_high_soft_limits() -> None:
+    assert main._fd_pressure_thresholds(4096) == (150, 200)
+
+
 def test_write_fd_snapshot_writes_expected_jsonl_record(tmp_path: Path) -> None:
     record = runtime.write_fd_snapshot(
         log_dir=tmp_path,
@@ -237,11 +298,13 @@ def test_doctor_fd_pressure_uses_thresholds_and_top_snapshot_patterns(tmp_path: 
         {"pattern": "*.jsonl (logs)", "count": 3},
         {"pattern": "memory.db", "count": 2},
     ]
+    assert check.details["other_count"] == 23
     assert "205 FDs in use; pressure is critical." in check.message
     assert "Soft limit 256." in check.message
     assert "cost.db=4" in check.message
     assert "*.jsonl (logs)=3" in check.message
     assert "memory.db=2" in check.message
+    assert "Uncategorized (other)=23." in check.message
 
 
 @pytest.mark.parametrize(

@@ -276,6 +276,11 @@ def test_doctor_cli_json_against_tmp_config(
         "engram.doctor.shutil.disk_usage",
         lambda _path: (2_000_000_000, 0, 1_500_000_000),
     )
+    monkeypatch.setattr(
+        "engram.doctor.fd_usage_snapshot",
+        lambda: {"in_use": 42, "soft_limit": 256, "hard_limit": 1024},
+    )
+    monkeypatch.setattr("engram.doctor.read_latest_fd_snapshot", lambda _path: None)
 
     def post_json(url: str, **_kwargs) -> HttpResult:
         if "slack.com" in url:

@@ -675,8 +675,10 @@ def check_fd_pressure(
     path = (log_dir or (Path.home() / ".engram" / "logs")).expanduser()
     usage = (usage_reader or fd_usage_snapshot)()
     snapshot = (snapshot_reader or read_latest_fd_snapshot)(path)
-    top_patterns = _top_fd_snapshot_patterns(snapshot)
+    top_patterns, other_count = _fd_snapshot_pattern_summary(snapshot)
     details: dict[str, Any] = {"log_dir": str(path), "top_path_patterns": top_patterns}
+    if other_count is not None:
+        details["other_count"] = other_count
 
     if usage is None or usage.get("in_use") is None:
         return DoctorCheck(
@@ -686,6 +688,7 @@ def check_fd_pressure(
             message=_fd_pressure_message(
                 "FD usage is unavailable on this system.",
                 top_patterns,
+                other_count,
             ),
             details=details,
         )
@@ -699,6 +702,7 @@ def check_fd_pressure(
             message=_fd_pressure_message(
                 "FD usage is unavailable on this system.",
                 top_patterns,
+                other_count,
             ),
             details=details,
         )
@@ -722,7 +726,7 @@ def check_fd_pressure(
         id="fd_pressure",
         name="FD pressure",
         status=status,
-        message=_fd_pressure_message(summary, top_patterns),
+        message=_fd_pressure_message(summary, top_patterns, other_count),
         details=details,
     )
 
@@ -904,13 +908,16 @@ def _free_bytes(usage: Any) -> int:
     return int(usage[2])
 
 
-def _top_fd_snapshot_patterns(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
+def _fd_snapshot_pattern_summary(
+    snapshot: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], int | None]:
     if not isinstance(snapshot, dict):
-        return []
+        return [], None
     raw_patterns = snapshot.get("by_path_pattern")
     if not isinstance(raw_patterns, dict):
-        return []
+        return [], None
     patterns: list[dict[str, Any]] = []
+    other_count: int | None = None
     for name, count in raw_patterns.items():
         if not isinstance(name, str):
             continue
@@ -920,15 +927,27 @@ def _top_fd_snapshot_patterns(snapshot: dict[str, Any] | None) -> list[dict[str,
             continue
         if value <= 0:
             continue
+        if name == "other":
+            other_count = value
+            continue
         patterns.append({"pattern": name, "count": value})
-    patterns.sort(key=lambda item: (item["pattern"] == "other", -item["count"], item["pattern"]))
-    return patterns[:3]
+    patterns.sort(key=lambda item: (-item["count"], item["pattern"]))
+    return patterns[:3], other_count
 
 
-def _fd_pressure_message(summary: str, top_patterns: list[dict[str, Any]]) -> str:
-    if not top_patterns:
+def _fd_pressure_message(
+    summary: str,
+    top_patterns: list[dict[str, Any]],
+    other_count: int | None,
+) -> str:
+    suffixes: list[str] = []
+    if top_patterns:
+        rendered = ", ".join(
+            f"{item['pattern']}={item['count']}" for item in top_patterns
+        )
+        suffixes.append(f"Top snapshot patterns: {rendered}.")
+    if other_count is not None:
+        suffixes.append(f"Uncategorized (other)={other_count}.")
+    if not suffixes:
         return summary
-    rendered = ", ".join(
-        f"{item['pattern']}={item['count']}" for item in top_patterns
-    )
-    return f"{summary} Top snapshot patterns: {rendered}."
+    return f"{summary} {' '.join(suffixes)}"
