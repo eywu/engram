@@ -24,6 +24,7 @@ from engram.agent import Agent
 from engram.config import EngramConfig
 from engram.costs import CostLedger, TurnCost
 from engram.egress import (
+    ActiveYoloGrantRow,
     _always_allow_label,
     _suggestion_label,
     post_meta_eligibility_question,
@@ -32,11 +33,15 @@ from engram.egress import (
     post_upgrade_result_in_channel,
     post_upgrade_waiting_message,
     post_yolo_expired_notification,
+    render_active_yolo_grants,
     update_question_resolved,
     update_upgrade_request_dm,
 )
 from engram.hitl import PendingQuestion, _resolve_question
 from engram.manifest import (
+    YOLO_DURATION_CHOICES,
+    YOLO_MAX_DURATION,
+    ChannelManifest,
     ChannelStatus,
     ManifestError,
     PermissionTier,
@@ -44,6 +49,7 @@ from engram.manifest import (
     load_manifest,
     persist_yolo_demotion,
     set_channel_permission_tier,
+    validate_upgrade_duration,
 )
 from engram.notifications import (
     PENDING_CHANNEL_ACTION_ID_PATTERN,
@@ -60,6 +66,8 @@ HITL_ACTION_ID_PATTERN = re.compile(r"^hitl_choice_(?:\d+|always_\d+|deny)$")
 UPGRADE_ACTION_ID_PATTERN = re.compile(
     r"^upgrade_decision_(approve_(?:permanent|30d|24h|6h)|deny)$"
 )
+YOLO_EXTEND_ACTION_ID_PATTERN = re.compile(r"^yolo_extend_[A-Z0-9]+$")
+YOLO_REVOKE_ACTION_ID_PATTERN = re.compile(r"^yolo_revoke_[A-Z0-9]+$")
 CHANNEL_REF_PATTERN = re.compile(r"<#(?P<id>[A-Z0-9]+)(?:\|[^>]+)?>")
 CHANNEL_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]+$")
 _PENDING_UPGRADE_REQUESTS: dict[str, PendingUpgradeRequest] = {}
@@ -150,6 +158,56 @@ def register_listeners(
                     )
             except Exception:
                 log.exception("ingress.upgrade_action_handler_failed")
+
+        task = asyncio.create_task(_run())
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    @app.action(YOLO_EXTEND_ACTION_ID_PATTERN)
+    async def on_yolo_extend_action(ack, body, client):
+        await ack()
+
+        async def _run() -> None:
+            try:
+                result = await handle_yolo_action(
+                    payload=body,
+                    router=router,
+                    config=config,
+                    slack_client=client,
+                    action_kind="extend",
+                )
+                if not result.get("ok"):
+                    log.warning(
+                        "ingress.yolo_extend_action_failed error=%s",
+                        result.get("error", "unknown"),
+                    )
+            except Exception:
+                log.exception("ingress.yolo_extend_action_handler_failed")
+
+        task = asyncio.create_task(_run())
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    @app.action(YOLO_REVOKE_ACTION_ID_PATTERN)
+    async def on_yolo_revoke_action(ack, body, client):
+        await ack()
+
+        async def _run() -> None:
+            try:
+                result = await handle_yolo_action(
+                    payload=body,
+                    router=router,
+                    config=config,
+                    slack_client=client,
+                    action_kind="revoke",
+                )
+                if not result.get("ok"):
+                    log.warning(
+                        "ingress.yolo_revoke_action_failed error=%s",
+                        result.get("error", "unknown"),
+                    )
+            except Exception:
+                log.exception("ingress.yolo_revoke_action_handler_failed")
 
         task = asyncio.create_task(_run())
         _BACKGROUND_TASKS.add(task)
@@ -613,51 +671,209 @@ async def handle_engram_command(
             slack_client,
             channel_id=source_channel_id,
             user_id=user_id,
-            text="Usage: /engram upgrade <tier> [reason...]",
+            text="Usage: /engram upgrade <tier> [reason...] | /engram yolo <list|off|extend> ...",
         )
         return {"ok": False, "error": "missing subcommand"}
 
     subcommand = parts[0].lower()
-    if subcommand != "upgrade":
-        await _post_ephemeral_reply(
-            slack_client,
-            channel_id=source_channel_id,
-            user_id=user_id,
-            text=f"Unknown /engram subcommand: {subcommand}",
-        )
-        return {"ok": False, "error": "unknown subcommand"}
+    if subcommand == "upgrade":
+        if len(parts) < 2:
+            await _post_ephemeral_reply(
+                slack_client,
+                channel_id=source_channel_id,
+                user_id=user_id,
+                text="Usage: /engram upgrade <task-assistant|owner-scoped|yolo> [reason...]",
+            )
+            return {"ok": False, "error": "missing tier"}
 
-    if len(parts) < 2:
-        await _post_ephemeral_reply(
-            slack_client,
-            channel_id=source_channel_id,
-            user_id=user_id,
-            text="Usage: /engram upgrade <task-assistant|owner-scoped|yolo> [reason...]",
-        )
-        return {"ok": False, "error": "missing tier"}
+        try:
+            tier = PermissionTier(parts[1].lower())
+        except ValueError:
+            await _post_ephemeral_reply(
+                slack_client,
+                channel_id=source_channel_id,
+                user_id=user_id,
+                text=f"Unknown tier: {parts[1]}",
+            )
+            return {"ok": False, "error": "unknown tier"}
 
-    try:
-        tier = PermissionTier(parts[1].lower())
-    except ValueError:
-        await _post_ephemeral_reply(
-            slack_client,
-            channel_id=source_channel_id,
+        reason = " ".join(parts[2:]).strip() or None
+        return await handle_upgrade_command(
+            router=router,
+            config=config,
+            slack_client=slack_client,
+            source_channel_id=source_channel_id,
+            source_channel_name=source_channel_name,
             user_id=user_id,
-            text=f"Unknown tier: {parts[1]}",
+            requested_tier=tier,
+            reason=reason,
         )
-        return {"ok": False, "error": "unknown tier"}
 
-    reason = " ".join(parts[2:]).strip() or None
-    return await handle_upgrade_command(
-        router=router,
-        config=config,
-        slack_client=slack_client,
-        source_channel_id=source_channel_id,
-        source_channel_name=source_channel_name,
+    if subcommand == "yolo":
+        return await handle_yolo_command(
+            router=router,
+            config=config,
+            slack_client=slack_client,
+            source_channel_id=source_channel_id,
+            user_id=user_id,
+            args=parts[1:],
+        )
+
+    await _post_ephemeral_reply(
+        slack_client,
+        channel_id=source_channel_id,
         user_id=user_id,
-        requested_tier=tier,
-        reason=reason,
+        text=f"Unknown /engram subcommand: {subcommand}",
     )
+    return {"ok": False, "error": "unknown subcommand"}
+
+
+async def handle_yolo_command(
+    *,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+    source_channel_id: str,
+    user_id: str | None,
+    args: list[str],
+) -> dict[str, object]:
+    if not _is_owner_user(config=config, user_id=user_id):
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text="Owner-only.",
+        )
+        return {"ok": False, "error": "not owner"}
+
+    if not args:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text="Usage: /engram yolo <list|off|extend> ...",
+        )
+        return {"ok": False, "error": "missing yolo subcommand"}
+
+    action = args[0].lower()
+    if action == "list":
+        home = router.home or paths.engram_home()
+        grants = _list_active_yolo_grants(home)
+        text, blocks = render_active_yolo_grants(grants)
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=text,
+            blocks=blocks,
+        )
+        return {"ok": True, "count": len(grants)}
+
+    if action == "off":
+        if len(args) < 2:
+            await _post_ephemeral_reply(
+                slack_client,
+                channel_id=source_channel_id,
+                user_id=user_id,
+                text="Usage: /engram yolo off <channel-name-or-id>",
+            )
+            return {"ok": False, "error": "missing channel"}
+
+        target_channel_id = _resolve_yolo_target(
+            " ".join(args[1:]),
+            source_channel_id=source_channel_id,
+            home=router.home or paths.engram_home(),
+        )
+        if target_channel_id is None:
+            await _post_ephemeral_reply(
+                slack_client,
+                channel_id=source_channel_id,
+                user_id=user_id,
+                text=f"Unknown channel: {' '.join(args[1:])}",
+            )
+            return {"ok": False, "error": "unknown channel"}
+
+        result = await _revoke_yolo_grant(
+            router=router,
+            config=config,
+            slack_client=slack_client,
+            channel_id=target_channel_id,
+        )
+        if not result["ok"]:
+            await _post_ephemeral_reply(
+                slack_client,
+                channel_id=source_channel_id,
+                user_id=user_id,
+                text=str(result["message"]),
+            )
+            return result
+
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=f"Revoked yolo for {result['label']}.",
+        )
+        return result
+
+    if action == "extend":
+        if len(args) < 3:
+            await _post_ephemeral_reply(
+                slack_client,
+                channel_id=source_channel_id,
+                user_id=user_id,
+                text="Usage: /engram yolo extend <channel> <6h|24h|72h>",
+            )
+            return {"ok": False, "error": "missing extend arguments"}
+
+        target_channel_id = _resolve_yolo_target(
+            args[1],
+            source_channel_id=source_channel_id,
+            home=router.home or paths.engram_home(),
+        )
+        if target_channel_id is None:
+            await _post_ephemeral_reply(
+                slack_client,
+                channel_id=source_channel_id,
+                user_id=user_id,
+                text=f"Unknown channel: {args[1]}",
+            )
+            return {"ok": False, "error": "unknown channel"}
+
+        result = await _extend_yolo_grant(
+            router=router,
+            config=config,
+            slack_client=slack_client,
+            channel_id=target_channel_id,
+            duration=args[2],
+        )
+        if not result["ok"]:
+            await _post_ephemeral_reply(
+                slack_client,
+                channel_id=source_channel_id,
+                user_id=user_id,
+                text=str(result["message"]),
+            )
+            return result
+
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=(
+                f"Extended {result['label']} by {result['duration']}. "
+                f"Remaining: {result['remaining_text']}."
+            ),
+        )
+        return result
+
+    await _post_ephemeral_reply(
+        slack_client,
+        channel_id=source_channel_id,
+        user_id=user_id,
+        text=f"Unknown /engram yolo subcommand: {action}",
+    )
+    return {"ok": False, "error": "unknown yolo subcommand"}
 
 
 async def handle_upgrade_command(
@@ -880,6 +1096,80 @@ async def handle_upgrade_action(
     return {"ok": True, "decision": "approve", "duration": normalized_duration}
 
 
+async def handle_yolo_action(
+    *,
+    payload: dict[str, object],
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+    action_kind: str,
+) -> dict[str, object]:
+    actions = payload.get("actions") or []
+    if not actions:
+        return {"ok": False, "error": "no actions"}
+
+    action = actions[0]
+    action_id = str(action.get("action_id") or "")
+    expected_pattern = (
+        YOLO_EXTEND_ACTION_ID_PATTERN
+        if action_kind == "extend"
+        else YOLO_REVOKE_ACTION_ID_PATTERN
+    )
+    if not expected_pattern.match(action_id):
+        return {"ok": False, "error": "unsupported action"}
+
+    clicker_user_id = str(payload.get("user", {}).get("id") or "") or None
+    source_channel_id = str(payload.get("channel", {}).get("id") or "")
+    if not _is_owner_user(config=config, user_id=clicker_user_id):
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=clicker_user_id,
+            text="Owner-only.",
+        )
+        return {"ok": False, "error": "not owner"}
+
+    channel_id = _channel_id_from_yolo_action(action_id, str(action.get("value") or ""))
+    if channel_id is None:
+        return {"ok": False, "error": "malformed action"}
+
+    if action_kind == "extend":
+        result = await _extend_yolo_grant(
+            router=router,
+            config=config,
+            slack_client=slack_client,
+            channel_id=channel_id,
+            duration="6h",
+        )
+        if result["ok"]:
+            text = (
+                f"Extended {result['label']} by 6h. "
+                f"Remaining: {result['remaining_text']}."
+            )
+        else:
+            text = str(result["message"])
+    else:
+        result = await _revoke_yolo_grant(
+            router=router,
+            config=config,
+            slack_client=slack_client,
+            channel_id=channel_id,
+        )
+        text = (
+            f"Revoked yolo for {result['label']}."
+            if result["ok"]
+            else str(result["message"])
+        )
+
+    await _post_ephemeral_reply(
+        slack_client,
+        channel_id=source_channel_id,
+        user_id=clicker_user_id,
+        text=text,
+    )
+    return result
+
+
 def parse_meta_eligibility_command(text: str) -> MetaEligibilityCommand | None:
     stripped = text.strip()
     if not stripped:
@@ -912,6 +1202,7 @@ async def _post_ephemeral_reply(
     channel_id: str,
     user_id: str | None,
     text: str,
+    blocks: list[dict[str, object]] | None = None,
 ) -> None:
     if not channel_id:
         return
@@ -919,10 +1210,15 @@ async def _post_ephemeral_reply(
         chat_post_ephemeral = getattr(slack_client, "chat_postEphemeral", None)
         if chat_post_ephemeral is not None:
             try:
+                payload: dict[str, object] = {
+                    "channel": channel_id,
+                    "user": user_id,
+                    "text": text,
+                }
+                if blocks is not None:
+                    payload["blocks"] = blocks
                 await chat_post_ephemeral(
-                    channel=channel_id,
-                    user=user_id,
-                    text=text,
+                    **payload,
                 )
                 return
             except Exception:
@@ -932,7 +1228,10 @@ async def _post_ephemeral_reply(
                     user_id,
                     exc_info=True,
                 )
-    await slack_client.chat_postMessage(channel=channel_id, text=text)
+    payload = {"channel": channel_id, "text": text}
+    if blocks is not None:
+        payload["blocks"] = blocks
+    await slack_client.chat_postMessage(**payload)
 
 
 def _encode_upgrade_action_value(*, request_id: str, channel_id: str) -> str:
@@ -1002,6 +1301,228 @@ def _normalize_target_text(raw: str | None) -> str | None:
     if not target or target.lower() in {"this", "this channel"}:
         return None
     return target
+
+
+def _is_owner_user(*, config: EngramConfig, user_id: str | None) -> bool:
+    return bool(config.owner_user_id and user_id == config.owner_user_id)
+
+
+def _list_active_yolo_grants(home, *, now: datetime.datetime | None = None) -> list[ActiveYoloGrantRow]:
+    current_time = now or datetime.datetime.now(datetime.UTC)
+    grants: list[ActiveYoloGrantRow] = []
+    for manifest_path in sorted(paths.contexts_dir(home).glob("*/.claude/channel-manifest.yaml")):
+        try:
+            manifest = load_manifest(manifest_path)
+        except ManifestError:
+            continue
+        if manifest.permission_tier != PermissionTier.YOLO or manifest.yolo_until is None:
+            continue
+        if manifest.yolo_until <= current_time:
+            continue
+        grants.append(
+            ActiveYoloGrantRow(
+                channel_id=manifest.channel_id,
+                channel_label=manifest.label,
+                remaining=manifest.yolo_until - current_time,
+                pre_yolo_tier=manifest.pre_yolo_tier or PermissionTier.TASK_ASSISTANT,
+            )
+        )
+    return grants
+
+
+def _resolve_yolo_target(
+    raw_target: str | None,
+    *,
+    source_channel_id: str,
+    home,
+) -> str | None:
+    target = _normalize_target_text(raw_target)
+    if target is None:
+        return source_channel_id
+
+    mention = CHANNEL_REF_PATTERN.search(target)
+    if mention:
+        return mention.group("id")
+
+    first_token = target.split()[0]
+    if CHANNEL_ID_PATTERN.match(first_token):
+        return first_token
+
+    wanted = first_token.lstrip("#").lower()
+    for manifest_path in sorted(paths.contexts_dir(home).glob("*/.claude/channel-manifest.yaml")):
+        try:
+            manifest = load_manifest(manifest_path)
+        except ManifestError:
+            continue
+        labels = {manifest.channel_id.lower()}
+        if manifest.label:
+            labels.add(manifest.label.lower())
+            labels.add(manifest.label.lstrip("#").lower())
+        if first_token.lower() in labels or wanted in labels:
+            return manifest.channel_id
+    return None
+
+
+def _channel_id_from_yolo_action(action_id: str, raw_value: str) -> str | None:
+    if CHANNEL_ID_PATTERN.match(raw_value):
+        return raw_value
+    parts = action_id.split("_")
+    if len(parts) < 3:
+        return None
+    candidate = parts[-1]
+    return candidate if CHANNEL_ID_PATTERN.match(candidate) else None
+
+
+def _normalize_yolo_duration(duration: str) -> str:
+    normalized = validate_upgrade_duration(duration)
+    if normalized not in YOLO_DURATION_CHOICES:
+        raise ValueError("Duration must be one of 6h, 24h, or 72h.")
+    return normalized
+
+
+def _yolo_extension_delta(duration: str) -> datetime.timedelta:
+    return {
+        "6h": datetime.timedelta(hours=6),
+        "24h": datetime.timedelta(hours=24),
+        "72h": datetime.timedelta(hours=72),
+    }[duration]
+
+
+def _load_active_yolo_manifest(
+    *,
+    channel_id: str,
+    home,
+    now: datetime.datetime | None = None,
+) -> ChannelManifest | None:
+    manifest_path = paths.channel_manifest_path(channel_id, home)
+    try:
+        manifest = load_manifest(manifest_path)
+    except ManifestError:
+        return None
+    current_time = now or datetime.datetime.now(datetime.UTC)
+    if (
+        manifest.permission_tier != PermissionTier.YOLO
+        or manifest.yolo_until is None
+        or manifest.yolo_until <= current_time
+    ):
+        return None
+    return manifest
+
+
+async def _revoke_yolo_grant(
+    *,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+    channel_id: str,
+) -> dict[str, object]:
+    home = router.home or paths.engram_home()
+    manifest = _load_active_yolo_manifest(channel_id=channel_id, home=home)
+    if manifest is None:
+        return {
+            "ok": False,
+            "error": "no active yolo grant",
+            "message": f"No active yolo grant for {channel_id}.",
+        }
+
+    previous, updated, _manifest_path, _normalized_duration = set_channel_permission_tier(
+        channel_id,
+        manifest.pre_yolo_tier or PermissionTier.TASK_ASSISTANT,
+        duration="permanent",
+        home=home,
+    )
+    router.replace_cached_manifest(updated)
+    label = _manifest_display_label(previous)
+    await slack_client.chat_postMessage(channel=channel_id, text="YOLO ended by owner")
+
+    owner_dm_channel_id = config.owner_dm_channel_id or router.owner_dm_channel_id
+    if owner_dm_channel_id:
+        await slack_client.chat_postMessage(
+            channel=owner_dm_channel_id,
+            text=f"YOLO ended on {label} — restored to {updated.permission_tier.value}.",
+        )
+
+    return {
+        "ok": True,
+        "channel_id": channel_id,
+        "label": label,
+        "tier": updated.permission_tier.value,
+    }
+
+
+async def _extend_yolo_grant(
+    *,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+    channel_id: str,
+    duration: str,
+) -> dict[str, object]:
+    home = router.home or paths.engram_home()
+    try:
+        normalized_duration = _normalize_yolo_duration(duration)
+    except ValueError as exc:
+        return {"ok": False, "error": "invalid duration", "message": str(exc)}
+
+    current_time = datetime.datetime.now(datetime.UTC)
+    manifest = _load_active_yolo_manifest(
+        channel_id=channel_id,
+        home=home,
+        now=current_time,
+    )
+    if manifest is None:
+        return {
+            "ok": False,
+            "error": "no active yolo grant",
+            "message": f"No active yolo grant for {channel_id}.",
+        }
+
+    remaining = manifest.yolo_until - current_time
+    requested_delta = _yolo_extension_delta(normalized_duration)
+    if remaining + requested_delta > YOLO_MAX_DURATION:
+        return {
+            "ok": False,
+            "error": "yolo cap exceeded",
+            "message": "Cannot extend beyond 72h total remaining.",
+        }
+
+    _previous, updated, _manifest_path, _normalized = set_channel_permission_tier(
+        channel_id,
+        PermissionTier.YOLO,
+        duration=normalized_duration,
+        home=home,
+        now=current_time,
+    )
+    router.replace_cached_manifest(updated)
+    new_remaining = (
+        updated.yolo_until - current_time
+        if updated.yolo_until is not None
+        else datetime.timedelta()
+    )
+    label = _manifest_display_label(updated)
+    owner_dm_channel_id = config.owner_dm_channel_id or router.owner_dm_channel_id
+    if owner_dm_channel_id:
+        await slack_client.chat_postMessage(
+            channel=owner_dm_channel_id,
+            text=(
+                f"YOLO extended on {label} by {normalized_duration}. "
+                f"Remaining: {_format_duration(new_remaining)}."
+            ),
+        )
+
+    return {
+        "ok": True,
+        "channel_id": channel_id,
+        "label": label,
+        "duration": normalized_duration,
+        "remaining_text": _format_duration(new_remaining),
+    }
+
+
+def _format_duration(duration: datetime.timedelta) -> str:
+    total_minutes = max(0, int(duration.total_seconds() // 60))
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{hours}h {minutes}m"
 
 
 def _resolve_meta_target(

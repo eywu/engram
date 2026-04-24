@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -40,6 +41,14 @@ _STICKY_INELIGIBLE_TOOLS = {
 class EgressResult:
     posted_message_ts: str | None
     chunks_posted: int
+
+
+@dataclass(frozen=True)
+class ActiveYoloGrantRow:
+    channel_id: str
+    channel_label: str | None
+    remaining: timedelta
+    pre_yolo_tier: PermissionTier
 
 
 async def post_reply(
@@ -449,6 +458,59 @@ async def post_yolo_expired_notification(
         text=_notification_fallback(text),
     )
     return response.get("ts") if isinstance(response, dict) else None
+
+
+def render_active_yolo_grants(
+    grants: Sequence[ActiveYoloGrantRow],
+) -> tuple[str, list[dict[str, object]]]:
+    if not grants:
+        text = "No active yolo grants."
+        return text, [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+
+    blocks: list[dict[str, object]] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "*Active yolo grants*"},
+        }
+    ]
+    for grant in grants:
+        label = _channel_label(grant.channel_id, grant.channel_label)
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*{label}* (`{grant.channel_id}`)\n"
+                        f"Remaining: {_format_duration_used(grant.remaining)}"
+                        f" • Restores to: `{grant.pre_yolo_tier.value}`"
+                    ),
+                },
+            }
+        )
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": f"yolo_actions_{grant.channel_id}",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Extend 6h"},
+                        "action_id": f"yolo_extend_{grant.channel_id}",
+                        "value": grant.channel_id,
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Revoke"},
+                        "action_id": f"yolo_revoke_{grant.channel_id}",
+                        "value": grant.channel_id,
+                        "style": "danger",
+                    },
+                ],
+            }
+        )
+
+    return "Active yolo grants", blocks
 
 
 async def update_question_resolved(
