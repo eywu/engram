@@ -60,3 +60,9 @@ def test_match_footgun_negative_cases(
     tool_input: dict[str, str],
 ) -> None:
     assert match_footgun(tool_name, tool_input) is None
+
+
+def test_rm_pattern_requires_recursive_flag_not_force_alone() -> None:
+    assert match_footgun("Bash", {"command": "rm -fr build"}) is not None
+    assert match_footgun("Bash", {"command": "rm -rf build"}) is not None
+    assert match_footgun("Bash", {"command": "rm -f single-file.txt"}) is None

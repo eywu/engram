@@ -38,8 +38,10 @@ _SHARED_BRANCH_PREFIXES = {
     "trunk",
 }
 
+# Require a recursive flag so plain single-file removals like ``rm -f foo``
+# stay outside the destructive-confirmation path.
 _RM_PATTERN = re.compile(
-    r"\brm\s+.*(?:--recursive\b|-[^\s-]*[rR][^\s]*)",
+    r"\brm\s+.*-(?=[rRfF]*[rR])[rRfF]+\b",
     _FLAGS,
 )
 _SUDO_PATTERN = re.compile(r"\bsudo\b", _FLAGS)
