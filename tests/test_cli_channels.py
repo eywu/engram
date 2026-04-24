@@ -63,6 +63,7 @@ def test_list_after_provisioning(cli, tmp_path: Path):
     assert result.exit_code == 0
     assert "C07TEAM" in result.output
     assert "pending" in result.output.lower()
+    assert "safe" in result.output
 
 
 # ── show ────────────────────────────────────────────────────────────────
@@ -86,7 +87,7 @@ def test_show_existing_channel(cli, tmp_path: Path):
     result = cli.invoke(app, ["show", "C07TEAM"])
     assert result.exit_code == 0
     assert "C07TEAM" in result.output
-    assert "task-assistant" in result.output
+    assert "safe" in result.output
     assert "pending" in result.output.lower()
     # tools disallowed list should surface
     assert "Bash" in result.output
@@ -164,7 +165,7 @@ def test_reset_flips_to_pending(cli, tmp_path: Path):
     assert m.status == ChannelStatus.PENDING
 
 
-def test_upgrade_sets_owner_scoped_tier(cli, tmp_path: Path):
+def test_upgrade_sets_trusted_tier(cli, tmp_path: Path):
     from engram.bootstrap import provision_channel as pc
 
     pc(
@@ -173,14 +174,30 @@ def test_upgrade_sets_owner_scoped_tier(cli, tmp_path: Path):
         home=tmp_path / ".engram",
     )
 
-    result = cli.invoke(app, ["upgrade", "C07TEAM", "owner-scoped"])
+    result = cli.invoke(app, ["upgrade", "C07TEAM", "trusted"])
 
     assert result.exit_code == 0
-    assert "task-assistant" in result.output
-    assert "owner-scoped" in result.output
+    assert "safe" in result.output
+    assert "trusted" in result.output
     manifest = load_manifest(channel_manifest_path("C07TEAM", tmp_path / ".engram"))
     assert manifest.permission_tier == PermissionTier.OWNER_SCOPED
     assert manifest.yolo_until is None
+
+
+def test_upgrade_accepts_deprecated_tier_alias_with_warning(cli, tmp_path: Path):
+    from engram.bootstrap import provision_channel as pc
+
+    pc(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        home=tmp_path / ".engram",
+    )
+
+    result = cli.invoke(app, ["upgrade", "C07TEAM", "task-assistant"])
+
+    assert result.exit_code == 0
+    assert "Deprecated tier name 'task-assistant'; use 'safe' instead." in result.output
+    assert "already has tier 'safe'" in result.output
 
 
 def test_upgrade_yolo_duration_and_tier_output(cli, tmp_path: Path):

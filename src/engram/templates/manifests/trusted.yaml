@@ -1,5 +1,11 @@
-# Compatibility copy for historical callers that still reference this path.
-# Keep in sync with `trusted.yaml`.
+# Owner-DM channel manifest template.
+#
+# Copied into contexts/<dm-channel-id>/.claude/channel-manifest.yaml on
+# first provisioning. Full inheritance, user-level setting priming so the
+# operator's personal MCPs (Linear, Gmail, etc.) are available.
+#
+# setting_sources=["user"] also drives the ~47% per-turn cost reduction
+# validated on 2026-04-20. (See scripts/cost_experiment.py.)
 
 channel_id: "{{channel_id}}"
 identity: owner-dm-full

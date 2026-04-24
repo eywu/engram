@@ -6,7 +6,7 @@ Two entry points:
   `.claude/` inheritance layer from repo templates.
 
 * `provision_channel(channel_id, ...)` — creates a new channel's context
-  directory from a template (owner-DM or task-assistant), renders its
+  directory from a template (owner-DM or safe), renders its
   CLAUDE.md with per-channel variables, and writes a ChannelManifest.
   Safe to call on existing channels: it will NOT clobber an existing
   manifest.
@@ -229,9 +229,9 @@ def _render_manifest(
 ) -> ChannelManifest:
     """Load the appropriate manifest template and fill in channel-specifics."""
     template_name = (
-        "owner-dm.yaml"
+        "trusted.yaml"
         if identity == IdentityTemplate.OWNER_DM_FULL
-        else "task-assistant.yaml"
+        else "safe.yaml"
     )
     template_path = paths.TEMPLATES_MANIFESTS_DIR / template_name
     raw = template_path.read_text()

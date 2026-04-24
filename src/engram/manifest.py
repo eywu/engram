@@ -68,9 +68,48 @@ class ChannelStatus(StrEnum):
 class PermissionTier(StrEnum):
     """Channel trust tier used for default permissions and HITL posture."""
 
-    TASK_ASSISTANT = "task-assistant"
-    OWNER_SCOPED = "owner-scoped"
+    TASK_ASSISTANT = "safe"
+    OWNER_SCOPED = "trusted"
     YOLO = "yolo"
+
+    @classmethod
+    def _missing_(cls, value):
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().lower()
+        return _PERMISSION_TIER_ALIASES.get(normalized)
+
+
+_PERMISSION_TIER_ALIASES: dict[str, PermissionTier] = {
+    "safe": PermissionTier.TASK_ASSISTANT,
+    "task-assistant": PermissionTier.TASK_ASSISTANT,
+    "trusted": PermissionTier.OWNER_SCOPED,
+    "owner-scoped": PermissionTier.OWNER_SCOPED,
+    "yolo": PermissionTier.YOLO,
+}
+_DEPRECATED_PERMISSION_TIER_NAMES: dict[str, str] = {
+    "task-assistant": PermissionTier.TASK_ASSISTANT.value,
+    "owner-scoped": PermissionTier.OWNER_SCOPED.value,
+}
+
+
+def parse_permission_tier(
+    value: PermissionTier | str,
+) -> tuple[PermissionTier, str | None]:
+    """Parse a tier name and return the canonical tier plus any deprecated alias."""
+    if isinstance(value, PermissionTier):
+        return value, None
+    normalized = str(value or "").strip().lower()
+    tier = PermissionTier(normalized)
+    deprecated = (
+        normalized if normalized in _DEPRECATED_PERMISSION_TIER_NAMES else None
+    )
+    return tier, deprecated
+
+
+def permission_tier_choices_text() -> str:
+    """Return the canonical tier list for help/usage text."""
+    return "safe|trusted|yolo"
 
 
 ABSOLUTE_DENY_RULES: tuple[str, ...] = (
@@ -537,6 +576,54 @@ def _merge_rules(*groups: list[str] | tuple[str, ...]) -> list[str]:
     return merged
 
 
+def _normalize_permission_tier_name(
+    value: object,
+) -> tuple[object, str | None, bool]:
+    if value in (None, ""):
+        return value, None, False
+    if isinstance(value, PermissionTier):
+        return value.value, None, False
+    if not isinstance(value, str):
+        return value, None, False
+
+    normalized = value.strip().lower()
+    try:
+        tier = PermissionTier(normalized)
+    except ValueError:
+        return value, None, False
+
+    deprecated = (
+        normalized if normalized in _DEPRECATED_PERMISSION_TIER_NAMES else None
+    )
+    return tier.value, deprecated, value != tier.value
+
+
+def _normalize_manifest_tier_aliases(
+    raw: dict,
+) -> tuple[dict, list[tuple[str, str, str]], bool]:
+    data = copy.deepcopy(raw)
+    migrations: list[tuple[str, str, str]] = []
+    changed = False
+
+    for field_name in ("permission_tier", "pre_yolo_tier"):
+        normalized, deprecated, field_changed = _normalize_permission_tier_name(
+            data.get(field_name)
+        )
+        if field_changed:
+            data[field_name] = normalized
+            changed = True
+        if deprecated is not None:
+            migrations.append(
+                (
+                    field_name,
+                    deprecated,
+                    str(normalized),
+                )
+            )
+
+    return data, migrations, changed
+
+
 def _apply_tier_defaults(
     raw: dict,
     *,
@@ -714,8 +801,11 @@ def load_manifest(path: Path) -> ChannelManifest:
         )
 
     try:
+        normalized_raw, alias_migrations, alias_changed = (
+            _normalize_manifest_tier_aliases(raw)
+        )
         hydrated_raw, changed = _apply_tier_defaults(
-            raw,
+            normalized_raw,
             infer_legacy_tier=True,
         )
         manifest = ChannelManifest.model_validate(hydrated_raw)
@@ -728,7 +818,19 @@ def load_manifest(path: Path) -> ChannelManifest:
             f"Manifest validation failed for {path}:\n{e}"
         ) from e
 
-    if changed or yolo_changed:
+    if alias_migrations:
+        migration_summary = ", ".join(
+            f"{field_name}: {old_name} -> {new_name}"
+            for field_name, old_name, new_name in alias_migrations
+        )
+        log.info(
+            "channel.permission_tier_migrated channel_id=%s path=%s migrations=%s",
+            manifest.channel_id,
+            path,
+            migration_summary,
+        )
+
+    if alias_changed or changed or yolo_changed:
         _write_manifest_atomic(manifest, path)
     return manifest
 

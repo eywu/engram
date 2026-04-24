@@ -49,6 +49,8 @@ from engram.manifest import (
     PermissionTier,
     dump_manifest,
     load_manifest,
+    parse_permission_tier,
+    permission_tier_choices_text,
     persist_yolo_demotion,
     set_channel_permission_tier,
     validate_upgrade_duration,
@@ -392,7 +394,7 @@ def register_listeners(
                             channel_id=channel_id,
                             channel_label=channel_label or channel_id,
                             invited_by_user_id=user_id,
-                            template=manifest.identity.value,
+                            tier=manifest.permission_tier.value,
                             first_message=text,
                             source_thread_ts=thread_ts,
                         )
@@ -825,18 +827,24 @@ async def handle_engram_command(
                 slack_client,
                 channel_id=source_channel_id,
                 user_id=user_id,
-                text="Usage: /engram upgrade <task-assistant|owner-scoped|yolo> [reason...]",
+                text=(
+                    "Usage: /engram upgrade "
+                    f"<{permission_tier_choices_text()}> [reason...]"
+                ),
             )
             return {"ok": False, "error": "missing tier"}
 
         try:
-            tier = PermissionTier(parts[1].lower())
+            tier, _deprecated_alias = parse_permission_tier(parts[1])
         except ValueError:
             await _post_ephemeral_reply(
                 slack_client,
                 channel_id=source_channel_id,
                 user_id=user_id,
-                text=f"Unknown tier: {parts[1]}",
+                text=(
+                    f"Unknown tier: {parts[1]}. "
+                    f"Use {permission_tier_choices_text()}."
+                ),
             )
             return {"ok": False, "error": "unknown tier"}
 

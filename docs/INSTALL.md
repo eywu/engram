@@ -375,7 +375,7 @@ Restart with `launchctl kickstart gui/$(id -u)/com.engram.bridge`.
 Check `engram cost --by-channel` to see which channel is spending. Each
 channel has its own identity template and permission manifest — tool-heavy
 templates (e.g. `owner-dm-full`) cost more per turn than restricted ones
-(e.g. `task-assistant`).
+(e.g. `safe`).
 
 ---
 

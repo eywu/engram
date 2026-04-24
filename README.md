@@ -48,7 +48,7 @@ arrives within ~30s.
 ## Safety
 
 Engram isolates each Slack room at three layers: separate workspace files, separate memory state, and a separate capability boundary.
-Every channel also carries its own manifest, so approval status, permission tier, deny rules, and nightly eligibility stay local to that room.
+Every channel also carries its own manifest, so approval status, permission tier (`safe`, `trusted`, or `yolo`), deny rules, and nightly eligibility stay local to that room.
 Sensitive tools still go through human-in-the-loop: Engram posts a Block Kit approval card, waits for the answer, and only then returns allow or deny to Claude.
 Destructive shell footguns add a second barrier: Engram posts a destructive-action card, opens a type-to-confirm modal, and requires `CONFIRM` even in YOLO mode.
 See [permission tiers](docs/permission-tiers.md), [HITL](docs/hitl.md), and [footgun confirmations](docs/footguns.md).
@@ -167,7 +167,7 @@ aggregated in the SQLite ledger at `~/.engram/costs.db`.
 
 | Slash command | What it does |
 | --- | --- |
-| `/engram upgrade <tier> [reason...]` | Request a permission-tier upgrade. Team channels require owner-DM approval. Tiers: `task-assistant`, `owner-scoped`, `yolo`. |
+| `/engram upgrade <tier> [reason...]` | Request a permission-tier upgrade. Team channels require owner-DM approval. Tiers: `safe`, `trusted`, `yolo`. |
 | `/engram yolo <list\|off\|extend> ...` | Manage time-boxed YOLO sessions. Use `list`, `off <channel-name-or-id>`, or `extend <channel> <6h\|24h\|72h>`. |
 | `/exclude-from-nightly [#channel]` | Exclude the current channel, or the named channel, from the nightly cross-channel meta-summary. |
 | `/include-in-nightly [#channel]` | Re-include the current channel, or the named channel, in the nightly cross-channel meta-summary. |

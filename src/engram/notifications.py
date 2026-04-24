@@ -91,7 +91,7 @@ async def notify_pending_channel(
     channel_id: str,
     channel_label: str,
     invited_by_user_id: str | None,
-    template: str,
+    tier: str,
     first_message: str,
     source_thread_ts: str | None,
 ) -> str | None:
@@ -121,7 +121,7 @@ async def notify_pending_channel(
         [
             f"• *Channel:* {channel_label} ({channel_id})",
             f"• *Invited by:* {invited_by}",
-            f"• *Template:* {template}",
+            f"• *Tier:* {tier}",
             f'• *First message:* "{preview}"',
         ]
     )

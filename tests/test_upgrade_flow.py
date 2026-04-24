@@ -134,8 +134,8 @@ async def test_upgrade_command_posts_waiting_message_and_owner_dm(
     )
     assert record.channel == "C07TEAM"
     assert record.user == "U07REQUESTER"
-    assert record.from_tier == "task-assistant"
-    assert record.to_tier == "owner-scoped"
+    assert record.from_tier == "safe"
+    assert record.to_tier == "trusted"
     assert record.reason == "private workspace"
 
 
@@ -178,7 +178,7 @@ async def test_upgrade_approve_permanent_updates_manifest_and_messages(
     assert manifest.yolo_until is None
     assert manifest.pre_yolo_tier is None
     assert [call["channel"] for call in slack.update_calls] == ["C07TEAM", "D07OWNER"]
-    assert slack.update_calls[0]["text"] == "✅ Upgraded to owner-scoped by <@U07OWNER>."
+    assert slack.update_calls[0]["text"] == "✅ Upgraded to trusted by <@U07OWNER>."
     assert slack.update_calls[1]["text"] == "✅ Approved by <@U07OWNER>."
     record = next(
         item for item in caplog.records if item.getMessage() == "permission.upgrade_granted"

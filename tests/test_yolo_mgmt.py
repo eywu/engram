@@ -144,7 +144,7 @@ async def test_yolo_list_renders_active_grants_with_buttons(tmp_path: Path) -> N
     call = slack.ephemeral_calls[0]
     assert call["text"] == "Active yolo grants"
     assert "*#growth* (`C07TEAM`)" in call["blocks"][1]["text"]["text"]
-    assert "Restores to: `owner-scoped`" in call["blocks"][1]["text"]["text"]
+    assert "Restores to: `trusted`" in call["blocks"][1]["text"]["text"]
     buttons = call["blocks"][2]["elements"]
     assert [button["text"]["text"] for button in buttons] == ["Extend 6h", "Revoke"]
     assert [button["action_id"] for button in buttons] == [
@@ -222,7 +222,7 @@ async def test_yolo_off_command_revokes_and_notifies_channel_and_owner_dm(
     }
     assert slack.post_calls[1]["channel"] == "D07OWNER"
     assert "YOLO ended on #growth" in slack.post_calls[1]["text"]
-    assert "restored to owner-scoped" in slack.post_calls[1]["text"]
+    assert "restored to trusted" in slack.post_calls[1]["text"]
     assert slack.ephemeral_calls[-1]["text"] == "Revoked yolo for #growth."
 
 
@@ -321,7 +321,7 @@ def test_cli_yolo_list_extend_and_off(cli: CliRunner, tmp_path: Path) -> None:
 
     assert list_result.exit_code == 0
     assert "C07TEAM" in list_result.output
-    assert "owner-scoped" in list_result.output
+    assert "trusted" in list_result.output
     assert extend_result.exit_code == 0
     assert updated.yolo_until == initial.yolo_until + timedelta(hours=6)
     assert off_result.exit_code == 0

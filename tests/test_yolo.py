@@ -282,7 +282,7 @@ async def test_lazy_yolo_expiry_demotes_notifies_and_sweep_becomes_noop(
 
     dm_call = next(call for call in slack.post_calls if call["channel"] == "D07OWNER")
     assert "YOLO expired on #growth" in dm_call["blocks"][0]["text"]["text"]
-    assert "reverted to owner-scoped" in dm_call["blocks"][0]["text"]["text"]
+    assert "reverted to trusted" in dm_call["blocks"][0]["text"]["text"]
     assert "Duration used: 24h 0m." in dm_call["blocks"][0]["text"]["text"]
     assert dm_call["blocks"][1]["type"] == "context"
     assert "/engram upgrade C07TEST123 yolo --until 24h" in dm_call["blocks"][1]["elements"][0]["text"]

@@ -323,7 +323,7 @@ async def test_pending_channel_notification_posts_owner_dm_card(tmp_path: Path):
         channel_id=result.channel_id,
         channel_label=result.manifest.label or result.channel_id,
         invited_by_user_id="U07REQUESTER",
-        template=result.manifest.identity.value,
+        tier=result.manifest.permission_tier.value,
         first_message="hey engram, what's the status?",
         source_thread_ts="1713800000.000100",
     )
@@ -334,7 +334,7 @@ async def test_pending_channel_notification_posts_owner_dm_card(tmp_path: Path):
     assert post["text"] == "New channel awaiting approval"
     assert "#engram-self (C07TEAM)" in post["blocks"][1]["text"]["text"]
     assert "<@U07REQUESTER>" in post["blocks"][1]["text"]["text"]
-    assert "task-assistant" in post["blocks"][1]["text"]["text"]
+    assert "safe" in post["blocks"][1]["text"]["text"]
     assert "hey engram, what's the status?" in post["blocks"][1]["text"]["text"]
 
 

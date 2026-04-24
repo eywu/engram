@@ -28,6 +28,8 @@ from engram.manifest import (
     ManifestError,
     PermissionTier,
     load_manifest,
+    parse_permission_tier,
+    permission_tier_choices_text,
     set_channel_permission_tier,
     set_channel_status,
     validate_upgrade_duration,
@@ -120,7 +122,7 @@ def list_channels() -> None:
     table = Table(show_header=True, header_style="bold")
     table.add_column("Channel ID")
     table.add_column("Status")
-    table.add_column("Identity")
+    table.add_column("Tier")
     table.add_column("Label")
     table.add_column("Setting", overflow="fold")
 
@@ -139,7 +141,7 @@ def list_channels() -> None:
         table.add_row(
             m.channel_id,
             f"[{_status_style(m.status)}]{m.status}[/]",
-            m.identity.value,
+            m.tier_effective().value,
             m.label or "—",
             ",".join(m.setting_sources),
         )
@@ -168,7 +170,7 @@ def show(
     rprint(
         f"  status:   [{_status_style(m.status)}]{m.status}[/]"
     )
-    rprint(f"  identity: {m.identity.value}")
+    rprint(f"  tier:     {m.tier_effective().value}")
     rprint(f"  setting:  {m.setting_sources}")
     rprint(f"  behavior: style={m.behavior.style} max_turns={m.behavior.max_turns}")
 
@@ -236,10 +238,26 @@ def upgrade(
 ) -> None:
     """Upgrade a channel tier immediately, bypassing the Slack approval flow."""
     try:
-        target_tier = PermissionTier(tier.strip().lower())
+        target_tier, deprecated_alias = parse_permission_tier(tier)
     except ValueError as exc:
         rprint(f"[red]Unknown permission tier: {tier}[/red]")
+        rprint(
+            f"  Expected one of: {permission_tier_choices_text()} "
+            "(deprecated aliases still accepted here)."
+        )
         raise typer.Exit(code=2) from exc
+
+    if deprecated_alias is not None:
+        log.info(
+            "permission_tier.deprecated_alias_used source=cli alias=%s canonical=%s channel_id=%s",
+            deprecated_alias,
+            target_tier.value,
+            channel_id,
+        )
+        rprint(
+            f"[yellow]Deprecated tier name '{deprecated_alias}'; "
+            f"use '{target_tier.value}' instead.[/yellow]"
+        )
 
     try:
         normalized_duration = validate_upgrade_duration(

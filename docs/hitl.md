@@ -30,9 +30,9 @@ hitl:
   max_per_day: 1000
 ```
 
-Owner DMs and task-assistant channels both enable HITL by default, but their scopes differ. Owner DMs inherit user settings and allow more tools, so you are more likely to see a card for `Write`, `Edit`, or `Bash`. Task-assistant channels are stricter because they are shared rooms.
+Owner DMs and safe channels both enable HITL by default, but their scopes differ. Owner DMs inherit user settings and allow more tools, so you are more likely to see a card for `Write`, `Edit`, or `Bash`. Safe channels are stricter because they are shared rooms.
 
-For the shared-channel baseline, see the task-assistant tier defaults in [`src/engram/manifest.py`](../src/engram/manifest.py). The task-assistant template still declares the write-side tool exclusions directly:
+For the shared-channel baseline, see the safe tier defaults in [`src/engram/manifest.py`](../src/engram/manifest.py). The safe template still declares the write-side tool exclusions directly:
 
 ```yaml
 tools:
@@ -45,10 +45,10 @@ tools:
     - NotebookEdit
 ```
 
-The task-assistant tier also denies common secret paths through native Claude Code permission rules:
+The safe tier also denies common secret paths through native Claude Code permission rules:
 
 ```yaml
-permission_tier: task-assistant
+permission_tier: safe
 # deny rules come from `_TIER_DEFAULTS` in src/engram/manifest.py
 ```
 
@@ -194,10 +194,10 @@ Values are normalized when loaded. `timeout_s` and `max_per_day` are converted t
 
 ### Owner-DM Default
 
-Owner DMs are private and inherit user-level settings, so the owner-scoped tier sets their default daily cap:
+Owner DMs are private and inherit user-level settings, so the trusted tier sets their default daily cap:
 
 ```yaml
-permission_tier: owner-scoped
+permission_tier: trusted
 setting_sources: [user]
 
 tools: {}
@@ -210,17 +210,17 @@ hitl:
   max_per_day: 1000
 ```
 
-Source: [`src/engram/templates/manifests/owner-dm.yaml`](../src/engram/templates/manifests/owner-dm.yaml).
+Source: [`src/engram/templates/manifests/trusted.yaml`](../src/engram/templates/manifests/trusted.yaml).
 
 Use this shape when you want Engram to have broad personal capability while still requiring a click before sensitive tool calls run.
 
-### Task-Assistant Default
+### Safe Default
 
-Task-assistant channels are shared by default. They start pending, use project-level settings, disallow shell and write tools, and derive their permission/HITL defaults from the task-assistant tier:
+Safe channels are shared by default. They start pending, use project-level settings, disallow shell and write tools, and derive their permission/HITL defaults from the safe tier:
 
 ```yaml
 status: pending
-permission_tier: task-assistant
+permission_tier: safe
 setting_sources: [project]
 
 tools:
@@ -238,7 +238,7 @@ hitl:
   max_per_day: 1000
 ```
 
-Source: [`src/engram/templates/manifests/task-assistant.yaml`](../src/engram/templates/manifests/task-assistant.yaml).
+Source: [`src/engram/templates/manifests/safe.yaml`](../src/engram/templates/manifests/safe.yaml).
 
 Use this shape for team rooms where you want Engram to answer questions, search approved memory, and use safe project tools without giving the channel a shell or write access by default.
 
@@ -260,7 +260,7 @@ Common adjustments:
 | Reduce stale cards | Lower `timeout_s`, for example `120`. |
 | Prevent prompt spam in a busy room | Lower `max_per_day`, for example `1` or `2`. |
 | Disable HITL for non-interactive jobs | Set `enabled: false`. |
-| Give the owner more review bandwidth | Owner-scoped already defaults to `max_per_day: 1000`; raise or lower it locally only if needed. |
+| Give the owner more review bandwidth | Trusted already defaults to `max_per_day: 1000`; raise or lower it locally only if needed. |
 
 Do not disable HITL in a live Slack channel unless the channel's tool scope is already tight enough for unattended tool execution.
 
@@ -326,7 +326,7 @@ The returned decision still appears as:
 hitl.tool_guard_returned decision=deny
 ```
 
-Caps exist to stop a confused or underspecified request from flooding a shared Slack channel with approval cards. They are especially important in task-assistant channels where multiple people may be talking to the same agent.
+Caps exist to stop a confused or underspecified request from flooding a shared Slack channel with approval cards. They are especially important in safe channels where multiple people may be talking to the same agent.
 
 The limiter also allows only one open HITL card per channel. If another question is already pending, the next prompt is denied with:
 
@@ -471,6 +471,6 @@ If you need to prove whether a tool actually ran, use the logs first. The key ch
 - [`src/engram/hitl.py`](../src/engram/hitl.py) is the canonical HITL state machine and log event source.
 - [`src/engram/egress.py`](../src/engram/egress.py) renders and updates the Slack Block Kit card.
 - [`src/engram/ingress.py`](../src/engram/ingress.py) handles button clicks and thread replies.
-- [`src/engram/templates/manifests/owner-dm.yaml`](../src/engram/templates/manifests/owner-dm.yaml) shows owner-DM defaults.
-- [`src/engram/templates/manifests/task-assistant.yaml`](../src/engram/templates/manifests/task-assistant.yaml) shows shared-channel defaults and deny examples.
+- [`src/engram/templates/manifests/trusted.yaml`](../src/engram/templates/manifests/trusted.yaml) shows owner-DM defaults.
+- [`src/engram/templates/manifests/safe.yaml`](../src/engram/templates/manifests/safe.yaml) shows shared-channel defaults and deny examples.
 - [`docs/m4-report.md`](m4-report.md) summarizes the M4 live demo and the GRO-426 blocking-gate fix.

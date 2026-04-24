@@ -174,9 +174,9 @@ def test_ask_user_question_defaults():
 
 def test_manifest_loads_hitl_section(tmp_path: Path):
     templates = [
-        ("owner-dm.yaml", "D07OWNER", "DM", PermissionTier.OWNER_SCOPED, 1000),
+        ("trusted.yaml", "D07OWNER", "DM", PermissionTier.OWNER_SCOPED, 1000),
         (
-            "task-assistant.yaml",
+            "safe.yaml",
             "C07TEAM",
             "#test-team",
             PermissionTier.TASK_ASSISTANT,
@@ -205,8 +205,8 @@ def test_manifest_loads_hitl_section(tmp_path: Path):
 
 def test_manifest_loads_nightly_model_from_templates(tmp_path: Path):
     templates = [
-        ("owner-dm.yaml", "D07OWNER", "DM", "opus"),
-        ("task-assistant.yaml", "C07TEAM", "#test-team", "sonnet"),
+        ("trusted.yaml", "D07OWNER", "DM", "opus"),
+        ("safe.yaml", "C07TEAM", "#test-team", "sonnet"),
     ]
 
     for template_name, channel_id, label, expected_model in templates:
@@ -225,7 +225,7 @@ def test_manifest_loads_nightly_model_from_templates(tmp_path: Path):
 
 
 def test_owner_dm_template_has_read_only_allow_defaults(tmp_path: Path):
-    template = paths.TEMPLATES_MANIFESTS_DIR / "owner-dm.yaml"
+    template = paths.TEMPLATES_MANIFESTS_DIR / "trusted.yaml"
     rendered = (
         template.read_text()
         .replace("{{channel_id}}", "D07OWNER")
@@ -239,6 +239,27 @@ def test_owner_dm_template_has_read_only_allow_defaults(tmp_path: Path):
     assert manifest.permissions.allow == list(
         OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES
     )
+
+
+def test_legacy_template_paths_still_load(tmp_path: Path):
+    templates = [
+        ("owner-dm.yaml", "D07OWNER", "DM", PermissionTier.OWNER_SCOPED),
+        ("task-assistant.yaml", "C07TEAM", "#test-team", PermissionTier.TASK_ASSISTANT),
+    ]
+
+    for template_name, channel_id, label, expected_tier in templates:
+        template = paths.TEMPLATES_MANIFESTS_DIR / template_name
+        rendered = (
+            template.read_text()
+            .replace("{{channel_id}}", channel_id)
+            .replace("{{channel_label}}", label)
+        )
+        manifest_path = tmp_path / template_name
+        manifest_path.write_text(rendered)
+
+        manifest = load_manifest(manifest_path)
+
+        assert manifest.permission_tier == expected_tier
 
 
 def test_no_dont_ask_rule_in_templates():

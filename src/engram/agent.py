@@ -586,8 +586,8 @@ class Agent:
                         )
                         return PermissionResultDeny(
                             message=(
-                                "Destructive command blocked in task-assistant tier. "
-                                "Request upgrade to owner-scoped."
+                                "Destructive command blocked in safe tier. "
+                                "Request upgrade to trusted."
                             ),
                         )
 
@@ -629,8 +629,8 @@ class Agent:
                     )
                     return PermissionResultDeny(
                         message=(
-                            "Destructive command blocked in task-assistant tier. "
-                            "Request upgrade to owner-scoped."
+                            "Destructive command blocked in safe tier. "
+                            "Request upgrade to trusted."
                         ),
                     )
 

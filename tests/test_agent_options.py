@@ -422,8 +422,8 @@ async def test_task_assistant_footgun_is_flat_denied_without_prompt():
 
     assert isinstance(result, PermissionResultDeny)
     assert result.message == (
-        "Destructive command blocked in task-assistant tier. "
-        "Request upgrade to owner-scoped."
+        "Destructive command blocked in safe tier. "
+        "Request upgrade to trusted."
     )
     assert questions == []
     assert router.hitl.pending_for_channel("C1") == []

@@ -1,5 +1,13 @@
-# Compatibility copy for historical callers that still reference this path.
-# Keep in sync with `safe.yaml`.
+# Team/topic channel manifest template.
+#
+# Copied into contexts/<channel-id>/.claude/channel-manifest.yaml when a new
+# channel is auto-provisioned. Status starts as `pending` — the operator
+# must approve via `engram channels approve <channel-id>` before the bot
+# responds.
+#
+# Default scope is exclusion-based: inherits the project-level toolkit
+# minus a few write-side tools that are rarely safe in a shared channel.
+# The operator can edit this file to tighten or relax the scope per channel.
 
 channel_id: "{{channel_id}}"
 identity: task-assistant

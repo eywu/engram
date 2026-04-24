@@ -28,8 +28,8 @@ The detector is exact and finite. If a pattern is not in `src/engram/footguns.py
 
 ## How it interacts with tiers
 
-- `owner-scoped` channels and the owner DM show the destructive-action card and require the typed confirmation modal before the command can continue.
-- `task-assistant` channels usually block these commands earlier because Bash and write-side tools are denied by default. If a footgun still matches there, Engram denies it outright and tells the user to request an upgrade.
+- `trusted` channels and the owner DM show the destructive-action card and require the typed confirmation modal before the command can continue.
+- `safe` channels usually block these commands earlier because Bash and write-side tools are denied by default. If a footgun still matches there, Engram denies it outright and tells the user to request an upgrade.
 - `yolo` still shows the confirmation flow. YOLO bypasses normal HITL questions, but destructive footguns remain gated by typed confirmation on purpose.
 
 ## How to override

@@ -1,9 +1,11 @@
 """Permission-tier foundation tests."""
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 import yaml
 
 from engram.manifest import (
@@ -65,10 +67,34 @@ permissions:
     assert first.permissions.allow == list(OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES)
 
     persisted = yaml.safe_load(path.read_text())
-    assert persisted["permission_tier"] == "owner-scoped"
+    assert persisted["permission_tier"] == "trusted"
     assert persisted["permissions"]["allow"] == list(
         OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES
     )
+
+
+def test_load_manifest_migrates_deprecated_tier_alias_fixture(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    fixture = (
+        Path(__file__).parent
+        / "fixtures"
+        / "manifests"
+        / "legacy-permission-tiers.yaml"
+    )
+    path = tmp_path / "channel-manifest.yaml"
+    path.write_text(fixture.read_text())
+
+    with caplog.at_level(logging.INFO, logger="engram.manifest"):
+        manifest = load_manifest(path)
+
+    assert manifest.permission_tier == PermissionTier.TASK_ASSISTANT
+    assert manifest.pre_yolo_tier == PermissionTier.OWNER_SCOPED
+    assert "channel.permission_tier_migrated" in caplog.text
+    persisted = yaml.safe_load(path.read_text())
+    assert persisted["permission_tier"] == "safe"
+    assert persisted["pre_yolo_tier"] == "trusted"
 
 
 def test_tier_effective_lazy_yolo_demotion():
@@ -128,7 +154,7 @@ channel_id: D07OWNER
 identity: owner-dm-full
 label: DM
 status: active
-permission_tier: owner-scoped
+permission_tier: trusted
 setting_sources: [user]
 permissions:
   deny:
@@ -152,7 +178,7 @@ def test_task_assistant_tier_denies_survive_user_additions(tmp_path: Path):
 channel_id: C07TEST
 identity: task-assistant
 status: active
-permission_tier: task-assistant
+permission_tier: safe
 setting_sources: [project]
 permissions:
   deny:
