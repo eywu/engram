@@ -3,13 +3,19 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 from typer.testing import CliRunner
 
 from engram.cli import app as cli_app
 from engram.config import AnthropicConfig, EngramConfig, SlackConfig
-from engram.ingress import handle_engram_command, handle_yolo_action
+from engram.ingress import (
+    ACTION_ID_YOLO_DURATION,
+    handle_engram_command,
+    handle_yolo_action,
+    handle_yolo_duration_action,
+)
 from engram.manifest import (
     ChannelManifest,
     ChannelStatus,
@@ -23,7 +29,8 @@ from engram.router import Router
 
 
 class FakeSlackClient:
-    def __init__(self) -> None:
+    def __init__(self, user_info: dict[str, dict[str, Any]] | None = None) -> None:
+        self.user_info = user_info or {}
         self.post_calls: list[dict[str, Any]] = []
         self.ephemeral_calls: list[dict[str, Any]] = []
         self.update_calls: list[dict[str, Any]] = []
@@ -42,6 +49,9 @@ class FakeSlackClient:
     async def chat_update(self, **kwargs):
         self.update_calls.append(kwargs)
         return {"ok": True}
+
+    async def users_info(self, *, user: str):
+        return {"ok": True, "user": self.user_info.get(user, {})}
 
 
 @pytest.fixture
@@ -87,6 +97,28 @@ def write_active_yolo_manifest(
     return path
 
 
+def write_channel_manifest(
+    home: Path,
+    *,
+    channel_id: str = "C07TEAM",
+    label: str = "#growth",
+    permission_tier: PermissionTier = PermissionTier.OWNER_SCOPED,
+) -> Path:
+    path = channel_manifest_path(channel_id, home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dump_manifest(
+        ChannelManifest(
+            channel_id=channel_id,
+            identity=IdentityTemplate.TASK_ASSISTANT,
+            status=ChannelStatus.ACTIVE,
+            label=label,
+            permission_tier=permission_tier,
+        ),
+        path,
+    )
+    return path
+
+
 def yolo_action_payload(
     *,
     action_id: str,
@@ -96,6 +128,19 @@ def yolo_action_payload(
 ) -> dict[str, Any]:
     return {
         "actions": [{"action_id": action_id, "value": value}],
+        "channel": {"id": channel_id},
+        "user": {"id": user_id},
+    }
+
+
+def yolo_duration_payload(
+    *,
+    value: str,
+    channel_id: str = "C07TEAM",
+    user_id: str = "U07OWNER",
+) -> dict[str, Any]:
+    return {
+        "actions": [{"action_id": ACTION_ID_YOLO_DURATION, "value": value}],
         "channel": {"id": channel_id},
         "user": {"id": user_id},
     }
@@ -276,6 +321,168 @@ async def test_yolo_extend_action_extends_and_confirms(tmp_path: Path) -> None:
     assert slack.post_calls[0]["channel"] == "D07OWNER"
     assert "YOLO extended on #growth by 6h" in slack.post_calls[0]["text"]
     assert slack.ephemeral_calls[0]["text"].startswith("Extended #growth by 6h.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_duration", "expected_hours"),
+    [("6", 6), ("24h", 24), ("72", 72)],
+)
+async def test_yolo_duration_action_sets_expected_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_duration: str,
+    expected_hours: int,
+) -> None:
+    home = tmp_path / ".engram"
+    write_channel_manifest(home)
+    fixed_now = datetime(2026, 4, 24, 14, 45, tzinfo=UTC)
+    monkeypatch.setattr("engram.ingress._utc_now", lambda: fixed_now)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient(user_info={"U07OWNER": {"tz": "America/Los_Angeles"}})
+
+    result = await handle_yolo_duration_action(
+        payload=yolo_duration_payload(value=f"C07TEAM|{raw_duration}"),
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+    )
+
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    expected_expiry = (fixed_now + timedelta(hours=expected_hours)).astimezone(
+        ZoneInfo("America/Los_Angeles")
+    )
+    expiry_label = expected_expiry.strftime("%Y-%m-%d %H:%M %Z")
+    assert result["ok"] is True
+    assert manifest.permission_tier == PermissionTier.YOLO
+    assert manifest.pre_yolo_tier == PermissionTier.OWNER_SCOPED
+    assert manifest.yolo_granted_at == fixed_now
+    assert manifest.yolo_until == fixed_now + timedelta(hours=expected_hours)
+    assert result["response"]["text"] == (
+        f"YOLO enabled for {expected_hours}h "
+        f"(expires {expiry_label}). Type `/engram` to manage."
+    )
+    assert slack.post_calls[0]["channel"] == "C07TEAM"
+    assert slack.post_calls[0]["text"] == (
+        f"🚀 <@U07OWNER> enabled YOLO mode for {expected_hours}h. "
+        f"HITL gates bypassed until {expiry_label}. "
+        "Destructive-command modals still active."
+    )
+
+
+@pytest.mark.asyncio
+async def test_yolo_duration_action_cancel_leaves_state_unchanged(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_channel_manifest(home)
+    before = load_manifest(channel_manifest_path("C07TEAM", home))
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_yolo_duration_action(
+        payload=yolo_duration_payload(value="C07TEAM|cancel"),
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+    )
+
+    after = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result["ok"] is True
+    assert result["response"]["text"] == "YOLO cancelled. Current tier unchanged."
+    assert after == before
+    assert slack.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_yolo_duration_action_rejects_non_owner_without_state_change(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_channel_manifest(home)
+    before = load_manifest(channel_manifest_path("C07TEAM", home))
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_yolo_duration_action(
+        payload=yolo_duration_payload(value="C07TEAM|24", user_id="U07OTHER"),
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+    )
+
+    after = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result["ok"] is False
+    assert result["error"] == "not owner"
+    assert result["response"]["text"] == "Owner-only."
+    assert after == before
+    assert slack.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_yolo_extend_command_without_duration_shows_picker(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_channel_manifest(home, channel_id="C07TEAM", label="#growth")
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OWNER",
+        command_text="yolo extend",
+    )
+
+    assert result == {"ok": True, "picker": True}
+    assert slack.ephemeral_calls[0]["text"].startswith("YOLO mode will bypass HITL gates")
+    assert [button["text"]["text"] for button in slack.ephemeral_calls[0]["blocks"][1]["elements"]] == [
+        "⏱️ 6h",
+        "⏱️ 24h",
+        "⏱️ 72h",
+        "✕ Cancel",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_yolo_extend_command_duration_alias_activates_current_channel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / ".engram"
+    write_channel_manifest(home, channel_id="C07TEAM", label="#growth")
+    fixed_now = datetime(2026, 4, 24, 14, 45, tzinfo=UTC)
+    monkeypatch.setattr("engram.ingress._utc_now", lambda: fixed_now)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient(user_info={"U07OWNER": {"tz": "America/Los_Angeles"}})
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OWNER",
+        command_text="yolo extend 24",
+    )
+
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result["ok"] is True
+    assert manifest.permission_tier == PermissionTier.YOLO
+    assert manifest.yolo_until == fixed_now + timedelta(hours=24)
+    assert slack.ephemeral_calls[0]["text"] == (
+        "YOLO enabled for 24h (expires 2026-04-25 07:45 PDT). "
+        "Type `/engram` to manage."
+    )
+    assert slack.post_calls[0]["text"] == (
+        "🚀 <@U07OWNER> enabled YOLO mode for 24h. "
+        "HITL gates bypassed until 2026-04-25 07:45 PDT. "
+        "Destructive-command modals still active."
+    )
 
 
 @pytest.mark.asyncio

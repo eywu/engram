@@ -43,7 +43,6 @@ from engram.egress import (
 )
 from engram.hitl import PendingQuestion, _resolve_question
 from engram.manifest import (
-    YOLO_DEFAULT_DURATION_TEXT,
     YOLO_DURATION_CHOICES,
     YOLO_MAX_DURATION,
     ChannelManifest,
@@ -89,6 +88,12 @@ CHANNEL_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]+$")
 _PENDING_UPGRADE_REQUESTS: dict[str, PendingUpgradeRequest] = {}
 _PENDING_UPGRADE_REQUESTS_BY_CHANNEL: dict[str, str] = {}
 _PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
+_YOLO_DURATION_PICKER_TEXT = (
+    "YOLO mode will bypass HITL gates "
+    "(footgun modal still active for destructive commands).\n"
+    "Choose a duration:"
+)
+_YOLO_DURATION_ALIASES = {"6": "6h", "24": "24h", "72": "72h"}
 
 
 @dataclass(frozen=True)
@@ -303,7 +308,7 @@ def register_listeners(
     async def on_channels_yolo_duration(ack, body, client, respond):
         await ack()
         try:
-            result = await handle_channels_dashboard_action(
+            result = await handle_yolo_duration_action(
                 payload=body,
                 router=router,
                 config=config,
@@ -1099,35 +1104,26 @@ async def handle_channels_dashboard_action(
             channel_id, target_tier_raw = parsed
             try:
                 target_tier = PermissionTier(target_tier_raw)
-                _previous, updated, _manifest_path, _duration = set_channel_permission_tier(
-                    channel_id,
-                    target_tier,
-                    duration=(
-                        YOLO_DEFAULT_DURATION_TEXT
-                        if target_tier == PermissionTier.YOLO
-                        else "permanent"
-                    ),
-                    home=router.home,
-                )
             except (ManifestError, ValueError) as exc:
                 notice = str(exc)
             else:
+                if target_tier == PermissionTier.YOLO:
+                    text, blocks = _render_yolo_duration_picker(channel_id=channel_id)
+                    return {
+                        "ok": True,
+                        "page": current_page,
+                        "response": _replace_original_ephemeral(
+                            text=text,
+                            blocks=blocks,
+                        ),
+                    }
+                _previous, updated, _manifest_path, _duration = set_channel_permission_tier(
+                    channel_id,
+                    target_tier,
+                    duration="permanent",
+                    home=router.home,
+                )
                 router.replace_cached_manifest(updated)
-    elif action_id == ACTION_ID_YOLO_DURATION:
-        parsed = _decode_channels_dashboard_pair(str(action.get("value") or ""))
-        if parsed is None:
-            notice = "Could not extend YOLO."
-        else:
-            channel_id, duration = parsed
-            result = await _extend_yolo_grant(
-                router=router,
-                config=config,
-                slack_client=slack_client,
-                channel_id=channel_id,
-                duration=duration,
-            )
-            if not result["ok"]:
-                notice = str(result["message"])
     elif action_id == ACTION_ID_NIGHTLY_TOGGLE:
         parsed = _decode_channels_dashboard_pair(str(action.get("value") or ""))
         if parsed is None:
@@ -1254,17 +1250,62 @@ async def handle_yolo_command(
         return result
 
     if action == "extend":
+        if len(args) == 1:
+            text, blocks = _render_yolo_duration_picker(channel_id=source_channel_id)
+            await _post_ephemeral_reply(
+                slack_client,
+                channel_id=source_channel_id,
+                user_id=user_id,
+                text=text,
+                blocks=blocks,
+            )
+            return {"ok": True, "picker": True}
+
+        if len(args) == 2:
+            try:
+                normalized_duration = _normalize_yolo_duration(args[1])
+            except ValueError:
+                await _post_ephemeral_reply(
+                    slack_client,
+                    channel_id=source_channel_id,
+                    user_id=user_id,
+                    text=(
+                        "Usage: /engram yolo extend [<6h|24h|72h>|"
+                        "<channel> <6h|24h|72h>]"
+                    ),
+                )
+                return {"ok": False, "error": "invalid duration"}
+
+            result = await _activate_yolo_grant(
+                router=router,
+                slack_client=slack_client,
+                channel_id=source_channel_id,
+                duration=normalized_duration,
+                clicker_user_id=user_id,
+            )
+            await _post_ephemeral_reply(
+                slack_client,
+                channel_id=source_channel_id,
+                user_id=user_id,
+                text=(
+                    str(result["ack_text"])
+                    if result["ok"]
+                    else str(result["message"])
+                ),
+            )
+            return result
+
         if len(args) < 3:
             await _post_ephemeral_reply(
                 slack_client,
                 channel_id=source_channel_id,
                 user_id=user_id,
-                text="Usage: /engram yolo extend <channel> <6h|24h|72h>",
+                text="Usage: /engram yolo extend [<6h|24h|72h>|<channel> <6h|24h|72h>]",
             )
             return {"ok": False, "error": "missing extend arguments"}
 
         target_channel_id = _resolve_yolo_target(
-            args[1],
+            " ".join(args[1:-1]),
             source_channel_id=source_channel_id,
             home=router.home or paths.engram_home(),
         )
@@ -1273,7 +1314,7 @@ async def handle_yolo_command(
                 slack_client,
                 channel_id=source_channel_id,
                 user_id=user_id,
-                text=f"Unknown channel: {args[1]}",
+                text=f"Unknown channel: {' '.join(args[1:-1])}",
             )
             return {"ok": False, "error": "unknown channel"}
 
@@ -1282,7 +1323,7 @@ async def handle_yolo_command(
             config=config,
             slack_client=slack_client,
             channel_id=target_channel_id,
-            duration=args[2],
+            duration=args[-1],
         )
         if not result["ok"]:
             await _post_ephemeral_reply(
@@ -1607,6 +1648,68 @@ async def handle_yolo_action(
     return result
 
 
+async def handle_yolo_duration_action(
+    *,
+    payload: dict[str, object],
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+) -> dict[str, object]:
+    actions = payload.get("actions") or []
+    if not actions:
+        return {"ok": False, "error": "no actions"}
+
+    action = actions[0]
+    action_id = str(action.get("action_id") or "")
+    if action_id != ACTION_ID_YOLO_DURATION:
+        return {"ok": False, "error": "unsupported action"}
+
+    clicker_user_id = str(payload.get("user", {}).get("id") or "") or None
+    if not _is_owner_user(config=config, user_id=clicker_user_id):
+        return {
+            "ok": False,
+            "error": "not owner",
+            "response": _replace_original_ephemeral(text="Owner-only."),
+        }
+
+    parsed = _decode_yolo_duration_value(str(action.get("value") or ""))
+    if parsed is None:
+        return {
+            "ok": False,
+            "error": "malformed value",
+            "response": _replace_original_ephemeral(
+                text="Could not update YOLO duration."
+            ),
+        }
+    channel_id, duration = parsed
+    if duration == "cancel":
+        return {
+            "ok": True,
+            "cancelled": True,
+            "response": _replace_original_ephemeral(
+                text="YOLO cancelled. Current tier unchanged."
+            ),
+        }
+
+    result = await _activate_yolo_grant(
+        router=router,
+        slack_client=slack_client,
+        channel_id=channel_id,
+        duration=duration,
+        clicker_user_id=clicker_user_id,
+    )
+    return {
+        **result,
+        "response": _replace_original_ephemeral(
+            text=(
+                str(result["ack_text"])
+                if result["ok"]
+                else str(result["message"])
+            )
+        ),
+    }
+
+
 def parse_meta_eligibility_command(text: str) -> MetaEligibilityCommand | None:
     stripped = text.strip()
     if not stripped:
@@ -1678,17 +1781,27 @@ async def _maybe_respond_with_dashboard(*, result: dict[str, object], respond) -
     await respond(**response)
 
 
+def _replace_original_ephemeral(
+    *,
+    text: str,
+    blocks: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "response_type": "ephemeral",
+        "replace_original": True,
+        "text": text,
+    }
+    if blocks is not None:
+        payload["blocks"] = blocks
+    return payload
+
+
 def _channels_dashboard_replace_original(
     *,
     text: str,
     blocks: list[dict[str, object]],
 ) -> dict[str, object]:
-    return {
-        "response_type": "ephemeral",
-        "replace_original": True,
-        "text": text,
-        "blocks": blocks,
-    }
+    return _replace_original_ephemeral(text=text, blocks=blocks)
 
 
 async def _set_dashboard_meta_eligible(
@@ -2022,8 +2135,8 @@ def _channels_dashboard_row_actions(
         buttons.append(
             _dashboard_button(
                 text="Extend YOLO",
-                action_id=ACTION_ID_YOLO_DURATION,
-                value=f"{channel_id}|{YOLO_DEFAULT_DURATION_TEXT}",
+                action_id=ACTION_ID_TIER_PICK,
+                value=f"{channel_id}|{PermissionTier.YOLO.value}",
             )
         )
     else:
@@ -2091,6 +2204,20 @@ def _decode_channels_dashboard_pair(raw: str) -> tuple[str, str] | None:
     if not sep or not CHANNEL_ID_PATTERN.match(channel_id) or not value:
         return None
     return channel_id, value
+
+
+def _decode_yolo_duration_value(raw: str) -> tuple[str, str] | None:
+    parsed = _decode_channels_dashboard_pair(raw)
+    if parsed is None:
+        return None
+    channel_id, duration = parsed
+    normalized = str(duration or "").strip().lower()
+    if normalized == "cancel":
+        return channel_id, normalized
+    try:
+        return channel_id, _normalize_yolo_duration(normalized)
+    except ValueError:
+        return None
 
 
 def _decode_channels_page_value(raw: str) -> int | None:
@@ -2174,6 +2301,10 @@ def _is_owner_user(*, config: EngramConfig, user_id: str | None) -> bool:
     return bool(config.owner_user_id and user_id == config.owner_user_id)
 
 
+def _utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC)
+
+
 def _list_active_yolo_grants(home, *, now: datetime.datetime | None = None) -> list[ActiveYoloGrantRow]:
     current_time = now or datetime.datetime.now(datetime.UTC)
     grants: list[ActiveYoloGrantRow] = []
@@ -2241,7 +2372,8 @@ def _channel_id_from_yolo_action(action_id: str, raw_value: str) -> str | None:
 
 
 def _normalize_yolo_duration(duration: str) -> str:
-    normalized = validate_upgrade_duration(duration)
+    raw = str(duration or "").strip().lower()
+    normalized = validate_upgrade_duration(_YOLO_DURATION_ALIASES.get(raw, raw))
     if normalized not in YOLO_DURATION_CHOICES:
         raise ValueError("Duration must be one of 6h, 24h, or 72h.")
     return normalized
@@ -2331,7 +2463,7 @@ async def _extend_yolo_grant(
     except ValueError as exc:
         return {"ok": False, "error": "invalid duration", "message": str(exc)}
 
-    current_time = datetime.datetime.now(datetime.UTC)
+    current_time = _utc_now()
     manifest = _load_active_yolo_manifest(
         channel_id=channel_id,
         home=home,
@@ -2383,6 +2515,148 @@ async def _extend_yolo_grant(
         "label": label,
         "duration": normalized_duration,
         "remaining_text": _format_duration(new_remaining),
+    }
+
+
+def _render_yolo_duration_picker(
+    *,
+    channel_id: str,
+) -> tuple[str, list[dict[str, object]]]:
+    buttons = [
+        _dashboard_button(
+            text="⏱️ 6h",
+            action_id=ACTION_ID_YOLO_DURATION,
+            value=f"{channel_id}|6",
+        ),
+        _dashboard_button(
+            text="⏱️ 24h",
+            action_id=ACTION_ID_YOLO_DURATION,
+            value=f"{channel_id}|24",
+        ),
+        _dashboard_button(
+            text="⏱️ 72h",
+            action_id=ACTION_ID_YOLO_DURATION,
+            value=f"{channel_id}|72",
+        ),
+        _dashboard_button(
+            text="✕ Cancel",
+            action_id=ACTION_ID_YOLO_DURATION,
+            value=f"{channel_id}|cancel",
+        ),
+    ]
+    return _YOLO_DURATION_PICKER_TEXT, [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": _YOLO_DURATION_PICKER_TEXT},
+        },
+        {
+            "type": "actions",
+            "block_id": f"engram_yolo_duration:{channel_id}",
+            "elements": buttons,
+        },
+    ]
+
+
+async def _slack_user_timezone(
+    slack_client,
+    *,
+    user_id: str | None,
+) -> datetime.tzinfo | None:
+    if not user_id:
+        return None
+    users_info = getattr(slack_client, "users_info", None)
+    if users_info is None:
+        return None
+    try:
+        response = await users_info(user=user_id)
+    except Exception:
+        log.info(
+            "ingress.yolo_timezone_lookup_failed user=%s",
+            user_id,
+            exc_info=True,
+        )
+        return None
+    user = response.get("user") if isinstance(response, dict) else None
+    tz_name = user.get("tz") if isinstance(user, dict) else None
+    if not tz_name:
+        return None
+    with contextlib.suppress(Exception):
+        return ZoneInfo(str(tz_name))
+    return None
+
+
+async def _format_yolo_expiry_for_user(
+    slack_client,
+    *,
+    user_id: str | None,
+    expires_at: datetime.datetime,
+) -> str:
+    timezone = await _slack_user_timezone(slack_client, user_id=user_id)
+    localized = expires_at.astimezone(timezone or datetime.UTC)
+    return localized.strftime("%Y-%m-%d %H:%M %Z")
+
+
+async def _activate_yolo_grant(
+    *,
+    router: Router,
+    slack_client,
+    channel_id: str,
+    duration: str,
+    clicker_user_id: str | None,
+) -> dict[str, object]:
+    home = router.home or paths.engram_home()
+    try:
+        normalized_duration = _normalize_yolo_duration(duration)
+        current_time = _utc_now()
+        existing = load_manifest(paths.channel_manifest_path(channel_id, home))
+        was_active_yolo = (
+            existing.permission_tier == PermissionTier.YOLO
+            and existing.yolo_until is not None
+            and existing.yolo_until > current_time
+        )
+        _previous, updated, _manifest_path, _normalized = set_channel_permission_tier(
+            channel_id,
+            PermissionTier.YOLO,
+            duration=normalized_duration,
+            home=home,
+            now=current_time,
+        )
+    except (ManifestError, ValueError) as exc:
+        return {"ok": False, "error": "activate failed", "message": str(exc)}
+
+    router.replace_cached_manifest(updated)
+    expires_at = updated.yolo_until
+    if expires_at is None:
+        return {
+            "ok": False,
+            "error": "activate failed",
+            "message": "Could not determine YOLO expiry.",
+        }
+
+    expiry_text = await _format_yolo_expiry_for_user(
+        slack_client,
+        user_id=clicker_user_id,
+        expires_at=expires_at,
+    )
+    verb = "extended" if was_active_yolo else "enabled"
+    user_ref = f"<@{clicker_user_id}>" if clicker_user_id else "Owner"
+    await slack_client.chat_postMessage(
+        channel=channel_id,
+        text=(
+            f"🚀 {user_ref} {verb} YOLO mode for {normalized_duration}. "
+            f"HITL gates bypassed until {expiry_text}. "
+            "Destructive-command modals still active."
+        ),
+    )
+    return {
+        "ok": True,
+        "channel_id": channel_id,
+        "duration": normalized_duration,
+        "expires_at": expires_at,
+        "ack_text": (
+            f"YOLO {verb} for {normalized_duration} "
+            f"(expires {expiry_text}). Type `/engram` to manage."
+        ),
     }
 
 

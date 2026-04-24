@@ -14,6 +14,7 @@ from engram.ingress import (
     ACTION_ID_YOLO_DURATION,
     handle_channels_dashboard_action,
     handle_engram_command,
+    handle_yolo_duration_action,
 )
 from engram.manifest import (
     ChannelManifest,
@@ -28,8 +29,13 @@ from engram.router import Router
 
 
 class FakeSlackClient:
-    def __init__(self, conversation_info: dict[str, dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        conversation_info: dict[str, dict[str, Any]] | None = None,
+        user_info: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
         self.conversation_info = conversation_info or {}
+        self.user_info = user_info or {}
         self.post_calls: list[dict[str, Any]] = []
         self.ephemeral_calls: list[dict[str, Any]] = []
         self.update_calls: list[dict[str, Any]] = []
@@ -53,6 +59,9 @@ class FakeSlackClient:
     async def conversations_info(self, *, channel: str):
         self.info_calls.append(channel)
         return {"ok": True, "channel": self.conversation_info.get(channel, {})}
+
+    async def users_info(self, *, user: str):
+        return {"ok": True, "user": self.user_info.get(user, {})}
 
 
 def make_config() -> EngramConfig:
@@ -431,7 +440,7 @@ async def test_channels_dashboard_paginates_25_channels_and_page_action_rerender
 
 
 @pytest.mark.asyncio
-async def test_channels_dashboard_tier_pick_action_updates_manifest_and_rerenders(
+async def test_channels_dashboard_tier_pick_action_shows_yolo_duration_picker(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / ".engram"
@@ -468,15 +477,16 @@ async def test_channels_dashboard_tier_pick_action_updates_manifest_and_rerender
     manifest = load_manifest(channel_manifest_path("C07TEAM", home))
     assert result["ok"] is True
     assert result["response"]["replace_original"] is True
-    assert manifest.permission_tier == PermissionTier.YOLO
-    assert manifest.yolo_until is not None
-    team_row = next(
-        text
-        for text in dashboard_row_texts(result["response"]["blocks"])
-        if text.startswith("💬 growth-team")
-    )
-    assert "[🚀 yolo" in team_row
-    assert "expires " in team_row
+    assert manifest.permission_tier == PermissionTier.OWNER_SCOPED
+    assert manifest.yolo_until is None
+    assert result["response"]["text"].startswith("YOLO mode will bypass HITL gates")
+    assert [element["text"]["text"] for element in result["response"]["blocks"][1]["elements"]] == [
+        "⏱️ 6h",
+        "⏱️ 24h",
+        "⏱️ 72h",
+        "✕ Cancel",
+    ]
+    assert slack.post_calls == []
 
 
 @pytest.mark.asyncio
@@ -534,7 +544,7 @@ async def test_channels_dashboard_nightly_toggle_action_rerenders(
 
 
 @pytest.mark.asyncio
-async def test_channels_dashboard_yolo_extend_action_rerenders(
+async def test_channels_dashboard_yolo_duration_action_activates_and_notifies(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / ".engram"
@@ -548,32 +558,45 @@ async def test_channels_dashboard_yolo_extend_action_rerenders(
         home,
         "C07TEAM",
         label="#growth-team",
-        tier=PermissionTier.YOLO,
-        yolo_hours=24,
-        pre_yolo_tier=PermissionTier.OWNER_SCOPED,
+        tier=PermissionTier.OWNER_SCOPED,
     )
-    before = load_manifest(channel_manifest_path("C07TEAM", home))
     router = Router(home=home, owner_dm_channel_id="D07OWNER")
     slack = FakeSlackClient(
         conversation_info={
             "D07OWNER": {"is_im": True},
             "C07TEAM": {"name": "growth-team", "is_private": False},
-        }
+        },
+        user_info={"U07OWNER": {"tz": "America/Los_Angeles"}},
     )
 
-    result = await handle_channels_dashboard_action(
+    result = await handle_yolo_duration_action(
         payload=dashboard_action_payload(
             action_id=ACTION_ID_YOLO_DURATION,
-            value="C07TEAM|24h",
+            value="C07TEAM|24",
         ),
         router=router,
         config=make_config(),
         slack_client=slack,
     )
 
-    after = load_manifest(channel_manifest_path("C07TEAM", home))
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
     assert result["ok"] is True
     assert result["response"]["replace_original"] is True
-    assert after.yolo_until is not None
-    assert before.yolo_until is not None
-    assert after.yolo_until > before.yolo_until
+    assert manifest.permission_tier == PermissionTier.YOLO
+    assert manifest.pre_yolo_tier == PermissionTier.OWNER_SCOPED
+    assert manifest.yolo_until is not None
+    assert manifest.yolo_granted_at is not None
+    assert manifest.yolo_until - manifest.yolo_granted_at == timedelta(hours=24)
+    assert "YOLO enabled for 24h (expires " in result["response"]["text"]
+    assert result["response"]["text"].endswith("). Type `/engram` to manage.")
+    assert "PDT" in result["response"]["text"]
+    assert slack.post_calls == [
+        {
+            "channel": "C07TEAM",
+            "text": slack.post_calls[0]["text"],
+            "_ts": slack.post_calls[0]["_ts"],
+        }
+    ]
+    assert slack.post_calls[0]["text"].startswith(
+        "🚀 <@U07OWNER> enabled YOLO mode for 24h."
+    )
