@@ -99,7 +99,7 @@ class FakeSlackClient:
         self.update_calls.append(kwargs)
         return {"ok": True}
 
-    async def chat_postEphemeral(self, **kwargs):
+    async def chat_postEphemeral(self, **kwargs):  # noqa: N802 (Slack SDK method name)
         self.ephemeral_calls.append(kwargs)
         return {"ok": True}
 
@@ -600,7 +600,7 @@ async def test_footgun_confirm_open_rejects_non_owner():
 
 
 @pytest.mark.asyncio
-async def test_footgun_confirm_submit_requires_exact_CONFIRM():
+async def test_footgun_confirm_submit_requires_exact_CONFIRM():  # noqa: N802 (testing literal string "CONFIRM")
     router = Router()
     slack = FakeSlackClient()
     tool_input = {"cmd": "rm -rf /tmp/demo", "cwd": "/tmp/demo"}

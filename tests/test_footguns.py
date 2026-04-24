@@ -4,7 +4,6 @@ import pytest
 
 from engram.footguns import FOOTGUN_PATTERNS, match_footgun
 
-
 POSITIVE_CASES = [
     ("Bash", {"command": "rm -rf build"}, "recursive rm command"),
     ("Bash", {"cmd": "sudo whoami"}, "sudo command"),
