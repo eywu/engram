@@ -1,8 +1,8 @@
 """Egress tests — chunking + post shape, no real Slack calls."""
 from __future__ import annotations
 
-from datetime import UTC, datetime
 import logging
+from datetime import UTC, datetime
 
 import pytest
 from slack_sdk.errors import SlackApiError
@@ -197,15 +197,17 @@ async def test_post_reply_logs_chunk_failure_and_reraises(
         is_error=False,
     )
 
-    with caplog.at_level(logging.ERROR, logger="engram.egress"):
-        with pytest.raises(SlackApiError):
-            await post_reply(
-                slack,
-                "C07TEST123",
-                turn,
-                thread_ts="1713800000.000200",
-                session_label="ch:C07TEST123",
-            )
+    with (
+        caplog.at_level(logging.ERROR, logger="engram.egress"),
+        pytest.raises(SlackApiError),
+    ):
+        await post_reply(
+            slack,
+            "C07TEST123",
+            turn,
+            thread_ts="1713800000.000200",
+            session_label="ch:C07TEST123",
+        )
 
     record = next(
         record
