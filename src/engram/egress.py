@@ -55,12 +55,22 @@ async def post_reply(
         body = chunk
         if i == len(chunks) - 1 and footer:
             body = f"{chunk}{footer}"
-        resp = await slack_client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            blocks=[{"type": "markdown", "text": body}],
-            text=_notification_fallback(body),
-        )
+        try:
+            resp = await slack_client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                blocks=[{"type": "markdown", "text": body}],
+                text=_notification_fallback(body),
+            )
+        except Exception as e:
+            log.exception(
+                "egress.chunk_failed session=%s chunk=%d/%d error_type=%s",
+                session_label,
+                i + 1,
+                len(chunks),
+                type(e).__name__,
+            )
+            raise
         if i == 0:
             posted_ts = resp.get("ts") if isinstance(resp, dict) else None
         n += 1

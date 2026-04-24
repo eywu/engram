@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import logging
 
 import pytest
+from slack_sdk.errors import SlackApiError
 
 from engram.agent import AgentTurn
 from engram.egress import (
@@ -174,6 +176,47 @@ async def test_reply_preserves_thread_ts():
     await post_reply(slack, "C07TEST123", turn, thread_ts="1713800000.000200")
 
     assert slack.post_calls[0]["thread_ts"] == "1713800000.000200"
+
+
+@pytest.mark.asyncio
+async def test_post_reply_logs_chunk_failure_and_reraises(
+    caplog: pytest.LogCaptureFixture,
+):
+    slack = FakeSlackClient()
+    error = SlackApiError("chunk rejected", {"ok": False, "error": "invalid_blocks_format"})
+
+    async def raise_slack_error(**kwargs):
+        raise error
+
+    slack.chat_postMessage = raise_slack_error
+    turn = AgentTurn(
+        text="a" * (SLACK_MAX_TEXT_LEN + 1),
+        cost_usd=None,
+        duration_ms=None,
+        num_turns=1,
+        is_error=False,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="engram.egress"):
+        with pytest.raises(SlackApiError):
+            await post_reply(
+                slack,
+                "C07TEST123",
+                turn,
+                thread_ts="1713800000.000200",
+                session_label="ch:C07TEST123",
+            )
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("egress.chunk_failed")
+    )
+    assert (
+        record.getMessage()
+        == "egress.chunk_failed session=ch:C07TEST123 chunk=1/2 error_type=SlackApiError"
+    )
+    assert record.exc_info is not None
 
 
 def test_notification_fallback_strips_markdown():
