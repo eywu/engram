@@ -480,13 +480,52 @@ def _write_manifest_atomic(manifest: ChannelManifest, path: Path) -> None:
         raise
 
 
+# Tools that must NEVER receive sticky channel-scoped allow rules, even if
+# the caller (UI, webhook, bulk-import) claims they are eligible. This is the
+# authoritative defense-in-depth layer: UI filters what's shown, but this set
+# filters what's actually persisted. See GRO-478 review for rationale.
+_STICKY_INELIGIBLE_TOOLS = frozenset({
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Task",
+    "SlashCommand",
+})
+
+
+def _assert_sticky_eligible(tool_name: str) -> None:
+    """Raise ValueError if tool_name must never receive a sticky allow rule."""
+    base = tool_name.split("(", 1)[0].strip()
+    if base in _STICKY_INELIGIBLE_TOOLS:
+        raise ValueError(
+            f"refusing to persist sticky allow for ineligible tool {tool_name!r}: "
+            f"{base} is in _STICKY_INELIGIBLE_TOOLS (mutating/high-risk)"
+        )
+    if base.startswith("mcp__"):
+        raise ValueError(
+            f"refusing to persist sticky allow for mcp tool {tool_name!r}: "
+            f"mcp tools require per-server opt-in, not blanket sticky"
+        )
+
+
 def add_allow_rule(
     channel_id: str,
     tool_name: str,
     *,
     home: Path | None = None,
 ) -> tuple[ChannelManifest, ChannelManifest, Path]:
-    """Persist a deduped ``permissions.allow`` entry for a channel manifest."""
+    """Persist a deduped ``permissions.allow`` entry for a channel manifest.
+
+    Enforces sticky-eligibility at the persistence layer as defense-in-depth:
+    if a caller somehow bypasses the UI's eligibility filter (tampered payload,
+    stale button, new code path, etc.), mutating/high-risk tools are rejected
+    here before they reach disk. See GRO-478 review.
+    """
+    _assert_sticky_eligible(tool_name)
     manifest_path = paths.channel_manifest_path(channel_id, home)
     manifest = load_manifest(manifest_path)
     normalized_rule = _validate_rule(tool_name)
