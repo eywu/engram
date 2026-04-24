@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from engram.agent import AgentTurn
-from engram.footguns import match_footgun
+from engram.footguns import FootgunMatch, match_footgun
 from engram.hitl import PendingQuestion
 from engram.manifest import YOLO_DEFAULT_DURATION_TEXT, PermissionTier
 
@@ -136,7 +136,7 @@ async def post_question(q: PendingQuestion, slack_client) -> tuple[str, str]:
     Returns (channel_ts, thread_ts), which are stored on the question for later
     message updates.
     """
-    if q.footgun_match is not None:
+    if _ensure_footgun_match(q) is not None:
         return await post_footgun_confirmation_card(q, slack_client)
 
     header = f"🤔 Can I proceed with `{q.tool_name}`?"
@@ -649,7 +649,7 @@ async def update_question_resolved(
 
 async def update_question_timeout(q: PendingQuestion, slack_client) -> None:
     """Edit the original question message to show timeout."""
-    if q.footgun_match is not None:
+    if _ensure_footgun_match(q) is not None:
         blocks = [
             {
                 "type": "section",
@@ -777,6 +777,13 @@ def _is_sticky_eligible(
     if tool_input is not None and match_footgun(tool_name, tool_input) is not None:
         return False
     return tool_name not in _STICKY_INELIGIBLE_TOOLS
+
+
+def _ensure_footgun_match(q: PendingQuestion) -> FootgunMatch | None:
+    """Populate missing footgun metadata from the pending tool invocation."""
+    if q.footgun_match is None:
+        q.footgun_match = match_footgun(q.tool_name, q.tool_input)
+    return q.footgun_match
 
 
 def _escape_mrkdwn(text: str) -> str:

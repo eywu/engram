@@ -460,6 +460,27 @@ async def test_post_question_renders_footgun_confirmation_card():
 
 
 @pytest.mark.asyncio
+async def test_post_question_derives_footgun_confirmation_when_metadata_missing():
+    slack = FakeSlackClient()
+    command = "rm -rf /tmp/demo"
+    q = make_question(
+        suggestions=[],
+        tool_name="Bash",
+        channel_manifest=owner_dm_manifest(),
+        tool_input={"cmd": command},
+        footgun_match=None,
+    )
+
+    await post_question(q, slack)
+
+    call = slack.post_calls[0]
+    assert call["text"] == "⚠️ Destructive action confirmation required"
+    assert q.footgun_match is not None
+    assert q.footgun_match.command == command
+    assert "Always allow" not in json.dumps(call["blocks"])
+
+
+@pytest.mark.asyncio
 async def test_update_question_resolved_strips_buttons():
     slack = FakeSlackClient()
     q = make_question()
@@ -500,6 +521,22 @@ async def test_update_footgun_question_timeout_denies_command():
     call = slack.update_calls[0]
     assert call["text"] == "Timed out"
     assert "command denied" in call["blocks"][0]["text"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_update_question_timeout_derives_footgun_metadata():
+    slack = FakeSlackClient()
+    q = make_question(
+        tool_input={"cmd": "rm -rf /tmp/demo"},
+        footgun_match=None,
+    )
+
+    await update_question_timeout(q, slack)
+
+    call = slack.update_calls[0]
+    assert call["text"] == "Timed out"
+    assert "command denied" in call["blocks"][0]["text"]["text"]
+    assert q.footgun_match is not None
 
 
 def test_suggestion_label_extraction():
