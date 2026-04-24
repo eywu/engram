@@ -54,3 +54,8 @@ engram channels tier <channel-id>
 ```
 
 `engram channels tier` prints the effective tier, YOLO status, and expiry timestamp if one is active.
+
+## See also
+
+- [Human-in-the-loop](hitl.md)
+- [Footgun confirmations](footguns.md)

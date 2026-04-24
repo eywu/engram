@@ -2,7 +2,7 @@
 
 > Personal AI agent for Slack — per-channel isolation, persistent memory, skill integration.
 
-**Status:** Beta — M1 through M5 shipped. Installable, self-hosted, mac-only.
+**Status:** Beta — M1 through M5 shipped, plus post-M5 permission tiers. Installable, self-hosted, mac-only.
 
 Engram is a lightweight AI agent that lives in Slack. It gives each channel its
 own Claude instance, its own context, its own memory, and its own capability
@@ -44,6 +44,14 @@ engram run
 
 Then DM the Engram bot in your Slack workspace. First response typically
 arrives within ~30s.
+
+## Safety
+
+Engram isolates each Slack room at three layers: separate workspace files, separate memory state, and a separate capability boundary.
+Every channel also carries its own manifest, so approval status, permission tier, deny rules, and nightly eligibility stay local to that room.
+Sensitive tools still go through human-in-the-loop: Engram posts a Block Kit approval card, waits for the answer, and only then returns allow or deny to Claude.
+Destructive shell footguns add a second barrier: Engram posts a destructive-action card, opens a type-to-confirm modal, and requires `CONFIRM` even in YOLO mode.
+See [permission tiers](docs/permission-tiers.md), [HITL](docs/hitl.md), and [footgun confirmations](docs/footguns.md).
 
 ## Design Principles
 
@@ -94,6 +102,7 @@ slack-bolt/python ──▶ Engram bridge ──▶ Claude Agent SDK ──▶ C
 | M3 — Memory + budget | ✅ Shipped | SQLite memory.db + FTS5 + Gemini embeddings, budget warnings |
 | M4 — Human-in-the-loop | ✅ Shipped | Block Kit permission cards, `can_use_tool` gate |
 | M5 — Self-improvement | ✅ Shipped | Nightly harvest → synthesize → validate → write back |
+| Permission tiers (post-M5, Apr 2026) | ✅ Shipped | `/engram upgrade` approval flow, time-boxed YOLO mode, destructive-command `CONFIRM` modal, sticky HITL approvals |
 
 Post-M5 cleanup (Apr 2026): 336 tests, ruff clean, live under launchd.
 
@@ -133,19 +142,35 @@ aggregated in the SQLite ledger at `~/.engram/costs.db`.
 
 ## Commands
 
-```bash
-engram setup                    # first-time configuration wizard
-engram run                      # start the bridge (foreground)
-engram status                   # show bridge health, channels, memory counts
-engram cost                     # query the cost ledger
-engram logs                     # tail the most recent structured log
-engram health                   # health check for launchd watchdogs
-engram channels list            # list provisioned channels
-engram channels show <id>       # inspect a channel's manifest + CLAUDE.md
-engram channels approve <id>    # approve a pending channel
-engram scope                    # audit per-channel scope and memory eligibility
-engram nightly                  # run nightly synthesis manually
-```
+### CLI commands
+
+| Command | What it does |
+| --- | --- |
+| `engram setup` | First-time configuration wizard |
+| `engram run` | Start the bridge in the foreground |
+| `engram status` | Show bridge health, channels, and memory counts |
+| `engram cost` | Query the cost ledger |
+| `engram logs` | Tail recent structured logs |
+| `engram health` | Run the launchd watchdog health check |
+| `engram channels list` | List provisioned channels |
+| `engram channels show <id>` | Inspect a channel manifest and `CLAUDE.md` |
+| `engram channels approve <id>` | Approve a pending channel |
+| `engram channels upgrade <channel-id> <tier> [--until 24h\|30d\|permanent]` | Change a channel's permission tier from the CLI |
+| `engram channels tier <channel-id>` | Show the effective tier, YOLO status, and expiry |
+| `engram yolo list` | List channels with active YOLO grants |
+| `engram yolo off <channel-id>` | Revoke an active YOLO grant immediately |
+| `engram yolo extend <channel-id> <6h\|24h\|72h>` | Extend an active YOLO grant |
+| `engram scope` | Audit per-channel scope and memory eligibility |
+| `engram nightly` | Run nightly synthesis manually |
+
+### Slack slash commands
+
+| Slash command | What it does |
+| --- | --- |
+| `/engram upgrade <tier> [reason...]` | Request a permission-tier upgrade. Team channels require owner-DM approval. Tiers: `task-assistant`, `owner-scoped`, `yolo`. |
+| `/engram yolo <list\|off\|extend> ...` | Manage time-boxed YOLO sessions. Use `list`, `off <channel-name-or-id>`, or `extend <channel> <6h\|24h\|72h>`. |
+| `/exclude-from-nightly [#channel]` | Exclude the current channel, or the named channel, from the nightly cross-channel meta-summary. |
+| `/include-in-nightly [#channel]` | Re-include the current channel, or the named channel, in the nightly cross-channel meta-summary. |
 
 See `engram <command> --help` for options.
 

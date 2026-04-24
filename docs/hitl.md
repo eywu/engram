@@ -461,6 +461,11 @@ If you need to prove whether a tool actually ran, use the logs first. The key ch
 | Too many cards | Lower `hitl.max_per_day` or tighten the channel manifest scope. |
 | Need to approve with conditions | Reply in the card thread with the condition instead of clicking a button. |
 
+## See also
+
+- [Permission tiers](permission-tiers.md)
+- [Footgun confirmations](footguns.md)
+
 ## References
 
 - [`src/engram/hitl.py`](../src/engram/hitl.py) is the canonical HITL state machine and log event source.
