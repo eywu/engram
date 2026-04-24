@@ -16,6 +16,8 @@ import re
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
+from zoneinfo import ZoneInfo
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from slack_bolt.async_app import AsyncApp
@@ -41,6 +43,7 @@ from engram.egress import (
 )
 from engram.hitl import PendingQuestion, _resolve_question
 from engram.manifest import (
+    YOLO_DEFAULT_DURATION_TEXT,
     YOLO_DURATION_CHOICES,
     YOLO_MAX_DURATION,
     ChannelManifest,
@@ -73,10 +76,19 @@ UPGRADE_ACTION_ID_PATTERN = re.compile(
 YOLO_EXTEND_ACTION_ID_PATTERN = re.compile(r"^yolo_extend_[A-Z0-9]+$")
 YOLO_REVOKE_ACTION_ID_PATTERN = re.compile(r"^yolo_revoke_[A-Z0-9]+$")
 FOOTGUN_CONFIRM_OPEN_ACTION_ID = "footgun_confirm_open"
+ACTION_ID_TIER_PICK = "engram_tier_pick"
+ACTION_ID_YOLO_DURATION = "engram_yolo_duration"
+ACTION_ID_NIGHTLY_TOGGLE = "engram_nightly_toggle"
+ACTION_ID_CHANNELS_PAGE = "engram_channels_page"
+CHANNELS_DASHBOARD_PAGE_SIZE = 20
+CHANNELS_DASHBOARD_BLOCK_ID_PATTERN = re.compile(
+    r"^engram_channels:(?P<page>\d+):(?P<kind>nav|channel:[A-Z0-9]+)$"
+)
 CHANNEL_REF_PATTERN = re.compile(r"<#(?P<id>[A-Z0-9]+)(?:\|[^>]+)?>")
 CHANNEL_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]+$")
 _PENDING_UPGRADE_REQUESTS: dict[str, PendingUpgradeRequest] = {}
 _PENDING_UPGRADE_REQUESTS_BY_CHANNEL: dict[str, str] = {}
+_PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 
 
 @dataclass(frozen=True)
@@ -97,6 +109,17 @@ class PendingUpgradeRequest:
     from_tier: PermissionTier
     to_tier: PermissionTier
     reason: str | None
+
+
+@dataclass(frozen=True)
+class ChannelDashboardRow:
+    channel_id: str
+    label: str
+    sort_label: str
+    manifest: ChannelManifest
+    is_owner_dm: bool
+    is_private: bool
+    is_archived: bool
 
 
 def register_listeners(
@@ -256,6 +279,82 @@ def register_listeners(
         task = asyncio.create_task(_run())
         _BACKGROUND_TASKS.add(task)
         task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    @app.action(ACTION_ID_TIER_PICK)
+    async def on_channels_tier_pick(ack, body, client, respond):
+        await ack()
+        try:
+            result = await handle_channels_dashboard_action(
+                payload=body,
+                router=router,
+                config=config,
+                slack_client=client,
+            )
+            await _maybe_respond_with_dashboard(result=result, respond=respond)
+            if not result.get("ok"):
+                log.warning(
+                    "ingress.channels_tier_pick_failed error=%s",
+                    result.get("error", "unknown"),
+                )
+        except Exception:
+            log.exception("ingress.channels_tier_pick_handler_failed")
+
+    @app.action(ACTION_ID_YOLO_DURATION)
+    async def on_channels_yolo_duration(ack, body, client, respond):
+        await ack()
+        try:
+            result = await handle_channels_dashboard_action(
+                payload=body,
+                router=router,
+                config=config,
+                slack_client=client,
+            )
+            await _maybe_respond_with_dashboard(result=result, respond=respond)
+            if not result.get("ok"):
+                log.warning(
+                    "ingress.channels_yolo_duration_failed error=%s",
+                    result.get("error", "unknown"),
+                )
+        except Exception:
+            log.exception("ingress.channels_yolo_duration_handler_failed")
+
+    @app.action(ACTION_ID_NIGHTLY_TOGGLE)
+    async def on_channels_nightly_toggle(ack, body, client, respond):
+        await ack()
+        try:
+            result = await handle_channels_dashboard_action(
+                payload=body,
+                router=router,
+                config=config,
+                slack_client=client,
+            )
+            await _maybe_respond_with_dashboard(result=result, respond=respond)
+            if not result.get("ok"):
+                log.warning(
+                    "ingress.channels_nightly_toggle_failed error=%s",
+                    result.get("error", "unknown"),
+                )
+        except Exception:
+            log.exception("ingress.channels_nightly_toggle_handler_failed")
+
+    @app.action(ACTION_ID_CHANNELS_PAGE)
+    async def on_channels_page(ack, body, client, respond):
+        await ack()
+        try:
+            result = await handle_channels_dashboard_action(
+                payload=body,
+                router=router,
+                config=config,
+                slack_client=client,
+            )
+            await _maybe_respond_with_dashboard(result=result, respond=respond)
+            if not result.get("ok"):
+                log.warning(
+                    "ingress.channels_page_failed error=%s",
+                    result.get("error", "unknown"),
+                )
+        except Exception:
+            log.exception("ingress.channels_page_handler_failed")
 
     @app.command("/engram")
     async def on_engram(ack, body, client):
@@ -816,11 +915,23 @@ async def handle_engram_command(
             slack_client,
             channel_id=source_channel_id,
             user_id=user_id,
-            text="Usage: /engram upgrade <tier> [reason...] | /engram yolo <list|off|extend> ...",
+            text=(
+                "Usage: /engram channels | /engram upgrade <tier> [reason...] "
+                "| /engram yolo <list|off|extend> ..."
+            ),
         )
         return {"ok": False, "error": "missing subcommand"}
 
     subcommand = parts[0].lower()
+    if subcommand == "channels":
+        return await handle_channels_command(
+            router=router,
+            config=config,
+            slack_client=slack_client,
+            source_channel_id=source_channel_id,
+            user_id=user_id,
+        )
+
     if subcommand == "upgrade":
         if len(parts) < 2:
             await _post_ephemeral_reply(
@@ -877,6 +988,181 @@ async def handle_engram_command(
         text=f"Unknown /engram subcommand: {subcommand}",
     )
     return {"ok": False, "error": "unknown subcommand"}
+
+
+async def handle_channels_command(
+    *,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+    source_channel_id: str,
+    user_id: str | None,
+) -> dict[str, object]:
+    owner_dm_channel_id = config.owner_dm_channel_id or router.owner_dm_channel_id
+    if not owner_dm_channel_id or not config.owner_user_id:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=(
+                "Channel dashboard is not configured yet. "
+                "Ask the operator to set owner_dm_channel_id and owner_user_id."
+            ),
+        )
+        return {"ok": False, "error": "owner approval config missing"}
+
+    if source_channel_id != owner_dm_channel_id:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=(
+                "Channel dashboard is DM-only. "
+                "Run `/engram channels` from your DM with Engram."
+            ),
+        )
+        return {"ok": False, "error": "dm_only"}
+
+    if not _is_owner_user(config=config, user_id=user_id):
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text="Owner-only.",
+        )
+        return {"ok": False, "error": "not owner"}
+
+    rows = await _collect_channels_dashboard_rows(
+        router=router,
+        config=config,
+        slack_client=slack_client,
+    )
+    text, blocks, page = _render_channels_dashboard(rows, page=0)
+    await _post_ephemeral_reply(
+        slack_client,
+        channel_id=source_channel_id,
+        user_id=user_id,
+        text=text,
+        blocks=blocks,
+    )
+    return {"ok": True, "count": len(rows), "page": page}
+
+
+async def handle_channels_dashboard_action(
+    *,
+    payload: dict[str, object],
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+) -> dict[str, object]:
+    actions = payload.get("actions") or []
+    if not actions:
+        return {"ok": False, "error": "no actions"}
+
+    owner_dm_channel_id = config.owner_dm_channel_id or router.owner_dm_channel_id
+    source_channel_id = str(payload.get("channel", {}).get("id") or "")
+    clicker_user_id = str(payload.get("user", {}).get("id") or "") or None
+    if not owner_dm_channel_id or source_channel_id != owner_dm_channel_id:
+        text = (
+            "Channel dashboard is DM-only. "
+            "Run `/engram channels` from your DM with Engram."
+        )
+        return {
+            "ok": False,
+            "error": "wrong surface",
+            "response": {"response_type": "ephemeral", "text": text},
+        }
+    if not _is_owner_user(config=config, user_id=clicker_user_id):
+        return {
+            "ok": False,
+            "error": "not owner",
+            "response": {"response_type": "ephemeral", "text": "Owner-only."},
+        }
+
+    action = actions[0]
+    action_id = str(action.get("action_id") or "")
+    current_page = _channels_dashboard_page_from_action(action)
+    target_page = current_page
+    notice: str | None = None
+
+    if action_id == ACTION_ID_CHANNELS_PAGE:
+        parsed_page = _decode_channels_page_value(str(action.get("value") or ""))
+        if parsed_page is None:
+            notice = "Could not change dashboard page."
+        else:
+            target_page = parsed_page
+    elif action_id == ACTION_ID_TIER_PICK:
+        parsed = _decode_channels_dashboard_pair(str(action.get("value") or ""))
+        if parsed is None:
+            notice = "Could not change channel tier."
+        else:
+            channel_id, target_tier_raw = parsed
+            try:
+                target_tier = PermissionTier(target_tier_raw)
+                _previous, updated, _manifest_path, _duration = set_channel_permission_tier(
+                    channel_id,
+                    target_tier,
+                    duration=(
+                        YOLO_DEFAULT_DURATION_TEXT
+                        if target_tier == PermissionTier.YOLO
+                        else "permanent"
+                    ),
+                    home=router.home,
+                )
+            except (ManifestError, ValueError) as exc:
+                notice = str(exc)
+            else:
+                router.replace_cached_manifest(updated)
+    elif action_id == ACTION_ID_YOLO_DURATION:
+        parsed = _decode_channels_dashboard_pair(str(action.get("value") or ""))
+        if parsed is None:
+            notice = "Could not extend YOLO."
+        else:
+            channel_id, duration = parsed
+            result = await _extend_yolo_grant(
+                router=router,
+                config=config,
+                slack_client=slack_client,
+                channel_id=channel_id,
+                duration=duration,
+            )
+            if not result["ok"]:
+                notice = str(result["message"])
+    elif action_id == ACTION_ID_NIGHTLY_TOGGLE:
+        parsed = _decode_channels_dashboard_pair(str(action.get("value") or ""))
+        if parsed is None:
+            notice = "Could not change nightly inclusion."
+        else:
+            channel_id, mode = parsed
+            if mode not in {"include", "exclude"}:
+                notice = "Could not change nightly inclusion."
+            else:
+                try:
+                    await _set_dashboard_meta_eligible(
+                        router=router,
+                        channel_id=channel_id,
+                        eligible=(mode == "include"),
+                    )
+                except ManifestError as exc:
+                    notice = str(exc)
+    else:
+        return {"ok": False, "error": "unsupported action"}
+
+    rows = await _collect_channels_dashboard_rows(
+        router=router,
+        config=config,
+        slack_client=slack_client,
+    )
+    text, blocks, rendered_page = _render_channels_dashboard(
+        rows,
+        page=target_page,
+        notice=notice,
+    )
+    return {
+        "ok": notice is None,
+        "page": rendered_page,
+        "response": _channels_dashboard_replace_original(text=text, blocks=blocks),
+    }
 
 
 async def handle_yolo_command(
@@ -1383,6 +1669,436 @@ async def _post_ephemeral_reply(
     if blocks is not None:
         payload["blocks"] = blocks
     await slack_client.chat_postMessage(**payload)
+
+
+async def _maybe_respond_with_dashboard(*, result: dict[str, object], respond) -> None:
+    response = result.get("response")
+    if not response or respond is None:
+        return
+    await respond(**response)
+
+
+def _channels_dashboard_replace_original(
+    *,
+    text: str,
+    blocks: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "response_type": "ephemeral",
+        "replace_original": True,
+        "text": text,
+        "blocks": blocks,
+    }
+
+
+async def _set_dashboard_meta_eligible(
+    *,
+    router: Router,
+    channel_id: str,
+    eligible: bool,
+) -> ChannelManifest:
+    manifest_path = paths.channel_manifest_path(channel_id, router.home)
+    manifest = load_manifest(manifest_path)
+    updated = manifest.model_copy(update={"meta_eligible": eligible})
+    dump_manifest(updated, manifest_path)
+    router.replace_cached_manifest(updated)
+    return updated
+
+
+async def _collect_channels_dashboard_rows(
+    *,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+) -> list[ChannelDashboardRow]:
+    home = router.home or paths.engram_home()
+    owner_dm_channel_id = config.owner_dm_channel_id or router.owner_dm_channel_id
+    manifests: list[ChannelManifest] = []
+    for manifest_path in sorted(
+        paths.contexts_dir(home).glob("*/.claude/channel-manifest.yaml")
+    ):
+        try:
+            manifest = load_manifest(manifest_path)
+        except ManifestError:
+            continue
+        if manifest.status != ChannelStatus.ACTIVE:
+            continue
+        manifests.append(manifest)
+
+    infos = await asyncio.gather(
+        *[
+            _fetch_channels_dashboard_info(
+                slack_client,
+                channel_id=manifest.channel_id,
+            )
+            for manifest in manifests
+        ]
+    )
+    rows = [
+        _build_channels_dashboard_row(
+            manifest=manifest,
+            channel_info=channel_info,
+            owner_dm_channel_id=owner_dm_channel_id,
+        )
+        for manifest, channel_info in zip(manifests, infos, strict=False)
+    ]
+    rows.sort(key=_channels_dashboard_sort_key)
+    return rows
+
+
+async def _fetch_channels_dashboard_info(
+    slack_client,
+    *,
+    channel_id: str,
+) -> dict[str, Any]:
+    conversations_info = getattr(slack_client, "conversations_info", None)
+    if conversations_info is None:
+        return {}
+    try:
+        response = await conversations_info(channel=channel_id)
+    except Exception:
+        return {}
+    channel = response.get("channel") if isinstance(response, dict) else None
+    return channel if isinstance(channel, dict) else {}
+
+
+def _build_channels_dashboard_row(
+    *,
+    manifest: ChannelManifest,
+    channel_info: dict[str, Any],
+    owner_dm_channel_id: str | None,
+) -> ChannelDashboardRow:
+    is_owner_dm = bool(
+        owner_dm_channel_id and manifest.channel_id == owner_dm_channel_id
+    )
+    is_private = _channels_dashboard_is_private(
+        channel_id=manifest.channel_id,
+        channel_info=channel_info,
+        is_owner_dm=is_owner_dm,
+    )
+    is_archived = bool(
+        channel_info.get("is_archived") or channel_info.get("is_read_only")
+    )
+    label = _channels_dashboard_label(
+        manifest=manifest,
+        channel_info=channel_info,
+        is_owner_dm=is_owner_dm,
+        is_archived=is_archived,
+    )
+    return ChannelDashboardRow(
+        channel_id=manifest.channel_id,
+        label=label,
+        sort_label=label.replace(" [archived]", "").casefold(),
+        manifest=manifest,
+        is_owner_dm=is_owner_dm,
+        is_private=is_private,
+        is_archived=is_archived,
+    )
+
+
+def _channels_dashboard_is_private(
+    *,
+    channel_id: str,
+    channel_info: dict[str, Any],
+    is_owner_dm: bool,
+) -> bool:
+    if is_owner_dm:
+        return False
+    if channel_info.get("is_private") or channel_info.get("is_group"):
+        return True
+    return channel_id.startswith(("D", "G"))
+
+
+def _channels_dashboard_label(
+    *,
+    manifest: ChannelManifest,
+    channel_info: dict[str, Any],
+    is_owner_dm: bool,
+    is_archived: bool,
+) -> str:
+    if is_owner_dm:
+        return "owner-dm (you)"
+
+    raw_label = (
+        str(channel_info.get("name") or "").strip()
+        or str(manifest.label or "").strip()
+        or manifest.channel_id
+    )
+    normalized = raw_label.lstrip("#") or manifest.channel_id
+    if is_archived:
+        return f"{normalized} [archived]"
+    return normalized
+
+
+def _channels_dashboard_sort_key(row: ChannelDashboardRow) -> tuple[int, str]:
+    if row.is_owner_dm:
+        return (0, row.sort_label)
+    if row.is_archived:
+        return (3, row.sort_label)
+    return (1 if row.is_private else 2, row.sort_label)
+
+
+def _render_channels_dashboard(
+    rows: list[ChannelDashboardRow],
+    *,
+    page: int,
+    notice: str | None = None,
+) -> tuple[str, list[dict[str, object]], int]:
+    text = "Engram channel dashboard"
+    if not rows:
+        blocks: list[dict[str, object]] = []
+        if notice:
+            blocks.append(_channels_dashboard_notice_block(notice))
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "No Engram-enabled channels yet. "
+                        "Add Engram to a channel and re-run `/engram channels`."
+                    ),
+                },
+            }
+        )
+        return text, blocks, 0
+
+    total_pages = (len(rows) + CHANNELS_DASHBOARD_PAGE_SIZE - 1) // CHANNELS_DASHBOARD_PAGE_SIZE
+    page_index = max(0, min(page, total_pages - 1))
+    start = page_index * CHANNELS_DASHBOARD_PAGE_SIZE
+    page_rows = rows[start : start + CHANNELS_DASHBOARD_PAGE_SIZE]
+
+    blocks = []
+    if notice:
+        blocks.append(_channels_dashboard_notice_block(notice))
+    header = (
+        f"Engram channels (page {page_index + 1}/{total_pages})"
+        if total_pages > 1
+        else "Engram channels"
+    )
+    blocks.append(
+        {
+            "type": "section",
+            "text": {"type": "plain_text", "text": header, "emoji": True},
+        }
+    )
+    for row in page_rows:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "plain_text",
+                    "text": _channels_dashboard_row_text(row),
+                    "emoji": True,
+                },
+            }
+        )
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": _channels_dashboard_block_id(
+                    page=page_index,
+                    channel_id=row.channel_id,
+                ),
+                "elements": _channels_dashboard_row_actions(row),
+            }
+        )
+
+    if total_pages > 1:
+        nav_elements: list[dict[str, object]] = []
+        if page_index > 0:
+            nav_elements.append(
+                _dashboard_button(
+                    text="Previous",
+                    action_id=ACTION_ID_CHANNELS_PAGE,
+                    value=str(page_index - 1),
+                )
+            )
+        if page_index + 1 < total_pages:
+            nav_elements.append(
+                _dashboard_button(
+                    text="Next",
+                    action_id=ACTION_ID_CHANNELS_PAGE,
+                    value=str(page_index + 1),
+                )
+            )
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": _channels_dashboard_block_id(
+                    page=page_index,
+                    channel_id=None,
+                ),
+                "elements": nav_elements,
+            }
+        )
+
+    return text, blocks, page_index
+
+
+def _channels_dashboard_notice_block(text: str) -> dict[str, object]:
+    return {
+        "type": "section",
+        "text": {"type": "plain_text", "text": text[:3000], "emoji": True},
+    }
+
+
+def _channels_dashboard_row_text(row: ChannelDashboardRow) -> str:
+    tier = row.manifest.tier_effective()
+    prefix = "📬" if row.is_owner_dm else "💬"
+    if tier == PermissionTier.YOLO and row.manifest.yolo_until is not None:
+        nightly = (
+            "Included in nightly ✓"
+            if row.manifest.meta_eligible
+            else "Nightly: excluded"
+        )
+        return (
+            f"{prefix} {row.label} [{_channels_dashboard_tier_label(tier)}"
+            f" • {_channels_dashboard_expiry_text(row.manifest.yolo_until)}]\n"
+            f"{nightly}"
+        )
+    if tier == PermissionTier.TASK_ASSISTANT:
+        return (
+            f"{prefix} {row.label} [{_channels_dashboard_tier_label(tier)}]\n"
+            "Nightly: excluded (safe tier)"
+        )
+    nightly = (
+        "Included in nightly ✓"
+        if row.manifest.meta_eligible
+        else "Nightly: excluded"
+    )
+    return (
+        f"{prefix} {row.label} [{_channels_dashboard_tier_label(tier)}]\n"
+        f"{nightly}"
+    )
+
+
+def _channels_dashboard_tier_label(tier: PermissionTier) -> str:
+    if tier == PermissionTier.TASK_ASSISTANT:
+        return "🔒 safe"
+    if tier == PermissionTier.YOLO:
+        return "🚀 yolo"
+    return "✨ trusted"
+
+
+def _channels_dashboard_expiry_text(expires_at: datetime.datetime) -> str:
+    local = expires_at.astimezone(_PACIFIC_TZ)
+    remaining = max(
+        datetime.timedelta(),
+        expires_at - datetime.datetime.now(datetime.UTC),
+    )
+    return (
+        f"expires {local.strftime('%Y-%m-%d %H:%M %Z')} "
+        f"({_format_duration(remaining)} left)"
+    )
+
+
+def _channels_dashboard_row_actions(
+    row: ChannelDashboardRow,
+) -> list[dict[str, object]]:
+    tier = row.manifest.tier_effective()
+    channel_id = row.channel_id
+    buttons: list[dict[str, object]] = []
+    if tier == PermissionTier.TASK_ASSISTANT:
+        buttons.append(
+            _dashboard_button(
+                text="Upgrade",
+                action_id=ACTION_ID_TIER_PICK,
+                value=f"{channel_id}|{PermissionTier.OWNER_SCOPED.value}",
+                style="primary",
+            )
+        )
+        return buttons
+
+    if tier == PermissionTier.YOLO:
+        target_tier = row.manifest.pre_yolo_tier or PermissionTier.TASK_ASSISTANT
+        buttons.append(
+            _dashboard_button(
+                text="Downgrade",
+                action_id=ACTION_ID_TIER_PICK,
+                value=f"{channel_id}|{target_tier.value}",
+            )
+        )
+        buttons.append(
+            _dashboard_button(
+                text="Extend YOLO",
+                action_id=ACTION_ID_YOLO_DURATION,
+                value=f"{channel_id}|{YOLO_DEFAULT_DURATION_TEXT}",
+            )
+        )
+    else:
+        buttons.append(
+            _dashboard_button(
+                text="Upgrade to YOLO",
+                action_id=ACTION_ID_TIER_PICK,
+                value=f"{channel_id}|{PermissionTier.YOLO.value}",
+                style="primary",
+            )
+        )
+        buttons.append(
+            _dashboard_button(
+                text="Downgrade to Safe",
+                action_id=ACTION_ID_TIER_PICK,
+                value=f"{channel_id}|{PermissionTier.TASK_ASSISTANT.value}",
+            )
+        )
+
+    if not row.is_owner_dm:
+        include = not row.manifest.meta_eligible
+        buttons.append(
+            _dashboard_button(
+                text="Include in nightly" if include else "Exclude from nightly",
+                action_id=ACTION_ID_NIGHTLY_TOGGLE,
+                value=f"{channel_id}|{'include' if include else 'exclude'}",
+            )
+        )
+    return buttons
+
+
+def _dashboard_button(
+    *,
+    text: str,
+    action_id: str,
+    value: str,
+    style: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "type": "button",
+        "text": {"type": "plain_text", "text": text},
+        "action_id": action_id,
+        "value": value,
+    }
+    if style is not None:
+        payload["style"] = style
+    return payload
+
+
+def _channels_dashboard_block_id(*, page: int, channel_id: str | None) -> str:
+    kind = "nav" if channel_id is None else f"channel:{channel_id}"
+    return f"engram_channels:{page}:{kind}"
+
+
+def _channels_dashboard_page_from_action(action: dict[str, object]) -> int:
+    block_id = str(action.get("block_id") or "")
+    match = CHANNELS_DASHBOARD_BLOCK_ID_PATTERN.match(block_id)
+    if match is None:
+        return 0
+    return int(match.group("page"))
+
+
+def _decode_channels_dashboard_pair(raw: str) -> tuple[str, str] | None:
+    channel_id, sep, value = raw.partition("|")
+    if not sep or not CHANNEL_ID_PATTERN.match(channel_id) or not value:
+        return None
+    return channel_id, value
+
+
+def _decode_channels_page_value(raw: str) -> int | None:
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
 
 
 def _encode_upgrade_action_value(*, request_id: str, channel_id: str) -> str:

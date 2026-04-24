@@ -91,10 +91,10 @@ async def run_nightly_pipeline(
 ) -> dict[str, Any]:
     """Run daily nightly work, optionally followed by weekly meta-synthesis."""
     clock = clock or (lambda: datetime.now(UTC))
-    root = engram_home()
+    cfg_path = config_path.expanduser()
+    root = cfg_path.parent if cfg_path.name else engram_home()
     memory_db = (db_path or root / "memory.db").expanduser()
     nightly_root = (output_root or root / "nightly").expanduser()
-    cfg_path = config_path.expanduser()
     cfg = load_nightly_config(cfg_path)
     run_date = target_date or clock().date()
     run_date_text = run_date.isoformat()

@@ -13,6 +13,10 @@ from engram.config import AnthropicConfig, EngramConfig, SlackConfig
 from engram.footguns import match_footgun
 from engram.hitl import PendingQuestion
 from engram.ingress import (
+    ACTION_ID_CHANNELS_PAGE,
+    ACTION_ID_NIGHTLY_TOGGLE,
+    ACTION_ID_TIER_PICK,
+    ACTION_ID_YOLO_DURATION,
     FOOTGUN_CONFIRM_OPEN_ACTION_ID,
     HITL_ACTION_ID_PATTERN,
     UPGRADE_ACTION_ID_PATTERN,
@@ -269,13 +273,17 @@ def test_register_listeners_attaches_hitl_action_handler():
 
     register_listeners(app, make_config(), Router(), agent=object())
 
-    assert len(app.actions) == 6
+    assert len(app.actions) == 10
     patterns = [pattern for pattern, _handler in app.actions]
     assert HITL_ACTION_ID_PATTERN in patterns
     assert PENDING_CHANNEL_ACTION_ID_PATTERN in patterns
     assert UPGRADE_ACTION_ID_PATTERN in patterns
     assert YOLO_EXTEND_ACTION_ID_PATTERN in patterns
     assert YOLO_REVOKE_ACTION_ID_PATTERN in patterns
+    assert ACTION_ID_TIER_PICK in patterns
+    assert ACTION_ID_YOLO_DURATION in patterns
+    assert ACTION_ID_NIGHTLY_TOGGLE in patterns
+    assert ACTION_ID_CHANNELS_PAGE in patterns
     assert FOOTGUN_CONFIRM_OPEN_ACTION_ID in patterns
     assert HITL_ACTION_ID_PATTERN.match("hitl_choice_0")
     assert HITL_ACTION_ID_PATTERN.match("hitl_choice_4")
