@@ -21,8 +21,8 @@ from engram.manifest import (
     ChannelStatus,
     IdentityTemplate,
     MemoryScope,
-    PermissionTier,
     PermissionsRules,
+    PermissionTier,
     ScopeList,
 )
 from engram.mcp import resolve_team_mcp_servers

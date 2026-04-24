@@ -19,8 +19,8 @@ stored for M3/M4 to consume without revisiting the schema.
 """
 from __future__ import annotations
 
-import copy
 import contextlib
+import copy
 import logging
 import os
 import re
@@ -555,7 +555,7 @@ def _apply_tier_defaults(
         desired_deny_rules = (
             list(defaults["deny_rules"])
             if not deny_rules
-            else _merge_rules(ABSOLUTE_DENY_RULES, deny_rules)
+            else _merge_rules(defaults["deny_rules"], deny_rules)
         )
         if permissions.get("deny") != desired_deny_rules:
             permissions["deny"] = desired_deny_rules

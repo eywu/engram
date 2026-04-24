@@ -24,10 +24,10 @@ from pathlib import Path
 
 from engram import paths
 from engram.manifest import (
-    _apply_tier_defaults,
     ChannelManifest,
     ChannelStatus,
     IdentityTemplate,
+    _apply_tier_defaults,
     dump_manifest,
     load_manifest,
 )

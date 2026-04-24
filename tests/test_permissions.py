@@ -16,10 +16,11 @@ from pydantic import ValidationError
 
 from engram.bootstrap import provision_channel
 from engram.manifest import (
-    ABSOLUTE_DENY_RULES,
+    _TIER_DEFAULTS,
     ChannelManifest,
     IdentityTemplate,
     PermissionsRules,
+    PermissionTier,
     dump_manifest,
     load_manifest,
 )
@@ -100,7 +101,7 @@ def test_permissions_survive_yaml_round_trip(tmp_path: Path):
     dump_manifest(m, path)
     reloaded = load_manifest(path)
     assert reloaded.permissions.deny == [
-        *ABSOLUTE_DENY_RULES,
+        *list(_TIER_DEFAULTS[PermissionTier.TASK_ASSISTANT]["deny_rules"]),
         "Bash(curl *)",
     ]
     assert reloaded.permissions.allow == ["Bash(git status)"]

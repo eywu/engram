@@ -8,9 +8,9 @@ import pytest
 import yaml
 
 from engram.manifest import (
+    _TIER_DEFAULTS,
     ABSOLUTE_DENY_RULES,
     OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES,
-    _TIER_DEFAULTS,
     ChannelManifest,
     IdentityTemplate,
     PermissionTier,
@@ -147,3 +147,25 @@ permissions:
     for rule in ABSOLUTE_DENY_RULES:
         assert rule in manifest.permissions.deny
         assert rule in decision.disallowed_tools
+
+
+def test_task_assistant_tier_denies_survive_user_additions(tmp_path: Path):
+    path = tmp_path / "channel-manifest.yaml"
+    path.write_text(
+        """
+channel_id: C07TEST
+identity: task-assistant
+status: active
+permission_tier: task-assistant
+setting_sources: [project]
+permissions:
+  deny:
+    - "Read(./secrets/**)"
+"""
+    )
+
+    manifest = load_manifest(path)
+
+    assert "Read(./secrets/**)" in manifest.permissions.deny
+    for rule in _TIER_DEFAULTS[PermissionTier.TASK_ASSISTANT]["deny_rules"]:
+        assert rule in manifest.permissions.deny, f"tier rule dropped: {rule}"

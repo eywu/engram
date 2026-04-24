@@ -7,8 +7,8 @@ from engram.egress import _is_sticky_eligible
 from engram.manifest import (
     ChannelManifest,
     IdentityTemplate,
-    PermissionTier,
     PermissionsRules,
+    PermissionTier,
     _assert_sticky_eligible,
     add_allow_rule,
 )

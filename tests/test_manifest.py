@@ -9,6 +9,7 @@ import yaml
 
 from engram import paths
 from engram.manifest import (
+    _TIER_DEFAULTS,
     OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES,
     AskUserQuestion,
     Behavior,
@@ -19,10 +20,9 @@ from engram.manifest import (
     IdentityTemplate,
     ManifestError,
     MemoryScope,
-    PermissionTier,
     PermissionsRules,
+    PermissionTier,
     ScopeList,
-    _TIER_DEFAULTS,
     dump_manifest,
     load_manifest,
 )

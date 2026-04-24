@@ -44,6 +44,7 @@ from engram.costs import CostDatabase, RateLimitRecord
 from engram.embeddings import EmbeddingQueue
 from engram.hitl import build_hitl_tool_guard
 from engram.hooks import build_hooks
+from engram.manifest import PermissionTier
 from engram.mcp import resolve_team_mcp_servers, warn_missing_mcp_servers
 from engram.mcp_tools import (
     MEMORY_SEARCH_FULL_TOOL_NAMES,
@@ -51,7 +52,6 @@ from engram.mcp_tools import (
     make_memory_search_server,
 )
 from engram.memory_hooks import make_memory_hooks_with_embeddings
-from engram.manifest import PermissionTier
 from engram.router import Router, SessionState
 from engram.scope import build_scope_decision, build_tool_guard
 from engram.telemetry import cli_stderr_logger
