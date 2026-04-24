@@ -25,6 +25,19 @@ features:
     home_tab_enabled: false
     messages_tab_enabled: true
     messages_tab_read_only_enabled: false
+  slash_commands:
+    - command: /engram
+      description: "Manage Engram permission tiers, YOLO mode, and nightly-summary inclusion"
+      usage_hint: "upgrade | yolo | channels | exclude | include"
+      should_escape: false
+    - command: /exclude-from-nightly
+      description: "Exclude this channel from the nightly cross-channel summary"
+      usage_hint: ""
+      should_escape: false
+    - command: /include-in-nightly
+      description: "Include this channel in the nightly cross-channel summary"
+      usage_hint: ""
+      should_escape: false
 oauth_config:
   scopes:
     bot:
@@ -32,6 +45,7 @@ oauth_config:
       - channels:history
       - channels:read
       - chat:write
+      - commands
       - files:read
       - files:write
       - groups:history
@@ -60,6 +74,8 @@ settings:
   socket_mode_enabled: true
   token_rotation_enabled: false
 ```
+
+**Slash commands are registered for you via the manifest.** You do not need to manually create `/engram` or the nightly-summary commands — they ship with the app.
 
 > ℹ️ Running `engram setup` also writes this manifest to
 > `/tmp/engram-slack-manifest.yaml` for convenience.

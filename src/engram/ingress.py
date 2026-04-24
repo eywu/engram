@@ -365,6 +365,14 @@ def register_listeners(
     async def on_engram(ack, body, client):
         await ack()
         try:
+            log.info(
+                "ingress.slash_command_received",
+                extra={
+                    "slash_command": "/engram",
+                    "source_channel_id": str(body.get("channel_id") or ""),
+                    "user_id": body.get("user_id"),
+                },
+            )
             await handle_engram_command(
                 router=router,
                 config=config,
@@ -381,6 +389,14 @@ def register_listeners(
     async def on_exclude_from_nightly(ack, body, client):
         await ack()
         try:
+            log.info(
+                "ingress.slash_command_received",
+                extra={
+                    "slash_command": "/exclude-from-nightly",
+                    "source_channel_id": str(body.get("channel_id") or ""),
+                    "user_id": body.get("user_id"),
+                },
+            )
             await handle_meta_eligibility_command(
                 router=router,
                 config=config,
@@ -398,6 +414,14 @@ def register_listeners(
     async def on_include_in_nightly(ack, body, client):
         await ack()
         try:
+            log.info(
+                "ingress.slash_command_received",
+                extra={
+                    "slash_command": "/include-in-nightly",
+                    "source_channel_id": str(body.get("channel_id") or ""),
+                    "user_id": body.get("user_id"),
+                },
+            )
             await handle_meta_eligibility_command(
                 router=router,
                 config=config,

@@ -126,8 +126,20 @@ the app manifest are in [slack-app-setup.md](slack-app-setup.md).
 6. Under **OAuth & Permissions**, copy the **Bot User OAuth Token** (`xoxb-…`)
 7. Under **Basic Information** → **App-Level Tokens**, generate a token
    with scope `connections:write` and copy it (`xapp-…`)
+8. **Verify slash commands work:** After installing the app, type `/engram`
+   in any channel where Engram is present. Slack should autocomplete it. If
+   it doesn't, the manifest wasn't applied — re-paste the manifest at
+   [api.slack.com](http://api.slack.com) and reinstall.
 
 Keep both tokens handy for the next step.
+
+### Upgrading an existing install
+
+If you installed Engram before slash commands were added to the manifest: go
+to [api.slack.com/apps](http://api.slack.com/apps) → your Engram app →
+**App Manifest**, replace the contents with the new manifest from
+`docs/slack-app-setup.md`, click **Save Changes**, then **Install App** to
+reinstall. This is a no-downtime change.
 
 ---
 
@@ -323,11 +335,12 @@ Before manual debugging, run:
 engram doctor
 ```
 
-It runs 13 pre-flight checks — `uv`, `claude` CLI, Python version, config
-file + permissions, Slack tokens (live `auth.test`), Anthropic + Gemini API
-keys (live validation), launchd jobs, disk space, log directory — and
-prints a Rich table with actionable hints for every `❌`. Exits `0` on a
-healthy setup or only-warnings, `1` on any failure.
+It runs 17 pre-flight checks — `uv`, `claude` CLI, Python version, config
+file + permissions, Slack tokens (live `auth.test`), slash-command coverage
+(recent bridge-log probe), Anthropic + Gemini API keys (live validation),
+launchd jobs, disk space, log directory — and prints a Rich table with
+actionable hints for every `❌`. Exits `0` on a healthy setup or
+only-warnings, `1` on any failure.
 
 ```bash
 engram doctor --json       # machine-readable output for scripts / issue reports

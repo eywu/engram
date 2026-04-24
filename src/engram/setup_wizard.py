@@ -40,6 +40,19 @@ SLACK_APP_MANIFEST = dedent(
         home_tab_enabled: false
         messages_tab_enabled: true
         messages_tab_read_only_enabled: false
+      slash_commands:
+        - command: /engram
+          description: "Manage Engram permission tiers, YOLO mode, and nightly-summary inclusion"
+          usage_hint: "upgrade | yolo | channels | exclude | include"
+          should_escape: false
+        - command: /exclude-from-nightly
+          description: "Exclude this channel from the nightly cross-channel summary"
+          usage_hint: ""
+          should_escape: false
+        - command: /include-in-nightly
+          description: "Include this channel in the nightly cross-channel summary"
+          usage_hint: ""
+          should_escape: false
     oauth_config:
       scopes:
         bot:
@@ -47,6 +60,7 @@ SLACK_APP_MANIFEST = dedent(
           - channels:history
           - channels:read
           - chat:write
+          - commands
           - files:read
           - files:write
           - groups:history
@@ -100,9 +114,11 @@ def run_wizard() -> None:
     rprint("\n[bold green]✓ Setup complete.[/bold green]")
     rprint(f"  Config written to: {DEFAULT_CONFIG_PATH}")
     rprint()
-    rprint("Next:")
-    rprint("  [cyan]engram status[/cyan]   — verify config")
-    rprint("  [cyan]engram run[/cyan]      — start the bridge (foreground)")
+    rprint("Next steps:")
+    rprint("  1. [cyan]engram run[/cyan]           — start the bridge")
+    rprint('  2. Test in Slack: DM the bot ("Hello")')
+    rprint("  3. Verify slash commands: type `/engram` in any channel — Slack should autocomplete")
+    rprint("     If not: re-paste the manifest at api.slack.com/apps and reinstall the app.")
     rprint()
 
 
