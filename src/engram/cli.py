@@ -45,6 +45,10 @@ from engram.uninstall import run_uninstall
 app = typer.Typer(
     name="engram",
     help="Personal AI agent for Slack.",
+    epilog=(
+        "CLI is fully equivalent to Slack slash commands. "
+        "Use it when Slack slash commands are unavailable in your workspace."
+    ),
     no_args_is_help=True,
     add_completion=False,
 )
@@ -116,6 +120,74 @@ def _active_yolo_manifest(
     return manifest
 
 
+def _active_yolo_manifests(
+    *,
+    now: datetime.datetime | None = None,
+) -> list[ChannelManifest]:
+    current_time = now or datetime.datetime.now(datetime.UTC)
+    manifests: list[ChannelManifest] = []
+    for manifest_path in _iter_manifest_paths():
+        try:
+            manifest = load_manifest(manifest_path)
+        except ManifestError:
+            continue
+        if (
+            manifest.permission_tier != PermissionTier.YOLO
+            or manifest.yolo_until is None
+            or manifest.yolo_until <= current_time
+        ):
+            continue
+        manifests.append(manifest)
+    return manifests
+
+
+def _print_active_yolo_grants(
+    manifests: list[ChannelManifest],
+    *,
+    now: datetime.datetime,
+) -> None:
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Channel ID")
+    table.add_column("Label")
+    table.add_column("Remaining")
+    table.add_column("Restores To")
+    for manifest in manifests:
+        table.add_row(
+            manifest.channel_id,
+            manifest.label or "—",
+            _format_duration(manifest.yolo_until - now),
+            (manifest.pre_yolo_tier or PermissionTier.TASK_ASSISTANT).value,
+        )
+    console.print(table)
+
+
+def _resolve_yolo_cli_target(
+    channel_id: str | None,
+    *,
+    now: datetime.datetime | None = None,
+) -> tuple[ChannelManifest, bool]:
+    current_time = now or datetime.datetime.now(datetime.UTC)
+    if channel_id is not None:
+        manifest = _active_yolo_manifest(channel_id, now=current_time)
+        if manifest is None:
+            rprint(f"[red]No active yolo grant for '{channel_id}'.[/red]")
+            raise typer.Exit(code=1)
+        return manifest, False
+
+    manifests = _active_yolo_manifests(now=current_time)
+    if len(manifests) == 1:
+        return manifests[0], True
+
+    if not manifests:
+        rprint("[red]No active yolo grants.[/red]")
+        rprint("Pass `--channel <id>` to target a channel explicitly.")
+        raise typer.Exit(code=2)
+
+    rprint("[red]Multiple active yolo grants. Pass `--channel <id>`.[/red]")
+    _print_active_yolo_grants(manifests, now=current_time)
+    raise typer.Exit(code=2)
+
+
 def _normalize_yolo_duration(duration: str) -> str:
     normalized = validate_upgrade_duration(duration)
     if normalized not in YOLO_DURATION_CHOICES:
@@ -135,63 +207,47 @@ def _yolo_extension_delta(duration: str) -> datetime.timedelta:
 def yolo_list() -> None:
     """List channels with active yolo grants."""
     now = datetime.datetime.now(datetime.UTC)
-    table = Table(show_header=True, header_style="bold")
-    table.add_column("Channel ID")
-    table.add_column("Label")
-    table.add_column("Remaining")
-    table.add_column("Restores To")
-    count = 0
-
-    for manifest_path in _iter_manifest_paths():
-        try:
-            manifest = load_manifest(manifest_path)
-        except ManifestError:
-            continue
-        if (
-            manifest.permission_tier != PermissionTier.YOLO
-            or manifest.yolo_until is None
-            or manifest.yolo_until <= now
-        ):
-            continue
-        table.add_row(
-            manifest.channel_id,
-            manifest.label or "—",
-            _format_duration(manifest.yolo_until - now),
-            (manifest.pre_yolo_tier or PermissionTier.TASK_ASSISTANT).value,
-        )
-        count += 1
-
-    if count == 0:
+    manifests = _active_yolo_manifests(now=now)
+    if not manifests:
         rprint("No active yolo grants.")
         return
-    console.print(table)
+    _print_active_yolo_grants(manifests, now=now)
 
 
 @yolo_app.command("off")
 def yolo_off(
-    channel_id: str = typer.Argument(..., help="Slack channel ID."),
+    channel_id: str | None = typer.Option(
+        None,
+        "--channel",
+        help="Slack channel ID. Defaults to the only active yolo channel.",
+    ),
 ) -> None:
     """Immediately revoke an active yolo grant."""
-    manifest = _active_yolo_manifest(channel_id)
-    if manifest is None:
-        rprint(f"[red]No active yolo grant for '{channel_id}'.[/red]")
-        raise typer.Exit(code=1)
+    manifest, inferred = _resolve_yolo_cli_target(channel_id)
+    if inferred:
+        rprint(
+            f"[dim]Using only active yolo channel '{manifest.channel_id}'.[/dim]"
+        )
 
     previous, updated, _manifest_path, _duration = set_channel_permission_tier(
-        channel_id,
+        manifest.channel_id,
         manifest.pre_yolo_tier or PermissionTier.TASK_ASSISTANT,
         duration="permanent",
     )
     rprint(
-        f"[green]✓[/] [bold]{channel_id}[/bold]: "
+        f"[green]✓[/] [bold]{manifest.channel_id}[/bold]: "
         f"{previous.permission_tier.value} → {updated.permission_tier.value}"
     )
 
 
 @yolo_app.command("extend")
 def yolo_extend(
-    channel_id: str = typer.Argument(..., help="Slack channel ID."),
     duration: str = typer.Argument(..., help="Extension duration: 6h, 24h, or 72h."),
+    channel_id: str | None = typer.Option(
+        None,
+        "--channel",
+        help="Slack channel ID. Defaults to the only active yolo channel.",
+    ),
 ) -> None:
     """Extend an active yolo grant, capped at 72h total remaining."""
     try:
@@ -201,10 +257,11 @@ def yolo_extend(
         raise typer.Exit(code=2) from exc
 
     now = datetime.datetime.now(datetime.UTC)
-    manifest = _active_yolo_manifest(channel_id, now=now)
-    if manifest is None:
-        rprint(f"[red]No active yolo grant for '{channel_id}'.[/red]")
-        raise typer.Exit(code=1)
+    manifest, inferred = _resolve_yolo_cli_target(channel_id, now=now)
+    if inferred:
+        rprint(
+            f"[dim]Using only active yolo channel '{manifest.channel_id}'.[/dim]"
+        )
 
     remaining = manifest.yolo_until - now
     if remaining + _yolo_extension_delta(normalized_duration) > YOLO_MAX_DURATION:
@@ -212,7 +269,7 @@ def yolo_extend(
         raise typer.Exit(code=2)
 
     _previous, updated, _manifest_path, _duration = set_channel_permission_tier(
-        channel_id,
+        manifest.channel_id,
         PermissionTier.YOLO,
         duration=normalized_duration,
         now=now,
@@ -223,7 +280,7 @@ def yolo_extend(
         else datetime.timedelta()
     )
     rprint(
-        f"[green]✓[/] [bold]{channel_id}[/bold]: extended by {normalized_duration} "
+        f"[green]✓[/] [bold]{manifest.channel_id}[/bold]: extended by {normalized_duration} "
         f"(remaining {_format_duration(new_remaining)})"
     )
 

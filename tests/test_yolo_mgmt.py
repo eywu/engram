@@ -521,9 +521,9 @@ def test_cli_yolo_list_extend_and_off(cli: CliRunner, tmp_path: Path) -> None:
     initial = load_manifest(channel_manifest_path("C07TEAM", home))
 
     list_result = cli.invoke(cli_app, ["yolo", "list"])
-    extend_result = cli.invoke(cli_app, ["yolo", "extend", "C07TEAM", "6h"])
+    extend_result = cli.invoke(cli_app, ["yolo", "extend", "--channel", "C07TEAM", "6h"])
     updated = load_manifest(channel_manifest_path("C07TEAM", home))
-    off_result = cli.invoke(cli_app, ["yolo", "off", "C07TEAM"])
+    off_result = cli.invoke(cli_app, ["yolo", "off", "--channel", "C07TEAM"])
     revoked = load_manifest(channel_manifest_path("C07TEAM", home))
 
     assert list_result.exit_code == 0
@@ -541,9 +541,48 @@ def test_cli_yolo_extend_rejects_cap_overflow(cli: CliRunner, tmp_path: Path) ->
     write_active_yolo_manifest(home, remaining_hours=70)
     before = load_manifest(channel_manifest_path("C07TEAM", home))
 
-    result = cli.invoke(cli_app, ["yolo", "extend", "C07TEAM", "6h"])
+    result = cli.invoke(cli_app, ["yolo", "extend", "--channel", "C07TEAM", "6h"])
 
     after = load_manifest(channel_manifest_path("C07TEAM", home))
     assert result.exit_code == 2
     assert "Cannot extend beyond 72h total remaining." in result.output
     assert after == before
+
+
+def test_cli_yolo_extend_without_channel_uses_only_active_grant(
+    cli: CliRunner,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_active_yolo_manifest(home, channel_id="D07OWNER", label="owner-dm")
+    before = load_manifest(channel_manifest_path("D07OWNER", home))
+
+    result = cli.invoke(cli_app, ["yolo", "extend", "6h"])
+
+    after = load_manifest(channel_manifest_path("D07OWNER", home))
+    assert result.exit_code == 0
+    assert "Using only active yolo channel 'D07OWNER'." in result.output
+    assert after.yolo_until == before.yolo_until + timedelta(hours=6)
+
+
+def test_cli_yolo_extend_without_channel_errors_when_multiple_active(
+    cli: CliRunner,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_active_yolo_manifest(home, channel_id="C07TEAM", label="#growth")
+    write_active_yolo_manifest(home, channel_id="D07OWNER", label="owner-dm")
+
+    result = cli.invoke(cli_app, ["yolo", "extend", "6h"])
+
+    assert result.exit_code == 2
+    assert "Multiple active yolo grants. Pass `--channel <id>`." in result.output
+    assert "C07TEAM" in result.output
+    assert "D07OWNER" in result.output
+
+
+def test_root_help_mentions_cli_slack_equivalence(cli: CliRunner) -> None:
+    result = cli.invoke(cli_app, ["--help"])
+
+    assert result.exit_code == 0
+    assert "CLI is fully equivalent to Slack slash commands." in result.output

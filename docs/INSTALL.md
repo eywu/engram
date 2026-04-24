@@ -228,6 +228,41 @@ that a week's worth of transcripts is worth summarizing.
 
 ---
 
+## Managing Engram without slash commands
+
+If you can't register slash commands in your Slack workspace, all Engram
+management works via CLI on the host running the bridge. The CLI is fully
+equivalent to the Slack slash-command surface, so an admin-less user can
+manage tiers, YOLO mode, nightly-summary inclusion, and the channel dashboard
+without needing Slack app-manifest changes.
+
+| Slack surface | CLI equivalent | Notes |
+| --- | --- | --- |
+| `/engram upgrade <safe\|trusted\|yolo>` | `engram channels upgrade <channel-id> <tier> [--until 24h\|30d\|permanent]` | Upgrade or downgrade a channel tier directly from the bridge host. |
+| `/engram yolo extend <channel> <duration>` | `engram yolo extend --channel <channel-id> <6h\|24h\|72h>` | Omitting `--channel` auto-targets the only active YOLO grant. |
+| `/engram yolo list` | `engram yolo list` | Lists every active YOLO grant with remaining time and restore tier. |
+| `/engram yolo off <channel>` | `engram yolo off --channel <channel-id>` | Omitting `--channel` auto-targets the only active YOLO grant. |
+| `/engram exclude` | `engram channels exclude <channel-id>` | Excludes one channel from the nightly cross-channel summary. |
+| `/engram include` | `engram channels include <channel-id>` | Re-includes a channel unless it is still `safe`. |
+| `/engram channels` | `engram channels list` | Shows the channel dashboard in tabular form. |
+| Slack-only parity gap: scripting | `engram channels list --json` | Stable versioned JSON for shell and `jq` pipelines. |
+
+Examples:
+
+```bash
+engram channels upgrade C07TEAM123 trusted
+engram channels exclude C07TEAM123
+engram channels include C07TEAM123
+engram yolo extend --channel D07OWNER123 24h
+engram yolo off --channel C07TEAM123
+engram channels list --json | jq '.channels[] | {channel_id, tier, nightly}'
+```
+
+For tier behavior, defaults, and alias migration details, see
+[permission-tiers.md](permission-tiers.md).
+
+---
+
 ## Optional: personal secret-file conventions
 
 Engram's `.env` lookup order is:

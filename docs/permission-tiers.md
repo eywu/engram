@@ -57,7 +57,11 @@ engram channels tier <channel-id>
 
 `engram channels tier` prints the effective tier, YOLO status, and expiry timestamp if one is active.
 
+If your Slack workspace won't let you register slash commands, use the full
+CLI parity guide in [INSTALL.md](INSTALL.md#managing-engram-without-slash-commands).
+
 ## See also
 
+- [Managing Engram without slash commands](INSTALL.md#managing-engram-without-slash-commands)
 - [Human-in-the-loop](hitl.md)
 - [Footgun confirmations](footguns.md)

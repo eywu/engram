@@ -14,6 +14,7 @@ next restart, or when a channel hasn't been resolved yet this run.
 """
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from engram.manifest import (
     load_manifest,
     parse_permission_tier,
     permission_tier_choices_text,
+    set_channel_nightly_included,
     set_channel_permission_tier,
     set_channel_status,
     validate_upgrade_duration,
@@ -43,6 +45,7 @@ app = typer.Typer(
 )
 console = Console()
 log = logging.getLogger(__name__)
+CHANNEL_LIST_SCHEMA_VERSION = "1"
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
@@ -104,14 +107,87 @@ def _flip_status(
     )
 
 
+def _load_manifest_or_exit(
+    channel_id: str,
+    *,
+    home: Path | None = None,
+) -> tuple[Path, object]:
+    manifest_path = paths.channel_manifest_path(channel_id, home)
+    if not manifest_path.exists():
+        rprint(f"[red]No manifest found for channel '{channel_id}'.[/red]")
+        rprint(f"  Expected at: {manifest_path}")
+        raise typer.Exit(code=1)
+    try:
+        return manifest_path, load_manifest(manifest_path)
+    except ManifestError as exc:
+        rprint(f"[red]Failed to load manifest: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+
+def _channel_name(manifest) -> str:
+    if manifest.is_owner_dm():
+        return "owner-dm"
+    return manifest.label or manifest.channel_id
+
+
+def _channel_list_record(manifest_path: Path) -> dict[str, object]:
+    channel_id = manifest_path.parent.parent.name
+    try:
+        manifest = load_manifest(manifest_path)
+    except ManifestError as exc:
+        return {
+            "channel_id": channel_id,
+            "channel_name": None,
+            "tier": "broken",
+            "nightly": "unknown",
+            "yolo_expires_at": None,
+            "owner_dm": False,
+            "status": "broken",
+            "manifest_path": str(manifest_path),
+            "error": str(exc),
+        }
+
+    effective_tier = manifest.tier_effective()
+    yolo_expires_at = (
+        manifest.yolo_until.isoformat()
+        if effective_tier == PermissionTier.YOLO and manifest.yolo_until is not None
+        else None
+    )
+    return {
+        "channel_id": manifest.channel_id,
+        "channel_name": _channel_name(manifest),
+        "tier": effective_tier.value,
+        "nightly": "included" if manifest.nightly_included else "excluded",
+        "yolo_expires_at": yolo_expires_at,
+        "owner_dm": manifest.is_owner_dm(),
+        "status": str(manifest.status),
+        "manifest_path": str(manifest_path),
+        "error": None,
+    }
+
+
 # ── Commands ────────────────────────────────────────────────────────────
 
 
 @app.command("list")
-def list_channels() -> None:
+def list_channels(
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit a versioned machine-readable channel inventory.",
+    ),
+) -> None:
     """List every provisioned channel and its status."""
     manifest_paths = _iter_manifest_paths()
     if not manifest_paths:
+        if json_output:
+            typer.echo(
+                json.dumps(
+                    {"version": CHANNEL_LIST_SCHEMA_VERSION, "channels": []},
+                    sort_keys=True,
+                )
+            )
+            return
         rprint(
             "[dim]No channels provisioned yet. "
             "They appear here after the bot first sees a message "
@@ -119,31 +195,48 @@ def list_channels() -> None:
         )
         return
 
+    records = [_channel_list_record(path) for path in manifest_paths]
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {"version": CHANNEL_LIST_SCHEMA_VERSION, "channels": records},
+                sort_keys=True,
+            )
+        )
+        return
+
     table = Table(show_header=True, header_style="bold")
     table.add_column("Channel ID")
-    table.add_column("Status")
+    table.add_column("Name")
     table.add_column("Tier")
-    table.add_column("Label")
-    table.add_column("Setting", overflow="fold")
+    table.add_column("Nightly")
+    table.add_column("YOLO Expiry")
+    table.add_column("Owner DM")
+    table.add_column("Status")
 
-    for mp in manifest_paths:
-        try:
-            m = load_manifest(mp)
-        except ManifestError:
+    for record in records:
+        if record["status"] == "broken":
             table.add_row(
-                mp.parent.parent.name,
+                str(record["channel_id"]),
+                "—",
                 "[red]BROKEN[/red]",
+                "unknown",
                 "—",
-                "—",
-                f"[dim]{mp}[/dim]",
+                "no",
+                "[red]broken[/red]",
             )
             continue
         table.add_row(
-            m.channel_id,
-            f"[{_status_style(m.status)}]{m.status}[/]",
-            m.tier_effective().value,
-            m.label or "—",
-            ",".join(m.setting_sources),
+            str(record["channel_id"]),
+            str(record["channel_name"] or "—"),
+            str(record["tier"]),
+            str(record["nightly"]),
+            str(record["yolo_expires_at"] or "—"),
+            "yes" if bool(record["owner_dm"]) else "no",
+            (
+                f"[{_status_style(ChannelStatus(str(record['status'])))}]"
+                f"{record['status']}[/]"
+            ),
         )
 
     console.print(table)
@@ -326,16 +419,7 @@ def tier(
     channel_id: str = typer.Argument(..., help="Slack channel ID."),
 ) -> None:
     """Show a channel's current tier, YOLO status, and expiry."""
-    manifest_path = paths.channel_manifest_path(channel_id)
-    if not manifest_path.exists():
-        rprint(f"[red]No manifest found for '{channel_id}'.[/red]")
-        raise typer.Exit(code=1)
-
-    try:
-        manifest = load_manifest(manifest_path)
-    except ManifestError as exc:
-        rprint(f"[red]Failed to load manifest: {exc}[/red]")
-        raise typer.Exit(code=2) from exc
+    _manifest_path, manifest = _load_manifest_or_exit(channel_id)
 
     expiry = manifest.yolo_until.isoformat() if manifest.yolo_until is not None else "none"
     yolo_status = "active" if manifest.tier_effective() == PermissionTier.YOLO else "inactive"
@@ -343,6 +427,63 @@ def tier(
     rprint(f"  tier:   {manifest.tier_effective().value}")
     rprint(f"  yolo:   {yolo_status}")
     rprint(f"  expiry: {expiry}")
+
+
+def _set_nightly_state(
+    channel_id: str,
+    *,
+    nightly_included: bool,
+) -> None:
+    _manifest_path, manifest = _load_manifest_or_exit(channel_id)
+    previous_state = "included" if manifest.nightly_included else "excluded"
+    desired_state = "included" if nightly_included else "excluded"
+    if previous_state == desired_state:
+        rprint(
+            f"[dim]Already {desired_state}. No change.[/dim]"
+        )
+        return
+
+    try:
+        _previous, _updated, _saved_path = set_channel_nightly_included(
+            channel_id,
+            nightly_included,
+        )
+    except ValueError as exc:
+        typer.echo(
+            "Cannot include a `safe` channel. Safe channels are excluded by default "
+            "to protect team privacy. Upgrade first: "
+            f"`engram channels upgrade {channel_id} trusted`."
+        )
+        raise typer.Exit(code=3) from exc
+    except ManifestError as exc:
+        rprint(f"[red]Failed to load manifest: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    if nightly_included:
+        rprint(
+            f"Channel '{channel_id}' included in nightly cross-channel summary."
+        )
+    else:
+        rprint(
+            f"Channel '{channel_id}' excluded from nightly cross-channel summary."
+        )
+    rprint(f"Previous state: {previous_state}")
+
+
+@app.command("exclude")
+def exclude(
+    channel_id: str = typer.Argument(..., help="Slack channel ID."),
+) -> None:
+    """Exclude a channel from the nightly cross-channel summary."""
+    _set_nightly_state(channel_id, nightly_included=False)
+
+
+@app.command("include")
+def include(
+    channel_id: str = typer.Argument(..., help="Slack channel ID."),
+) -> None:
+    """Include a channel in the nightly cross-channel summary."""
+    _set_nightly_state(channel_id, nightly_included=True)
 
 
 if __name__ == "__main__":
