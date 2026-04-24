@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import json
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from engram.doctor import (
     check_python_version,
     check_slack_app_token,
     check_slack_bot_token,
+    check_slack_slash_commands,
     check_uv_on_path,
 )
 
@@ -63,6 +65,21 @@ def _config(tmp_path: Path, *, gemini_api_key: str | None = None) -> EngramConfi
         ),
         embeddings=EmbeddingsConfig(api_key=gemini_api_key),
     )
+
+
+def _write_bridge_log(
+    log_dir: Path,
+    *,
+    log_date: datetime.date,
+    rows: list[dict[str, object]],
+) -> Path:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / f"engram-{log_date.isoformat()}.jsonl"
+    path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def test_check_uv_on_path_reports_version() -> None:
@@ -144,6 +161,92 @@ def test_check_slack_app_token_requires_xapp_prefix(tmp_path: Path) -> None:
 
     assert check.status == CheckStatus.FAIL
     assert "xapp-" in check.message
+
+
+def test_check_slack_slash_commands_passes_when_recent_logs_cover_all_commands(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    now = datetime.datetime(2026, 4, 24, 12, 0, tzinfo=datetime.UTC)
+    _write_bridge_log(
+        cfg.paths.log_dir,
+        log_date=now.date(),
+        rows=[
+            {
+                "timestamp": "2026-04-24T11:00:00Z",
+                "event": "ingress.slash_command_received",
+                "slash_command": "/engram",
+            },
+            {
+                "timestamp": "2026-04-24T11:05:00Z",
+                "event": "ingress.slash_command_received",
+                "slash_command": "/exclude-from-nightly",
+            },
+            {
+                "timestamp": "2026-04-24T11:10:00Z",
+                "event": "ingress.slash_command_received",
+                "slash_command": "/include-in-nightly",
+            },
+        ],
+    )
+
+    check = check_slack_slash_commands(cfg, now=lambda: now)
+
+    assert check.status == CheckStatus.PASS
+    assert check.details["verdict"] == "present"
+    assert check.details["observed_commands"] == [
+        "/engram",
+        "/exclude-from-nightly",
+        "/include-in-nightly",
+    ]
+
+
+def test_check_slack_slash_commands_warns_when_recent_logs_show_missing_signal(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    now = datetime.datetime(2026, 4, 24, 12, 0, tzinfo=datetime.UTC)
+    _write_bridge_log(
+        cfg.paths.log_dir,
+        log_date=now.date(),
+        rows=[
+            {
+                "timestamp": "2026-04-24T11:15:00Z",
+                "event": "slack.ui_error",
+                "message": "\"/engram\" is not a valid command.",
+            },
+        ],
+    )
+
+    check = check_slack_slash_commands(cfg, now=lambda: now)
+
+    assert check.status == CheckStatus.WARN
+    assert check.details["verdict"] == "missing"
+    assert "Upgrading an existing install" in check.message
+
+
+def test_check_slack_slash_commands_warns_when_recent_logs_are_inconclusive(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    now = datetime.datetime(2026, 4, 24, 12, 0, tzinfo=datetime.UTC)
+    _write_bridge_log(
+        cfg.paths.log_dir,
+        log_date=now.date(),
+        rows=[
+            {
+                "timestamp": "2026-04-24T11:00:00Z",
+                "event": "ingress.slash_command_received",
+                "slash_command": "/engram",
+            },
+        ],
+    )
+
+    check = check_slack_slash_commands(cfg, now=lambda: now)
+
+    assert check.status == CheckStatus.WARN
+    assert check.details["verdict"] == "unknown"
+    assert "should autocomplete" in check.message
 
 
 def test_check_anthropic_api_key_validates_messages_api(tmp_path: Path) -> None:
@@ -269,6 +372,11 @@ def test_doctor_cli_json_against_tmp_config(
                     "api_key": "sk-ant-test",
                     "model": "claude-test-model",
                 },
+                "paths": {
+                    "state_dir": str(home / "state"),
+                    "contexts_dir": str(home / "contexts"),
+                    "log_dir": str(logs),
+                },
             }
         ),
         encoding="utf-8",
@@ -297,6 +405,27 @@ def test_doctor_cli_json_against_tmp_config(
         lambda: {"in_use": 42, "soft_limit": 256, "hard_limit": 1024},
     )
     monkeypatch.setattr("engram.doctor.read_latest_fd_snapshot", lambda _path: None)
+    _write_bridge_log(
+        logs,
+        log_date=datetime.datetime.now(datetime.UTC).date(),
+        rows=[
+            {
+                "timestamp": datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
+                "event": "ingress.slash_command_received",
+                "slash_command": "/engram",
+            },
+            {
+                "timestamp": datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
+                "event": "ingress.slash_command_received",
+                "slash_command": "/exclude-from-nightly",
+            },
+            {
+                "timestamp": datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
+                "event": "ingress.slash_command_received",
+                "slash_command": "/include-in-nightly",
+            },
+        ],
+    )
 
     def post_json(url: str, **_kwargs) -> HttpResult:
         if "slack.com" in url:
@@ -311,8 +440,8 @@ def test_doctor_cli_json_against_tmp_config(
     payload = json.loads(result.output)
     assert payload["schema_version"] == 1
     assert payload["summary"] == {
-        "total": 16,
-        "passed": 16,
+        "total": 17,
+        "passed": 17,
         "warnings": 0,
         "failed": 0,
         "exit_code": 0,
@@ -327,6 +456,7 @@ def test_doctor_cli_json_against_tmp_config(
         "owner_user_id",
         "slack_bot_token",
         "slack_app_token",
+        "slack_slash_commands",
         "anthropic_api_key",
         "gemini_api_key",
         "launchd_bridge",

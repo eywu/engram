@@ -1,6 +1,7 @@
 """Pre-flight diagnostics for an Engram installation."""
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import shutil
@@ -29,6 +30,17 @@ GEMINI_EMBED_URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent?key={api_key}"
 )
 MIN_MEMORY_DB_FREE_BYTES = 1_000_000_000
+SLACK_SLASH_COMMANDS = (
+    "/engram",
+    "/exclude-from-nightly",
+    "/include-in-nightly",
+)
+SLACK_SLASH_COMMAND_MISSING_PATTERNS = (
+    "not a valid command",
+    "isn't a valid command",
+    "unknown slash command",
+)
+SLACK_SLASH_COMMAND_LOG_WINDOW = datetime.timedelta(hours=24)
 
 
 class CheckStatus(StrEnum):
@@ -123,6 +135,7 @@ def run_doctor(config_path: Path | None = None) -> DoctorReport:
             expected_team_id=_configured_slack_team_id(path),
         ),
         check_slack_app_token(config),
+        check_slack_slash_commands(config, log_dir=log_dir),
         check_anthropic_api_key(config),
         check_gemini_api_key(config),
         check_launchd_job(
@@ -438,6 +451,83 @@ def check_slack_app_token(config: EngramConfig | None) -> DoctorCheck:
         status=CheckStatus.FAIL,
         message="Slack app token must start with xapp- for Socket Mode.",
         details={"prefix": token[:5]},
+    )
+
+
+def check_slack_slash_commands(
+    config: EngramConfig | None,
+    *,
+    log_dir: Path | None = None,
+    now: Callable[[], datetime.datetime] | None = None,
+) -> DoctorCheck:
+    details: dict[str, Any] = {
+        "required_commands": list(SLACK_SLASH_COMMANDS),
+        "window_hours": int(SLACK_SLASH_COMMAND_LOG_WINDOW.total_seconds() // 3600),
+    }
+    if config is None:
+        return DoctorCheck(
+            id="slack_slash_commands",
+            name="Slack slash commands",
+            status=CheckStatus.WARN,
+            message="Slack slash-command check skipped because config did not load.",
+            details=details | {"verdict": "unknown", "reason": "config_unavailable"},
+        )
+
+    if not _optional_str(config.slack.bot_token):
+        return DoctorCheck(
+            id="slack_slash_commands",
+            name="Slack slash commands",
+            status=CheckStatus.WARN,
+            message="Slack slash-command check skipped because the bot token is unavailable.",
+            details=details | {"verdict": "unknown", "reason": "missing_bot_token"},
+        )
+
+    clock = now or (lambda: datetime.datetime.now(datetime.UTC))
+    window_end = clock()
+    if window_end.tzinfo is None:
+        window_end = window_end.replace(tzinfo=datetime.UTC)
+    cutoff = window_end - SLACK_SLASH_COMMAND_LOG_WINDOW
+    path = (log_dir or config.paths.log_dir).expanduser()
+    evidence = _collect_slack_slash_command_evidence(
+        path,
+        cutoff=cutoff,
+        window_end=window_end,
+    )
+    details |= {
+        "verdict": evidence["verdict"],
+        "log_dir": str(path),
+        "log_files": evidence["log_files"],
+        "observed_commands": evidence["observed_commands"],
+        "missing_signals": evidence["missing_signals"],
+    }
+    if evidence["verdict"] == "present":
+        return DoctorCheck(
+            id="slack_slash_commands",
+            name="Slack slash commands",
+            status=CheckStatus.PASS,
+            message="Recent bridge logs show all three slash commands reaching Engram.",
+            details=details,
+        )
+    if evidence["verdict"] == "missing":
+        return DoctorCheck(
+            id="slack_slash_commands",
+            name="Slack slash commands",
+            status=CheckStatus.WARN,
+            message=(
+                "Recent bridge logs suggest Slack slash commands are missing. "
+                "See the 'Upgrading an existing install' section in docs/INSTALL.md."
+            ),
+            details=details,
+        )
+    return DoctorCheck(
+        id="slack_slash_commands",
+        name="Slack slash commands",
+        status=CheckStatus.WARN,
+        message=(
+            "No recent bridge evidence confirmed all slash commands. "
+            "Type `/engram` in Slack; it should autocomplete."
+        ),
+        details=details,
     )
 
 
@@ -899,6 +989,69 @@ def _find_launchd_row(output: str, label: str) -> tuple[str, str] | None:
     return None
 
 
+def _collect_slack_slash_command_evidence(
+    log_dir: Path,
+    *,
+    cutoff: datetime.datetime,
+    window_end: datetime.datetime,
+) -> dict[str, Any]:
+    observed_commands: set[str] = set()
+    missing_signals: list[str] = []
+    log_files = [str(path) for path in _recent_engram_log_paths(log_dir, cutoff=cutoff, window_end=window_end)]
+    for path_str in log_files:
+        path = Path(path_str)
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            payload = _parse_json_payload(line)
+            timestamp = _parse_doctor_log_timestamp(payload.get("timestamp"))
+            if timestamp is None or timestamp < cutoff or timestamp > window_end:
+                continue
+            slash_command = _optional_str(payload.get("slash_command"))
+            if slash_command in SLACK_SLASH_COMMANDS:
+                observed_commands.add(slash_command)
+            haystack = json.dumps(payload, sort_keys=True).lower()
+            for pattern in SLACK_SLASH_COMMAND_MISSING_PATTERNS:
+                if pattern in haystack and pattern not in missing_signals:
+                    missing_signals.append(pattern)
+
+    if missing_signals:
+        verdict = "missing"
+    elif set(SLACK_SLASH_COMMANDS).issubset(observed_commands):
+        verdict = "present"
+    else:
+        verdict = "unknown"
+    return {
+        "verdict": verdict,
+        "log_files": log_files,
+        "observed_commands": sorted(observed_commands),
+        "missing_signals": missing_signals,
+    }
+
+
+def _recent_engram_log_paths(
+    log_dir: Path,
+    *,
+    cutoff: datetime.datetime,
+    window_end: datetime.datetime,
+) -> list[Path]:
+    if not log_dir.exists() or not log_dir.is_dir():
+        return []
+    paths: list[Path] = []
+    start_date = cutoff.date()
+    end_date = window_end.date()
+    for path in sorted(log_dir.glob("engram-*.jsonl")):
+        try:
+            file_date = datetime.date.fromisoformat(path.stem.removeprefix("engram-"))
+        except ValueError:
+            continue
+        if start_date <= file_date <= end_date:
+            paths.append(path)
+    return paths
+
+
 def _configured_slack_team_id(config_path: Path) -> str | None:
     for env_key in ("ENGRAM_SLACK_TEAM_ID", "SLACK_TEAM_ID"):
         if value := os.environ.get(env_key):
@@ -946,6 +1099,19 @@ def _parse_json_payload(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _parse_doctor_log_timestamp(value: object) -> datetime.datetime | None:
+    text = _optional_str(value)
+    if text is None:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=datetime.UTC)
+    return parsed.astimezone(datetime.UTC)
 
 
 def _optional_str(value: object) -> str | None:
