@@ -15,11 +15,12 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 from rich.console import Console
 from rich.table import Table
 
 from engram.config import EngramConfig
+from engram.runtime import fd_usage_snapshot, read_latest_fd_snapshot
 
 SLACK_AUTH_TEST_URL = "https://slack.com/api/auth.test"
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
@@ -132,6 +133,7 @@ def run_doctor(config_path: Path | None = None) -> DoctorReport:
             "launchd nightly job",
             "com.engram.v3.nightly",
         ),
+        check_fd_pressure(log_dir),
         check_disk_space(path.parent),
         check_log_dir_writable(log_dir),
     ]
@@ -664,6 +666,67 @@ def check_log_dir_writable(
     )
 
 
+def check_fd_pressure(
+    log_dir: Path | None = None,
+    *,
+    usage_reader: Callable[[], dict[str, int | None] | None] | None = None,
+    snapshot_reader: Callable[[Path], dict[str, Any] | None] | None = None,
+) -> DoctorCheck:
+    path = (log_dir or (Path.home() / ".engram" / "logs")).expanduser()
+    usage = (usage_reader or fd_usage_snapshot)()
+    snapshot = (snapshot_reader or read_latest_fd_snapshot)(path)
+    top_patterns = _top_fd_snapshot_patterns(snapshot)
+    details: dict[str, Any] = {"log_dir": str(path), "top_path_patterns": top_patterns}
+
+    if usage is None or usage.get("in_use") is None:
+        return DoctorCheck(
+            id="fd_pressure",
+            name="FD pressure",
+            status=CheckStatus.WARN,
+            message=_fd_pressure_message(
+                "FD usage is unavailable on this system.",
+                top_patterns,
+            ),
+            details=details,
+        )
+
+    in_use_raw = usage.get("in_use")
+    if in_use_raw is None:
+        return DoctorCheck(
+            id="fd_pressure",
+            name="FD pressure",
+            status=CheckStatus.WARN,
+            message=_fd_pressure_message(
+                "FD usage is unavailable on this system.",
+                top_patterns,
+            ),
+            details=details,
+        )
+
+    in_use = int(in_use_raw)
+    soft_limit = usage.get("soft_limit")
+    details |= usage
+    if in_use >= 200:
+        status = CheckStatus.FAIL
+        summary = f"{in_use} FDs in use; pressure is critical."
+    elif in_use >= 100:
+        status = CheckStatus.WARN
+        summary = f"{in_use} FDs in use; pressure is elevated."
+    else:
+        status = CheckStatus.PASS
+        summary = f"{in_use} FDs in use; pressure is normal."
+
+    if soft_limit is not None:
+        summary = f"{summary} Soft limit {soft_limit}."
+    return DoctorCheck(
+        id="fd_pressure",
+        name="FD pressure",
+        status=status,
+        message=_fd_pressure_message(summary, top_patterns),
+        details=details,
+    )
+
+
 def _check_binary_on_path(
     *,
     check_id: str,
@@ -839,3 +902,33 @@ def _free_bytes(usage: Any) -> int:
     if free is not None:
         return int(free)
     return int(usage[2])
+
+
+def _top_fd_snapshot_patterns(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(snapshot, dict):
+        return []
+    raw_patterns = snapshot.get("by_path_pattern")
+    if not isinstance(raw_patterns, dict):
+        return []
+    patterns: list[dict[str, Any]] = []
+    for name, count in raw_patterns.items():
+        if not isinstance(name, str):
+            continue
+        try:
+            value = int(count)
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        patterns.append({"pattern": name, "count": value})
+    patterns.sort(key=lambda item: (item["pattern"] == "other", -item["count"], item["pattern"]))
+    return patterns[:3]
+
+
+def _fd_pressure_message(summary: str, top_patterns: list[dict[str, Any]]) -> str:
+    if not top_patterns:
+        return summary
+    rendered = ", ".join(
+        f"{item['pattern']}={item['count']}" for item in top_patterns
+    )
+    return f"{summary} Top snapshot patterns: {rendered}."

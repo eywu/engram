@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-import yaml
+import yaml  # type: ignore[import-untyped]
 from typer.testing import CliRunner
 
 from engram.cli import app
@@ -290,8 +290,8 @@ def test_doctor_cli_json_against_tmp_config(
     payload = json.loads(result.output)
     assert payload["schema_version"] == 1
     assert payload["summary"] == {
-        "total": 13,
-        "passed": 13,
+        "total": 14,
+        "passed": 14,
         "warnings": 0,
         "failed": 0,
         "exit_code": 0,
@@ -308,6 +308,7 @@ def test_doctor_cli_json_against_tmp_config(
         "gemini_api_key",
         "launchd_bridge",
         "launchd_nightly",
+        "fd_pressure",
         "memory_db_disk_space",
         "log_dir_writable",
     ]

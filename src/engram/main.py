@@ -9,6 +9,10 @@ import contextlib
 import logging
 import signal
 import sys
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
@@ -24,7 +28,7 @@ from engram.embeddings import EmbeddingQueue, GeminiEmbedder
 from engram.hitl import PendingQuestion
 from engram.ingress import register_listeners
 from engram.router import Router
-from engram.runtime import write_runtime_snapshot
+from engram.runtime import prune_fd_snapshot_files, write_fd_snapshot, write_runtime_snapshot
 from engram.telemetry import configure_logging
 
 READY_LOG_LINE = "engram.ready"  # stable string for health probes / test harnesses
@@ -33,6 +37,19 @@ _TIMEOUT_UPDATE_TASKS: set[asyncio.Task[None]] = set()
 
 def _configure_logging() -> None:
     configure_logging()
+
+
+@dataclass
+class _FdAlertTierState:
+    consecutive: int = 0
+    active: bool = False
+
+
+@dataclass
+class _RuntimeSnapshotLoopState:
+    warn: _FdAlertTierState = field(default_factory=_FdAlertTierState)
+    critical: _FdAlertTierState = field(default_factory=_FdAlertTierState)
+    next_fd_snapshot_at: float = 0.0
 
 
 async def _discover_template_vars(
@@ -63,10 +80,12 @@ async def _discover_template_vars(
             info = await app.client.conversations_info(
                 channel=owner_dm_channel_id
             )
-            user_id = info.get("channel", {}).get("user")
+            channel_info = info.get("channel")
+            user_id = channel_info.get("user") if isinstance(channel_info, dict) else None
             if user_id:
                 u = await app.client.users_info(user=user_id)
-                profile = u.get("user", {})
+                user_info = u.get("user")
+                profile = user_info if isinstance(user_info, dict) else {}
                 display = (
                     profile.get("real_name")
                     or profile.get("name")
@@ -118,6 +137,13 @@ async def run() -> int:
         project_root_path,
         config.owner_dm_channel_id or "(unset)",
     )
+    if config.observability.fd_snapshots_enabled:
+        try:
+            removed = prune_fd_snapshot_files(log_dir=config.paths.log_dir)
+        except Exception:
+            log.warning("engram.fd_snapshot_prune_failed", exc_info=True)
+        else:
+            log.info("engram.fd_snapshot_pruned removed=%s", removed)
 
     app = AsyncApp(token=config.slack.bot_token)
 
@@ -188,7 +214,7 @@ async def run() -> int:
             log.exception("Failed to post HITL question: %s", e)
             raise
 
-    agent._on_new_question = on_new_question_for_channel
+    agent._on_new_question = on_new_question_for_channel  # type: ignore[attr-defined]
     register_listeners(app, config, router, agent, cost_ledger=cost_ledger)
     idle_sweeper_task = router.start_idle_sweeper()
 
@@ -225,6 +251,9 @@ async def run() -> int:
             state_dir=config.paths.state_dir,
             router=router,
             cost_db=cost_ledger.db,
+            owner_alert=_owner_alert,
+            log_dir=config.paths.log_dir,
+            fd_snapshots_enabled=config.observability.fd_snapshots_enabled,
         ),
         name="engram-runtime-snapshot",
     )
@@ -271,26 +300,125 @@ async def _runtime_snapshot_loop(
     router: Router,
     cost_db,
     interval_seconds: float = 15.0,
+    owner_alert: Callable[[str], Awaitable[None]] | None = None,
+    log_dir: Path | None = None,
+    fd_snapshots_enabled: bool = True,
+    fd_snapshot_interval_seconds: float = 3600.0,
 ) -> None:
+    loop_log = logging.getLogger("engram.main")
+    state = _RuntimeSnapshotLoopState(
+        next_fd_snapshot_at=asyncio.get_running_loop().time()
+    )
     while True:
         await asyncio.sleep(interval_seconds)
         try:
-            await write_runtime_snapshot(
+            snapshot = await write_runtime_snapshot(
                 state_dir=state_dir,
                 router=router,
                 cost_db=cost_db,
             )
+            bridge = snapshot.get("bridge", {})
+            fd_usage = bridge.get("fds")
+            if isinstance(fd_usage, dict):
+                await _maybe_alert_on_fd_pressure(
+                    fd_usage,
+                    pid=bridge.get("pid"),
+                    owner_alert=owner_alert,
+                    state=state,
+                )
+            if fd_snapshots_enabled and log_dir is not None:
+                now = asyncio.get_running_loop().time()
+                if now >= state.next_fd_snapshot_at:
+                    try:
+                        write_fd_snapshot(log_dir=log_dir)
+                    except Exception:
+                        loop_log.warning("engram.fd_snapshot_write_failed", exc_info=True)
+                    finally:
+                        state.next_fd_snapshot_at = now + fd_snapshot_interval_seconds
         except Exception:
-            logging.getLogger("engram.main").warning(
+            loop_log.warning(
                 "engram.runtime_snapshot_failed",
                 exc_info=True,
             )
 
 
+async def _maybe_alert_on_fd_pressure(
+    fd_usage: dict[str, int | None],
+    *,
+    pid: object,
+    owner_alert: Callable[[str], Awaitable[None]] | None,
+    state: _RuntimeSnapshotLoopState,
+) -> None:
+    in_use = fd_usage.get("in_use")
+    if in_use is None:
+        return
+
+    warn_threshold, critical_threshold = _fd_pressure_thresholds(fd_usage.get("soft_limit"))
+    warn_ready = _update_fd_alert_tier(state.warn, in_use >= warn_threshold)
+    critical_ready = _update_fd_alert_tier(state.critical, in_use >= critical_threshold)
+    if critical_ready:
+        state.warn.active = True
+        state.warn.consecutive = max(state.warn.consecutive, 2)
+        message = _critical_fd_pressure_alert(in_use, fd_usage.get("soft_limit"))
+    elif warn_ready:
+        message = _warn_fd_pressure_alert(in_use, fd_usage.get("soft_limit"), pid)
+    else:
+        return
+
+    if owner_alert is None:
+        return
+    try:
+        await owner_alert(message)
+    except Exception:
+        logging.getLogger("engram.main").warning(
+            "engram.fd_pressure_alert_failed",
+            exc_info=True,
+        )
+
+
+def _fd_pressure_thresholds(soft_limit: int | None) -> tuple[int, int]:
+    if soft_limit is not None and 0 < soft_limit < 256:
+        return max(1, (soft_limit * 3 + 4) // 5), max(1, (soft_limit * 4 + 4) // 5)
+    return 150, 200
+
+
+def _update_fd_alert_tier(state: _FdAlertTierState, over_threshold: bool) -> bool:
+    if not over_threshold:
+        state.consecutive = 0
+        state.active = False
+        return False
+    state.consecutive += 1
+    if state.consecutive >= 2 and not state.active:
+        state.active = True
+        return True
+    return False
+
+
+def _warn_fd_pressure_alert(in_use: int, soft_limit: int | None, pid: object) -> str:
+    limit = soft_limit if soft_limit is not None else "unknown"
+    pid_text = pid if pid is not None else "PID"
+    return (
+        f"⚠️ Engram FD pressure: {in_use} / {limit} in use. "
+        "Monotonic growth may indicate a resource leak.\n"
+        f"Run `lsof -p {pid_text}` to inspect. "
+        "See GRO-481 for prior incident pattern."
+    )
+
+
+def _critical_fd_pressure_alert(in_use: int, soft_limit: int | None) -> str:
+    limit = soft_limit if soft_limit is not None else "unknown"
+    return (
+        f"🚨 Engram FD pressure CRITICAL: {in_use} / {limit} in use. "
+        "Bridge may soon fail to bootstrap new channels or reconnect to Slack.\n"
+        "Recommended: `launchctl kickstart -k gui/$(id -u)/com.engram.bridge` "
+        "to recover, then investigate."
+    )
+
+
 def _schedule_timeout_update(q: PendingQuestion, slack_client) -> None:
     """Update the Slack question if asyncio.wait_for cancels it on timeout."""
 
-    def update_if_timed_out(future: asyncio.Future[object]) -> None:
+    def update_if_timed_out(future: asyncio.Future[Any]) -> None:
         if not future.cancelled():
             return
         task = asyncio.create_task(update_question_timeout(q, slack_client))

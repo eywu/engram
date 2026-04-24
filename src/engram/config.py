@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 from dotenv import load_dotenv
 
 from engram.budget import BudgetConfig
@@ -184,6 +184,23 @@ def load_nightly_config(config_path: Path | None = None) -> NightlyConfig:
     return NightlyConfig.from_mapping(raw.get("nightly"))
 
 
+@dataclass(frozen=True)
+class ObservabilityConfig:
+    fd_snapshots_enabled: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "fd_snapshots_enabled",
+            _bool(self.fd_snapshots_enabled),
+        )
+
+    @classmethod
+    def from_mapping(cls, raw: dict | None) -> ObservabilityConfig:
+        raw = raw or {}
+        return cls(fd_snapshots_enabled=raw.get("fd_snapshots_enabled", True))
+
+
 @dataclass
 class EngramConfig:
     slack: SlackConfig
@@ -207,6 +224,8 @@ class EngramConfig:
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
     # M5: offline nightly memory jobs.
     nightly: NightlyConfig = field(default_factory=NightlyConfig)
+    # M5b: runtime observability toggles.
+    observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
 
     @classmethod
     def load(cls, config_path: Path | None = None) -> EngramConfig:
@@ -277,6 +296,7 @@ class EngramConfig:
             hitl=HITLConfig.from_mapping(raw.get("hitl")),
             embeddings=EmbeddingsConfig.from_mapping(raw.get("embeddings")),
             nightly=NightlyConfig.from_mapping(raw.get("nightly")),
+            observability=ObservabilityConfig.from_mapping(raw.get("observability")),
         )
 
     def ensure_dirs(self) -> None:

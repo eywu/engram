@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import resource
+import subprocess
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,7 @@ from engram.telemetry import write_json
 
 log = logging.getLogger(__name__)
 _FD_WARNING_THRESHOLD = 0.5
+_FD_SNAPSHOT_RETENTION_DAYS = 30
 _fd_warning_active = False
 
 
@@ -29,6 +32,10 @@ def health_path(state_dir: Path) -> Path:
 
 def status_path(state_dir: Path) -> Path:
     return state_dir / "status.json"
+
+
+def fd_snapshot_dir(log_dir: Path) -> Path:
+    return log_dir / "fd-snapshots"
 
 
 async def write_runtime_snapshot(
@@ -52,7 +59,7 @@ async def write_runtime_snapshot(
     for session in router.list_sessions():
         channels.append(await _channel_snapshot(session, cost_db))
 
-    snapshot = {
+    snapshot: dict[str, Any] = {
         "bridge": {"up": True, "pid": pid, "ts": now},
         "channels": channels,
         "memory": memory_tool_metrics(),
@@ -214,3 +221,145 @@ def _warn_if_fd_usage_high(fd_usage: dict[str, int | None]) -> None:
 
     if not over_threshold:
         _fd_warning_active = False
+
+
+def write_fd_snapshot(
+    *,
+    log_dir: Path,
+    pid: int | None = None,
+    now: datetime.datetime | None = None,
+    runner: Any = None,
+) -> dict[str, Any] | None:
+    snapshot_pid = pid or os.getpid()
+    timestamp = now or datetime.datetime.now(datetime.UTC)
+    run = runner or _run_lsof
+    try:
+        output = run(snapshot_pid)
+    except FileNotFoundError:
+        log.warning("runtime.fd_snapshot_unavailable reason=lsof_missing")
+        return None
+    except Exception:
+        log.warning("runtime.fd_snapshot_failed pid=%s", snapshot_pid, exc_info=True)
+        return None
+
+    total_fds, by_type, by_path_pattern = _parse_lsof_output(output)
+    record = {
+        "ts": _iso_utc(timestamp),
+        "pid": snapshot_pid,
+        "total_fds": total_fds,
+        "by_type": dict(by_type),
+        "by_path_pattern": dict(by_path_pattern),
+    }
+    target_dir = fd_snapshot_dir(log_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{timestamp:%Y-%m-%d}.jsonl"
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True))
+        handle.write("\n")
+    return record
+
+
+def prune_fd_snapshot_files(
+    *,
+    log_dir: Path,
+    now: datetime.datetime | None = None,
+    retention_days: int = _FD_SNAPSHOT_RETENTION_DAYS,
+) -> int:
+    removed = 0
+    cutoff_date = (now or datetime.datetime.now(datetime.UTC)).date() - datetime.timedelta(
+        days=retention_days
+    )
+    for path in fd_snapshot_dir(log_dir).glob("*.jsonl"):
+        file_date = _fd_snapshot_file_date(path)
+        if file_date is None or file_date >= cutoff_date:
+            continue
+        path.unlink(missing_ok=True)
+        removed += 1
+    return removed
+
+
+def read_latest_fd_snapshot(log_dir: Path) -> dict[str, Any] | None:
+    snapshot_dir = fd_snapshot_dir(log_dir)
+    if not snapshot_dir.exists():
+        return None
+    for path in sorted(snapshot_dir.glob("*.jsonl"), reverse=True):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                return payload
+    return None
+
+
+def _run_lsof(pid: int) -> str:
+    completed = subprocess.run(
+        ["lsof", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "lsof failed")
+    return completed.stdout
+
+
+def _parse_lsof_output(output: str) -> tuple[int, Counter[str], Counter[str]]:
+    by_type: Counter[str] = Counter()
+    by_path_pattern: Counter[str] = Counter()
+    total_fds = 0
+    for line in output.splitlines():
+        if not line or line.startswith("COMMAND"):
+            continue
+        parts = line.split(None, 8)
+        if len(parts) < 9:
+            continue
+        fd = parts[3]
+        if not fd or not fd[0].isdigit():
+            continue
+        fd_type = parts[4]
+        name = parts[8]
+        total_fds += 1
+        by_type[fd_type] += 1
+        by_path_pattern[_fd_path_pattern(fd_type, name)] += 1
+    if not by_path_pattern:
+        by_path_pattern["other"] = 0
+    return total_fds, by_type, by_path_pattern
+
+
+def _fd_path_pattern(fd_type: str, name: str) -> str:
+    normalized = name.lower()
+    basename = Path(name).name.lower() if "/" in name else name.lower()
+    if basename.endswith(".db"):
+        return basename
+    if basename.endswith(".jsonl") and "logs" in normalized:
+        return "*.jsonl (logs)"
+    if fd_type in {"IPv4", "IPv6"}:
+        for host in ("slack.com", "anthropic.com", "googleapis.com"):
+            if host in normalized:
+                return f"{host} TCP"
+    return "other"
+
+
+def _fd_snapshot_file_date(path: Path) -> datetime.date | None:
+    try:
+        return datetime.date.fromisoformat(path.stem)
+    except ValueError:
+        return None
+
+
+def _iso_utc(value: datetime.datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=datetime.UTC)
+    return value.astimezone(datetime.UTC).replace(microsecond=0).isoformat().replace(
+        "+00:00",
+        "Z",
+    )
