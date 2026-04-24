@@ -13,13 +13,13 @@ from engram.config import AnthropicConfig, EngramConfig, SlackConfig
 from engram.footguns import match_footgun
 from engram.hitl import PendingQuestion
 from engram.ingress import (
-    ACTION_ID_CHANNELS_PAGE,
-    ACTION_ID_NIGHTLY_TOGGLE,
-    ACTION_ID_TIER_PICK,
-    ACTION_ID_YOLO_DURATION,
+    CHANNELS_PAGE_ACTION_PATTERN,
     FOOTGUN_CONFIRM_OPEN_ACTION_ID,
     HITL_ACTION_ID_PATTERN,
+    NIGHTLY_TOGGLE_ACTION_PATTERN,
+    TIER_PICK_ACTION_PATTERN,
     UPGRADE_ACTION_ID_PATTERN,
+    YOLO_DURATION_ACTION_PATTERN,
     YOLO_EXTEND_ACTION_ID_PATTERN,
     YOLO_REVOKE_ACTION_ID_PATTERN,
     handle_block_action,
@@ -285,10 +285,10 @@ def test_register_listeners_attaches_hitl_action_handler():
     assert UPGRADE_ACTION_ID_PATTERN in patterns
     assert YOLO_EXTEND_ACTION_ID_PATTERN in patterns
     assert YOLO_REVOKE_ACTION_ID_PATTERN in patterns
-    assert ACTION_ID_TIER_PICK in patterns
-    assert ACTION_ID_YOLO_DURATION in patterns
-    assert ACTION_ID_NIGHTLY_TOGGLE in patterns
-    assert ACTION_ID_CHANNELS_PAGE in patterns
+    assert TIER_PICK_ACTION_PATTERN in patterns
+    assert YOLO_DURATION_ACTION_PATTERN in patterns
+    assert NIGHTLY_TOGGLE_ACTION_PATTERN in patterns
+    assert CHANNELS_PAGE_ACTION_PATTERN in patterns
     assert FOOTGUN_CONFIRM_OPEN_ACTION_ID in patterns
     assert HITL_ACTION_ID_PATTERN.match("hitl_choice_0")
     assert HITL_ACTION_ID_PATTERN.match("hitl_choice_4")
@@ -306,6 +306,14 @@ def test_register_listeners_attaches_hitl_action_handler():
     assert UPGRADE_ACTION_ID_PATTERN.match("upgrade_decision_deny")
     assert YOLO_EXTEND_ACTION_ID_PATTERN.match("yolo_extend_C07TEST123")
     assert YOLO_REVOKE_ACTION_ID_PATTERN.match("yolo_revoke_C07TEST123")
+    assert TIER_PICK_ACTION_PATTERN.match("engram_tier_pick")
+    assert TIER_PICK_ACTION_PATTERN.match("engram_tier_pick:trusted:C07TEST123")
+    assert YOLO_DURATION_ACTION_PATTERN.match("engram_yolo_duration")
+    assert YOLO_DURATION_ACTION_PATTERN.match("engram_yolo_duration:24:C07TEST123")
+    assert NIGHTLY_TOGGLE_ACTION_PATTERN.match("engram_nightly_toggle")
+    assert NIGHTLY_TOGGLE_ACTION_PATTERN.match("engram_nightly_toggle:exclude:C07TEST123")
+    assert CHANNELS_PAGE_ACTION_PATTERN.match("engram_channels_page")
+    assert CHANNELS_PAGE_ACTION_PATTERN.match("engram_channels_page:2")
     assert [command for command, _handler in app.commands] == [
         "/engram",
         "/exclude-from-nightly",

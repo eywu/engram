@@ -73,10 +73,26 @@ UPGRADE_ACTION_ID_PATTERN = re.compile(
 YOLO_EXTEND_ACTION_ID_PATTERN = re.compile(r"^yolo_extend_[A-Z0-9]+$")
 YOLO_REVOKE_ACTION_ID_PATTERN = re.compile(r"^yolo_revoke_[A-Z0-9]+$")
 FOOTGUN_CONFIRM_OPEN_ACTION_ID = "footgun_confirm_open"
-ACTION_ID_TIER_PICK = "engram_tier_pick"
-ACTION_ID_YOLO_DURATION = "engram_yolo_duration"
-ACTION_ID_NIGHTLY_TOGGLE = "engram_nightly_toggle"
-ACTION_ID_CHANNELS_PAGE = "engram_channels_page"
+ACTION_ID_TIER_PICK_PREFIX = "engram_tier_pick"
+ACTION_ID_TIER_PICK = ACTION_ID_TIER_PICK_PREFIX
+TIER_PICK_ACTION_PATTERN = re.compile(
+    rf"^{re.escape(ACTION_ID_TIER_PICK_PREFIX)}(?::.+)?$"
+)
+ACTION_ID_YOLO_DURATION_PREFIX = "engram_yolo_duration"
+ACTION_ID_YOLO_DURATION = ACTION_ID_YOLO_DURATION_PREFIX
+YOLO_DURATION_ACTION_PATTERN = re.compile(
+    rf"^{re.escape(ACTION_ID_YOLO_DURATION_PREFIX)}(?::.+)?$"
+)
+ACTION_ID_NIGHTLY_TOGGLE_PREFIX = "engram_nightly_toggle"
+ACTION_ID_NIGHTLY_TOGGLE = ACTION_ID_NIGHTLY_TOGGLE_PREFIX
+NIGHTLY_TOGGLE_ACTION_PATTERN = re.compile(
+    rf"^{re.escape(ACTION_ID_NIGHTLY_TOGGLE_PREFIX)}(?::.+)?$"
+)
+ACTION_ID_CHANNELS_PAGE_PREFIX = "engram_channels_page"
+ACTION_ID_CHANNELS_PAGE = ACTION_ID_CHANNELS_PAGE_PREFIX
+CHANNELS_PAGE_ACTION_PATTERN = re.compile(
+    rf"^{re.escape(ACTION_ID_CHANNELS_PAGE_PREFIX)}(?::.+)?$"
+)
 CHANNELS_DASHBOARD_PAGE_SIZE = 20
 CHANNELS_DASHBOARD_BLOCK_ID_PATTERN = re.compile(
     r"^engram_channels:(?P<page>\d+):(?P<kind>nav|channel:[A-Z0-9]+)$"
@@ -296,7 +312,7 @@ def register_listeners(
         _BACKGROUND_TASKS.add(task)
         task.add_done_callback(_BACKGROUND_TASKS.discard)
 
-    @app.action(ACTION_ID_TIER_PICK)
+    @app.action(TIER_PICK_ACTION_PATTERN)
     async def on_channels_tier_pick(ack, body, client, respond):
         await ack()
         try:
@@ -315,7 +331,7 @@ def register_listeners(
         except Exception:
             log.exception("ingress.channels_tier_pick_handler_failed")
 
-    @app.action(ACTION_ID_YOLO_DURATION)
+    @app.action(YOLO_DURATION_ACTION_PATTERN)
     async def on_channels_yolo_duration(ack, body, client, respond):
         await ack()
         try:
@@ -334,7 +350,7 @@ def register_listeners(
         except Exception:
             log.exception("ingress.channels_yolo_duration_handler_failed")
 
-    @app.action(ACTION_ID_NIGHTLY_TOGGLE)
+    @app.action(NIGHTLY_TOGGLE_ACTION_PATTERN)
     async def on_channels_nightly_toggle(ack, body, client, respond):
         await ack()
         try:
@@ -353,7 +369,7 @@ def register_listeners(
         except Exception:
             log.exception("ingress.channels_nightly_toggle_handler_failed")
 
-    @app.action(ACTION_ID_CHANNELS_PAGE)
+    @app.action(CHANNELS_PAGE_ACTION_PATTERN)
     async def on_channels_page(ack, body, client, respond):
         await ack()
         try:
@@ -1155,13 +1171,13 @@ async def handle_channels_dashboard_action(
     target_page = current_page
     notice: str | None = None
 
-    if action_id == ACTION_ID_CHANNELS_PAGE:
+    if CHANNELS_PAGE_ACTION_PATTERN.match(action_id):
         parsed_page = _decode_channels_page_value(str(action.get("value") or ""))
         if parsed_page is None:
             notice = "Could not change dashboard page."
         else:
             target_page = parsed_page
-    elif action_id == ACTION_ID_TIER_PICK:
+    elif TIER_PICK_ACTION_PATTERN.match(action_id):
         parsed = _decode_channels_dashboard_pair(str(action.get("value") or ""))
         if parsed is None:
             notice = "Could not change channel tier."
@@ -1195,7 +1211,7 @@ async def handle_channels_dashboard_action(
                     previous=previous,
                     updated=updated,
                 )
-    elif action_id == ACTION_ID_YOLO_DURATION:
+    elif YOLO_DURATION_ACTION_PATTERN.match(action_id):
         parsed = _decode_channels_dashboard_pair(str(action.get("value") or ""))
         if parsed is None:
             notice = "Could not extend YOLO."
@@ -1210,7 +1226,7 @@ async def handle_channels_dashboard_action(
             )
             if not result["ok"]:
                 notice = str(result["message"])
-    elif action_id == ACTION_ID_NIGHTLY_TOGGLE:
+    elif NIGHTLY_TOGGLE_ACTION_PATTERN.match(action_id):
         parsed = _decode_channels_dashboard_pair(str(action.get("value") or ""))
         if parsed is None:
             notice = "Could not change nightly inclusion."
@@ -1860,7 +1876,7 @@ async def handle_yolo_duration_action(
 
     action = actions[0]
     action_id = str(action.get("action_id") or "")
-    if action_id != ACTION_ID_YOLO_DURATION:
+    if not YOLO_DURATION_ACTION_PATTERN.match(action_id):
         return {"ok": False, "error": "unsupported action"}
 
     clicker_user_id = str(payload.get("user", {}).get("id") or "") or None
@@ -2331,7 +2347,7 @@ def _render_channels_dashboard(
             nav_elements.append(
                 _dashboard_button(
                     text="Previous",
-                    action_id=ACTION_ID_CHANNELS_PAGE,
+                    action_id=_channels_page_action_id(target_page=page_index - 1),
                     value=str(page_index - 1),
                 )
             )
@@ -2339,7 +2355,7 @@ def _render_channels_dashboard(
             nav_elements.append(
                 _dashboard_button(
                     text="Next",
-                    action_id=ACTION_ID_CHANNELS_PAGE,
+                    action_id=_channels_page_action_id(target_page=page_index + 1),
                     value=str(page_index + 1),
                 )
             )
@@ -2495,7 +2511,7 @@ def build_tier_picker_blocks(
                 current_tier=current_tier,
                 is_owner=is_owner,
             ),
-            action_id=ACTION_ID_TIER_PICK,
+            action_id=_tier_pick_action_id(tier=tier),
             value=f"{channel_id}|{tier.value}|{invoker_user_id or ''}",
             style=_tier_picker_button_style(
                 tier,
@@ -2604,7 +2620,10 @@ def _channels_dashboard_row_actions(
         buttons.append(
             _dashboard_button(
                 text="Upgrade",
-                action_id=ACTION_ID_TIER_PICK,
+                action_id=_tier_pick_action_id(
+                    tier=PermissionTier.OWNER_SCOPED,
+                    channel_id=channel_id,
+                ),
                 value=f"{channel_id}|{PermissionTier.OWNER_SCOPED.value}",
                 style="primary",
             )
@@ -2612,7 +2631,10 @@ def _channels_dashboard_row_actions(
         buttons.append(
             _dashboard_button(
                 text="Exclude from nightly ✓",
-                action_id=ACTION_ID_NIGHTLY_TOGGLE,
+                action_id=_nightly_toggle_action_id(
+                    mode="exclude",
+                    channel_id=channel_id,
+                ),
                 value=f"{channel_id}|exclude",
             )
         )
@@ -2623,14 +2645,20 @@ def _channels_dashboard_row_actions(
         buttons.append(
             _dashboard_button(
                 text="Downgrade",
-                action_id=ACTION_ID_TIER_PICK,
+                action_id=_tier_pick_action_id(
+                    tier=target_tier,
+                    channel_id=channel_id,
+                ),
                 value=f"{channel_id}|{target_tier.value}",
             )
         )
         buttons.append(
             _dashboard_button(
                 text="Extend YOLO",
-                action_id=ACTION_ID_TIER_PICK,
+                action_id=_tier_pick_action_id(
+                    tier=PermissionTier.YOLO,
+                    channel_id=channel_id,
+                ),
                 value=f"{channel_id}|{PermissionTier.YOLO.value}",
             )
         )
@@ -2638,7 +2666,10 @@ def _channels_dashboard_row_actions(
         buttons.append(
             _dashboard_button(
                 text="Upgrade to YOLO",
-                action_id=ACTION_ID_TIER_PICK,
+                action_id=_tier_pick_action_id(
+                    tier=PermissionTier.YOLO,
+                    channel_id=channel_id,
+                ),
                 value=f"{channel_id}|{PermissionTier.YOLO.value}",
                 style="primary",
             )
@@ -2646,7 +2677,10 @@ def _channels_dashboard_row_actions(
         buttons.append(
             _dashboard_button(
                 text="Downgrade to Safe",
-                action_id=ACTION_ID_TIER_PICK,
+                action_id=_tier_pick_action_id(
+                    tier=PermissionTier.TASK_ASSISTANT,
+                    channel_id=channel_id,
+                ),
                 value=f"{channel_id}|{PermissionTier.TASK_ASSISTANT.value}",
             )
         )
@@ -2655,7 +2689,10 @@ def _channels_dashboard_row_actions(
     buttons.append(
         _dashboard_button(
             text="Include in nightly" if include else "Exclude from nightly",
-            action_id=ACTION_ID_NIGHTLY_TOGGLE,
+            action_id=_nightly_toggle_action_id(
+                mode="include" if include else "exclude",
+                channel_id=channel_id,
+            ),
             value=f"{channel_id}|{'include' if include else 'exclude'}",
         )
     )
@@ -2678,6 +2715,28 @@ def _dashboard_button(
     if style is not None:
         payload["style"] = style
     return payload
+
+
+def _tier_pick_action_id(
+    *,
+    tier: PermissionTier,
+    channel_id: str | None = None,
+) -> str:
+    if channel_id:
+        return f"{ACTION_ID_TIER_PICK_PREFIX}:{tier.value}:{channel_id}"
+    return f"{ACTION_ID_TIER_PICK_PREFIX}:{tier.value}"
+
+
+def _yolo_duration_action_id(*, choice: str, channel_id: str) -> str:
+    return f"{ACTION_ID_YOLO_DURATION_PREFIX}:{choice}:{channel_id}"
+
+
+def _nightly_toggle_action_id(*, mode: str, channel_id: str) -> str:
+    return f"{ACTION_ID_NIGHTLY_TOGGLE_PREFIX}:{mode}:{channel_id}"
+
+
+def _channels_page_action_id(*, target_page: int) -> str:
+    return f"{ACTION_ID_CHANNELS_PAGE_PREFIX}:{target_page}"
 
 
 def _channels_dashboard_block_id(*, page: int, channel_id: str | None) -> str:
@@ -3025,22 +3084,25 @@ def _render_yolo_duration_picker(
     buttons = [
         _dashboard_button(
             text="⏱️ 6h",
-            action_id=ACTION_ID_YOLO_DURATION,
+            action_id=_yolo_duration_action_id(choice="6", channel_id=channel_id),
             value=f"{channel_id}|6",
         ),
         _dashboard_button(
             text="⏱️ 24h",
-            action_id=ACTION_ID_YOLO_DURATION,
+            action_id=_yolo_duration_action_id(choice="24", channel_id=channel_id),
             value=f"{channel_id}|24",
         ),
         _dashboard_button(
             text="⏱️ 72h",
-            action_id=ACTION_ID_YOLO_DURATION,
+            action_id=_yolo_duration_action_id(choice="72", channel_id=channel_id),
             value=f"{channel_id}|72",
         ),
         _dashboard_button(
             text="✕ Cancel",
-            action_id=ACTION_ID_YOLO_DURATION,
+            action_id=_yolo_duration_action_id(
+                choice="cancel",
+                channel_id=channel_id,
+            ),
             value=f"{channel_id}|cancel",
         ),
     ]
