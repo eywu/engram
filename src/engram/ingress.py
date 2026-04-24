@@ -28,14 +28,20 @@ from engram.egress import (
     _suggestion_label,
     post_meta_eligibility_question,
     post_reply,
+    post_upgrade_request_dm,
+    post_upgrade_result_in_channel,
+    post_upgrade_waiting_message,
     update_question_resolved,
+    update_upgrade_request_dm,
 )
 from engram.hitl import PendingQuestion, _resolve_question
 from engram.manifest import (
     ChannelStatus,
     ManifestError,
+    PermissionTier,
     dump_manifest,
     load_manifest,
+    set_channel_permission_tier,
 )
 from engram.notifications import (
     PENDING_CHANNEL_ACTION_ID_PATTERN,
@@ -49,14 +55,33 @@ log = logging.getLogger(__name__)
 hitl_log = logging.getLogger("engram.hitl")
 _BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 HITL_ACTION_ID_PATTERN = re.compile(r"^hitl_choice_(?:\d+|always_\d+|deny)$")
+UPGRADE_ACTION_ID_PATTERN = re.compile(
+    r"^upgrade_decision_(approve_(?:permanent|30d|24h|6h)|deny)$"
+)
 CHANNEL_REF_PATTERN = re.compile(r"<#(?P<id>[A-Z0-9]+)(?:\|[^>]+)?>")
 CHANNEL_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]+$")
+_PENDING_UPGRADE_REQUESTS: dict[str, PendingUpgradeRequest] = {}
+_PENDING_UPGRADE_REQUESTS_BY_CHANNEL: dict[str, str] = {}
 
 
 @dataclass(frozen=True)
 class MetaEligibilityCommand:
     eligible: bool
     target: str | None
+
+
+@dataclass(frozen=True)
+class PendingUpgradeRequest:
+    request_id: str
+    source_channel_id: str
+    source_channel_label: str
+    source_message_ts: str
+    owner_dm_channel_id: str
+    owner_dm_message_ts: str
+    requested_by_user_id: str | None
+    from_tier: PermissionTier
+    to_tier: PermissionTier
+    reason: str | None
 
 
 def register_listeners(
@@ -103,6 +128,46 @@ def register_listeners(
         task = asyncio.create_task(_run())
         _BACKGROUND_TASKS.add(task)
         task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    @app.action(UPGRADE_ACTION_ID_PATTERN)
+    async def on_upgrade_action(ack, body, client):
+        await ack()
+
+        async def _run() -> None:
+            try:
+                result = await handle_upgrade_action(
+                    payload=body,
+                    router=router,
+                    slack_client=client,
+                    owner_user_id=config.owner_user_id,
+                )
+                if not result.get("ok"):
+                    log.warning(
+                        "ingress.upgrade_action_failed error=%s",
+                        result.get("error", "unknown"),
+                    )
+            except Exception:
+                log.exception("ingress.upgrade_action_handler_failed")
+
+        task = asyncio.create_task(_run())
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    @app.command("/engram")
+    async def on_engram(ack, body, client):
+        await ack()
+        try:
+            await handle_engram_command(
+                router=router,
+                config=config,
+                slack_client=client,
+                source_channel_id=str(body.get("channel_id") or ""),
+                source_channel_name=body.get("channel_name"),
+                user_id=body.get("user_id"),
+                command_text=body.get("text"),
+            )
+        except Exception:
+            log.exception("ingress.engram_command_failed")
 
     @app.command("/exclude-from-nightly")
     async def on_exclude_from_nightly(ack, body, client):
@@ -458,6 +523,289 @@ async def handle_meta_eligibility_command(
     return {"ok": True, "permission_request_id": q.permission_request_id}
 
 
+async def handle_engram_command(
+    *,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+    source_channel_id: str,
+    source_channel_name: str | None,
+    user_id: str | None,
+    command_text: str | None,
+) -> dict[str, object]:
+    parts = [part for part in str(command_text or "").split() if part]
+    if not parts:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text="Usage: /engram upgrade <tier> [reason...]",
+        )
+        return {"ok": False, "error": "missing subcommand"}
+
+    subcommand = parts[0].lower()
+    if subcommand != "upgrade":
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=f"Unknown /engram subcommand: {subcommand}",
+        )
+        return {"ok": False, "error": "unknown subcommand"}
+
+    if len(parts) < 2:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text="Usage: /engram upgrade <task-assistant|owner-scoped|yolo> [reason...]",
+        )
+        return {"ok": False, "error": "missing tier"}
+
+    try:
+        tier = PermissionTier(parts[1].lower())
+    except ValueError:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=f"Unknown tier: {parts[1]}",
+        )
+        return {"ok": False, "error": "unknown tier"}
+
+    reason = " ".join(parts[2:]).strip() or None
+    return await handle_upgrade_command(
+        router=router,
+        config=config,
+        slack_client=slack_client,
+        source_channel_id=source_channel_id,
+        source_channel_name=source_channel_name,
+        user_id=user_id,
+        requested_tier=tier,
+        reason=reason,
+    )
+
+
+async def handle_upgrade_command(
+    *,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+    source_channel_id: str,
+    source_channel_name: str | None,
+    user_id: str | None,
+    requested_tier: PermissionTier,
+    reason: str | None,
+) -> dict[str, object]:
+    if not source_channel_id:
+        return {"ok": False, "error": "missing source channel"}
+
+    owner_dm_channel_id = config.owner_dm_channel_id or router.owner_dm_channel_id
+    if not owner_dm_channel_id or not config.owner_user_id:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=(
+                "Permission upgrades are not configured yet. "
+                "Ask the operator to set owner_dm_channel_id and owner_user_id."
+            ),
+        )
+        return {"ok": False, "error": "owner approval config missing"}
+
+    session = await router.get(
+        source_channel_id,
+        channel_name=_channel_label_from_name(source_channel_name),
+        is_dm=source_channel_id.startswith("D"),
+    )
+    manifest = session.manifest
+    source_channel_label = (
+        _manifest_display_label(manifest)
+        if manifest is not None
+        else (_channel_label_from_name(source_channel_name) or source_channel_id)
+    )
+    from_tier = (
+        manifest.tier_effective()
+        if manifest is not None
+        else PermissionTier.TASK_ASSISTANT
+    )
+
+    await _supersede_pending_upgrade_for_channel(
+        source_channel_id=source_channel_id,
+        slack_client=slack_client,
+    )
+
+    source_message_ts = await post_upgrade_waiting_message(
+        slack_client,
+        channel_id=source_channel_id,
+    )
+    request_id = str(uuid.uuid4())
+    owner_dm_message_ts = await post_upgrade_request_dm(
+        slack_client,
+        owner_dm_channel_id=owner_dm_channel_id,
+        source_channel_id=source_channel_id,
+        source_channel_label=source_channel_label,
+        requested_by_user_id=user_id,
+        from_tier=from_tier,
+        to_tier=requested_tier,
+        reason=reason,
+        action_value=_encode_upgrade_action_value(
+            request_id=request_id,
+            channel_id=source_channel_id,
+        ),
+    )
+    request = PendingUpgradeRequest(
+        request_id=request_id,
+        source_channel_id=source_channel_id,
+        source_channel_label=source_channel_label,
+        source_message_ts=source_message_ts,
+        owner_dm_channel_id=owner_dm_channel_id,
+        owner_dm_message_ts=owner_dm_message_ts,
+        requested_by_user_id=user_id,
+        from_tier=from_tier,
+        to_tier=requested_tier,
+        reason=reason,
+    )
+    _PENDING_UPGRADE_REQUESTS[request_id] = request
+    _PENDING_UPGRADE_REQUESTS_BY_CHANNEL[source_channel_id] = request_id
+    log.info(
+        "permission.upgrade_requested",
+        extra={
+            "channel": source_channel_id,
+            "user": user_id,
+            "from_tier": from_tier.value,
+            "to_tier": requested_tier.value,
+            "reason": reason or "",
+        },
+    )
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "source_message_ts": source_message_ts,
+        "owner_dm_message_ts": owner_dm_message_ts,
+    }
+
+
+async def handle_upgrade_action(
+    *,
+    payload: dict[str, object],
+    router: Router,
+    slack_client,
+    owner_user_id: str | None,
+) -> dict[str, object]:
+    actions = payload.get("actions") or []
+    if not actions:
+        return {"ok": False, "error": "no actions"}
+
+    action = actions[0]
+    action_id = str(action.get("action_id") or "")
+    if not UPGRADE_ACTION_ID_PATTERN.match(action_id):
+        return {"ok": False, "error": "unsupported action"}
+
+    clicker_user_id = payload.get("user", {}).get("id")
+    if not owner_user_id:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=str(payload.get("channel", {}).get("id") or ""),
+            user_id=clicker_user_id,
+            text="Upgrade approvals are not configured.",
+        )
+        return {"ok": False, "error": "owner user is not configured"}
+    if clicker_user_id != owner_user_id:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=str(payload.get("channel", {}).get("id") or ""),
+            user_id=clicker_user_id,
+            text="Only the owner can approve upgrades.",
+        )
+        return {"ok": False, "error": "not owner"}
+
+    request_ref = _decode_upgrade_action_value(str(action.get("value") or ""))
+    if request_ref is None:
+        return {"ok": False, "error": "malformed value"}
+
+    request = _PENDING_UPGRADE_REQUESTS.get(request_ref["request_id"])
+    if request is None:
+        return {"ok": False, "error": "request not found"}
+    if request.owner_dm_channel_id != payload.get("channel", {}).get("id"):
+        return {"ok": False, "error": "wrong surface"}
+    if (
+        _PENDING_UPGRADE_REQUESTS_BY_CHANNEL.get(request.source_channel_id)
+        != request.request_id
+    ):
+        await update_upgrade_request_dm(
+            slack_client,
+            channel_id=request.owner_dm_channel_id,
+            message_ts=request.owner_dm_message_ts,
+            text="⚪ Superseded by newer request.",
+            detail="_Only the newest request in a channel stays actionable._",
+        )
+        _discard_pending_upgrade_request(request)
+        return {"ok": False, "error": "request superseded"}
+
+    if action_id == "upgrade_decision_deny":
+        log.info(
+            "permission.upgrade_denied",
+            extra={
+                "channel": request.source_channel_id,
+                "approver": clicker_user_id,
+            },
+        )
+        await post_upgrade_result_in_channel(
+            slack_client,
+            channel_id=request.source_channel_id,
+            message_ts=request.source_message_ts,
+            approved=False,
+        )
+        await update_upgrade_request_dm(
+            slack_client,
+            channel_id=request.owner_dm_channel_id,
+            message_ts=request.owner_dm_message_ts,
+            text=f"❌ Denied by <@{clicker_user_id}>.",
+            detail=f"*Channel:* {request.source_channel_label} ({request.source_channel_id})",
+        )
+        _discard_pending_upgrade_request(request)
+        return {"ok": True, "decision": "deny"}
+
+    duration = _upgrade_duration_from_action(action_id)
+    _previous, updated, _manifest_path, normalized_duration = set_channel_permission_tier(
+        request.source_channel_id,
+        request.to_tier,
+        duration=duration,
+        home=router.home,
+    )
+    router.replace_cached_manifest(updated)
+    log.info(
+        "permission.upgrade_granted",
+        extra={
+            "channel": request.source_channel_id,
+            "approver": clicker_user_id,
+            "duration": normalized_duration,
+        },
+    )
+    await post_upgrade_result_in_channel(
+        slack_client,
+        channel_id=request.source_channel_id,
+        message_ts=request.source_message_ts,
+        approved=True,
+        tier=request.to_tier,
+        approver_user_id=clicker_user_id,
+    )
+    await update_upgrade_request_dm(
+        slack_client,
+        channel_id=request.owner_dm_channel_id,
+        message_ts=request.owner_dm_message_ts,
+        text=f"✅ Approved by <@{clicker_user_id}>.",
+        detail=(
+            f"*Channel:* {request.source_channel_label} ({request.source_channel_id})"
+            f" • *Tier:* `{request.to_tier.value}`"
+            f" • *Duration:* `{normalized_duration}`"
+        ),
+    )
+    _discard_pending_upgrade_request(request)
+    return {"ok": True, "decision": "approve", "duration": normalized_duration}
+
+
 def parse_meta_eligibility_command(text: str) -> MetaEligibilityCommand | None:
     stripped = text.strip()
     if not stripped:
@@ -482,6 +830,95 @@ def parse_meta_eligibility_command(text: str) -> MetaEligibilityCommand | None:
                 _normalize_target_text(match.groupdict().get("target")),
             )
     return None
+
+
+async def _post_ephemeral_reply(
+    slack_client,
+    *,
+    channel_id: str,
+    user_id: str | None,
+    text: str,
+) -> None:
+    if not channel_id:
+        return
+    if user_id:
+        chat_post_ephemeral = getattr(slack_client, "chat_postEphemeral", None)
+        if chat_post_ephemeral is not None:
+            try:
+                await chat_post_ephemeral(
+                    channel=channel_id,
+                    user=user_id,
+                    text=text,
+                )
+                return
+            except Exception:
+                log.info(
+                    "ingress.ephemeral_reply_failed channel=%s user=%s",
+                    channel_id,
+                    user_id,
+                    exc_info=True,
+                )
+    await slack_client.chat_postMessage(channel=channel_id, text=text)
+
+
+def _encode_upgrade_action_value(*, request_id: str, channel_id: str) -> str:
+    return (
+        f'{{"channel_id":"{channel_id}","request_id":"{request_id}"}}'
+    )
+
+
+def _decode_upgrade_action_value(raw: str) -> dict[str, str] | None:
+    match = re.fullmatch(
+        r'\{"channel_id":"(?P<channel_id>[A-Z0-9]+)","request_id":"(?P<request_id>[^"]+)"\}',
+        raw,
+    )
+    if match is None:
+        return None
+    return {
+        "channel_id": match.group("channel_id"),
+        "request_id": match.group("request_id"),
+    }
+
+
+def _upgrade_duration_from_action(action_id: str) -> str:
+    if action_id == "upgrade_decision_approve_permanent":
+        return "permanent"
+    if action_id == "upgrade_decision_approve_30d":
+        return "30d"
+    if action_id == "upgrade_decision_approve_24h":
+        return "24h"
+    if action_id == "upgrade_decision_approve_6h":
+        return "6h"
+    raise ValueError(f"unsupported upgrade action {action_id}")
+
+
+async def _supersede_pending_upgrade_for_channel(
+    *,
+    source_channel_id: str,
+    slack_client,
+) -> None:
+    previous_request_id = _PENDING_UPGRADE_REQUESTS_BY_CHANNEL.get(source_channel_id)
+    if previous_request_id is None:
+        return
+    previous = _PENDING_UPGRADE_REQUESTS.get(previous_request_id)
+    if previous is None:
+        _PENDING_UPGRADE_REQUESTS_BY_CHANNEL.pop(source_channel_id, None)
+        return
+    await update_upgrade_request_dm(
+        slack_client,
+        channel_id=previous.owner_dm_channel_id,
+        message_ts=previous.owner_dm_message_ts,
+        text="⚪ Superseded by newer request.",
+        detail="_Only the newest request in a channel stays actionable._",
+    )
+    _discard_pending_upgrade_request(previous)
+
+
+def _discard_pending_upgrade_request(request: PendingUpgradeRequest) -> None:
+    _PENDING_UPGRADE_REQUESTS.pop(request.request_id, None)
+    current = _PENDING_UPGRADE_REQUESTS_BY_CHANNEL.get(request.source_channel_id)
+    if current == request.request_id:
+        _PENDING_UPGRADE_REQUESTS_BY_CHANNEL.pop(request.source_channel_id, None)
 
 
 def _normalize_target_text(raw: str | None) -> str | None:

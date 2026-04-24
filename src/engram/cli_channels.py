@@ -14,6 +14,7 @@ next restart, or when a channel hasn't been resolved yet this run.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import typer
@@ -25,8 +26,11 @@ from engram import paths
 from engram.manifest import (
     ChannelStatus,
     ManifestError,
+    PermissionTier,
     load_manifest,
+    set_channel_permission_tier,
     set_channel_status,
+    validate_upgrade_duration,
 )
 
 app = typer.Typer(
@@ -36,6 +40,7 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+log = logging.getLogger(__name__)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
@@ -217,6 +222,104 @@ def reset(
 ) -> None:
     """Reset a channel to PENDING; requires re-approval before bot responds."""
     _flip_status(channel_id, ChannelStatus.PENDING)
+
+
+@app.command("upgrade")
+def upgrade(
+    channel_id: str = typer.Argument(..., help="Slack channel ID."),
+    tier: str = typer.Argument(..., help="Target tier."),
+    until: str = typer.Option(
+        "permanent",
+        "--until",
+        help="Upgrade duration: 24h, 30d, or permanent.",
+    ),
+) -> None:
+    """Upgrade a channel tier immediately, bypassing the Slack approval flow."""
+    try:
+        target_tier = PermissionTier(tier.strip().lower())
+    except ValueError as exc:
+        rprint(f"[red]Unknown permission tier: {tier}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    try:
+        normalized_duration = validate_upgrade_duration(until)
+    except ValueError as exc:
+        rprint(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    manifest_path = paths.channel_manifest_path(channel_id)
+    if not manifest_path.exists():
+        rprint(f"[red]No manifest found for channel '{channel_id}'.[/red]")
+        rprint(f"  Expected at: {manifest_path}")
+        raise typer.Exit(code=1)
+
+    try:
+        previous, updated, _manifest_path, normalized_duration = (
+            set_channel_permission_tier(
+                channel_id,
+                target_tier,
+                duration=normalized_duration,
+            )
+        )
+    except ManifestError as exc:
+        rprint(f"[red]Failed to load manifest: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    if previous == updated:
+        rprint(
+            "[dim]Channel "
+            f"'{channel_id}' already has tier '{updated.permission_tier.value}' "
+            f"with duration '{normalized_duration}'.[/dim]"
+        )
+        return
+
+    log.info(
+        "permission.upgrade_granted",
+        extra={
+            "channel": channel_id,
+            "approver": "cli",
+            "duration": normalized_duration,
+        },
+    )
+    rprint(
+        f"[green]✓[/] [bold]{channel_id}[/bold]: "
+        f"{previous.permission_tier.value} → {updated.permission_tier.value} "
+        f"({normalized_duration})"
+    )
+    if updated.yolo_until is not None:
+        rprint(f"  expires: {updated.yolo_until.isoformat()}")
+        if updated.pre_yolo_tier is not None:
+            rprint(f"  restores_to: {updated.pre_yolo_tier.value}")
+    else:
+        rprint("  expires: permanent")
+    rprint(
+        "[dim]Note: already-cached sessions in the running bridge keep "
+        "their old tier until next restart.[/dim]"
+    )
+
+
+@app.command("tier")
+def tier(
+    channel_id: str = typer.Argument(..., help="Slack channel ID."),
+) -> None:
+    """Show a channel's current tier, YOLO status, and expiry."""
+    manifest_path = paths.channel_manifest_path(channel_id)
+    if not manifest_path.exists():
+        rprint(f"[red]No manifest found for '{channel_id}'.[/red]")
+        raise typer.Exit(code=1)
+
+    try:
+        manifest = load_manifest(manifest_path)
+    except ManifestError as exc:
+        rprint(f"[red]Failed to load manifest: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    expiry = manifest.yolo_until.isoformat() if manifest.yolo_until is not None else "none"
+    yolo_status = "active" if manifest.tier_effective() == PermissionTier.YOLO else "inactive"
+    rprint(f"[bold]{channel_id}[/bold]")
+    rprint(f"  tier:   {manifest.tier_effective().value}")
+    rprint(f"  yolo:   {yolo_status}")
+    rprint(f"  expiry: {expiry}")
 
 
 if __name__ == "__main__":

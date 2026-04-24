@@ -22,6 +22,8 @@ from engram.doctor import (
     check_gemini_api_key,
     check_launchd_job,
     check_log_dir_writable,
+    check_owner_dm_channel_id,
+    check_owner_user_id,
     check_python_version,
     check_slack_app_token,
     check_slack_bot_token,
@@ -44,6 +46,8 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "SLACK_TEAM_ID",
         "ANTHROPIC_API_KEY",
         "GEMINI_API_KEY",
+        "ENGRAM_OWNER_DM_CHANNEL_ID",
+        "ENGRAM_OWNER_USER_ID",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -118,6 +122,16 @@ def test_check_slack_bot_token_validates_team_id(tmp_path: Path) -> None:
 
     assert check.status == CheckStatus.PASS
     assert check.details["team_id"] == "T123"
+
+
+def test_owner_approval_checks_warn_when_missing(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+
+    owner_dm = check_owner_dm_channel_id(cfg)
+    owner_user = check_owner_user_id(cfg)
+
+    assert owner_dm.status == CheckStatus.WARN
+    assert owner_user.status == CheckStatus.WARN
 
 
 def test_check_slack_app_token_requires_xapp_prefix(tmp_path: Path) -> None:
@@ -249,6 +263,8 @@ def test_doctor_cli_json_against_tmp_config(
                     "app_token": "xapp-test",
                     "team_id": "T123",
                 },
+                "owner_dm_channel_id": "D07OWNER",
+                "owner_user_id": "U07OWNER",
                 "anthropic": {
                     "api_key": "sk-ant-test",
                     "model": "claude-test-model",
@@ -295,8 +311,8 @@ def test_doctor_cli_json_against_tmp_config(
     payload = json.loads(result.output)
     assert payload["schema_version"] == 1
     assert payload["summary"] == {
-        "total": 14,
-        "passed": 14,
+        "total": 16,
+        "passed": 16,
         "warnings": 0,
         "failed": 0,
         "exit_code": 0,
@@ -307,6 +323,8 @@ def test_doctor_cli_json_against_tmp_config(
         "python_version",
         "config_file",
         "config_load",
+        "owner_dm_channel_id",
+        "owner_user_id",
         "slack_bot_token",
         "slack_app_token",
         "anthropic_api_key",

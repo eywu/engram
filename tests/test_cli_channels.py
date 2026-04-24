@@ -15,6 +15,7 @@ from engram.cli_channels import app
 from engram.manifest import (
     ChannelStatus,
     IdentityTemplate,
+    PermissionTier,
     load_manifest,
 )
 from engram.paths import channel_manifest_path
@@ -161,3 +162,45 @@ def test_reset_flips_to_pending(cli, tmp_path: Path):
 
     m = load_manifest(channel_manifest_path("D07OWNER", tmp_path / ".engram"))
     assert m.status == ChannelStatus.PENDING
+
+
+def test_upgrade_sets_owner_scoped_tier(cli, tmp_path: Path):
+    from engram.bootstrap import provision_channel as pc
+
+    pc(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        home=tmp_path / ".engram",
+    )
+
+    result = cli.invoke(app, ["upgrade", "C07TEAM", "owner-scoped"])
+
+    assert result.exit_code == 0
+    assert "task-assistant" in result.output
+    assert "owner-scoped" in result.output
+    manifest = load_manifest(channel_manifest_path("C07TEAM", tmp_path / ".engram"))
+    assert manifest.permission_tier == PermissionTier.OWNER_SCOPED
+    assert manifest.yolo_until is None
+
+
+def test_upgrade_yolo_duration_and_tier_output(cli, tmp_path: Path):
+    from engram.bootstrap import provision_channel as pc
+
+    pc(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        home=tmp_path / ".engram",
+    )
+
+    upgrade_result = cli.invoke(app, ["upgrade", "C07TEAM", "yolo", "--until", "24h"])
+    tier_result = cli.invoke(app, ["tier", "C07TEAM"])
+
+    assert upgrade_result.exit_code == 0
+    manifest = load_manifest(channel_manifest_path("C07TEAM", tmp_path / ".engram"))
+    assert manifest.permission_tier == PermissionTier.YOLO
+    assert manifest.yolo_until is not None
+    assert manifest.pre_yolo_tier == PermissionTier.TASK_ASSISTANT
+    assert tier_result.exit_code == 0
+    assert "tier:   yolo" in tier_result.output
+    assert "yolo:   active" in tier_result.output
+    assert "expiry:" in tier_result.output

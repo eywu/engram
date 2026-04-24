@@ -251,6 +251,169 @@ async def post_meta_eligibility_question(
     return (response["ts"], response["ts"])
 
 
+async def post_upgrade_waiting_message(
+    slack_client,
+    *,
+    channel_id: str,
+) -> str:
+    text = "⏳ Permission upgrade requested — waiting for owner approval."
+    response = await slack_client.chat_postMessage(
+        channel=channel_id,
+        text=text,
+    )
+    return str(response["ts"])
+
+
+async def post_upgrade_request_dm(
+    slack_client,
+    *,
+    owner_dm_channel_id: str,
+    source_channel_id: str,
+    source_channel_label: str,
+    requested_by_user_id: str | None,
+    from_tier: PermissionTier,
+    to_tier: PermissionTier,
+    reason: str | None,
+    action_value: str,
+) -> str:
+    requested_by = (
+        f"<@{requested_by_user_id}>"
+        if requested_by_user_id
+        else "_unknown_"
+    )
+    reason_text = _escape_mrkdwn(reason) if reason else "_No reason provided._"
+    details = "\n".join(
+        [
+            "*Permission upgrade request*",
+            f"• *Channel:* {source_channel_label} ({source_channel_id})",
+            f"• *Requested by:* {requested_by}",
+            f"• *Current tier:* `{from_tier.value}`",
+            f"• *Requested tier:* `{to_tier.value}`",
+            f"• *Reason:* {reason_text}",
+        ]
+    )
+    if to_tier == PermissionTier.YOLO:
+        actions = [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Approve 24h"},
+                "value": action_value,
+                "action_id": "upgrade_decision_approve_24h",
+                "style": "primary",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Approve 6h"},
+                "value": action_value,
+                "action_id": "upgrade_decision_approve_6h",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Deny"},
+                "value": action_value,
+                "action_id": "upgrade_decision_deny",
+                "style": "danger",
+            },
+        ]
+    else:
+        actions = [
+            {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Approve until revoked",
+                },
+                "value": action_value,
+                "action_id": "upgrade_decision_approve_permanent",
+                "style": "primary",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Approve 30d"},
+                "value": action_value,
+                "action_id": "upgrade_decision_approve_30d",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Deny"},
+                "value": action_value,
+                "action_id": "upgrade_decision_deny",
+                "style": "danger",
+            },
+        ]
+
+    response = await slack_client.chat_postMessage(
+        channel=owner_dm_channel_id,
+        text="Permission upgrade request",
+        blocks=[
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": details},
+            },
+            {
+                "type": "actions",
+                "block_id": "upgrade_actions",
+                "elements": actions,
+            },
+        ],
+    )
+    return str(response["ts"])
+
+
+async def update_upgrade_request_dm(
+    slack_client,
+    *,
+    channel_id: str,
+    message_ts: str,
+    text: str,
+    detail: str | None = None,
+) -> None:
+    blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": text},
+        }
+    ]
+    if detail:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": detail}],
+            }
+        )
+    await slack_client.chat_update(
+        channel=channel_id,
+        ts=message_ts,
+        text=_notification_fallback(text),
+        blocks=blocks,
+    )
+
+
+async def post_upgrade_result_in_channel(
+    slack_client,
+    *,
+    channel_id: str,
+    message_ts: str,
+    approved: bool,
+    tier: PermissionTier | None = None,
+    approver_user_id: str | None = None,
+) -> None:
+    if approved:
+        approver = f"<@{approver_user_id}>" if approver_user_id else "_unknown_"
+        if tier is None:
+            raise ValueError("tier is required for approved upgrade results")
+        text = f"✅ Upgraded to {tier.value} by {approver}."
+    else:
+        text = "❌ Request denied."
+
+    await slack_client.chat_update(
+        channel=channel_id,
+        ts=message_ts,
+        text=text,
+        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
+    )
+
+
 async def update_question_resolved(
     q: PendingQuestion,
     answer_text: str,
@@ -388,6 +551,15 @@ def _is_sticky_eligible(tool_name: str, channel_manifest) -> bool:
     if tool_name.startswith("mcp__"):
         return False
     return tool_name not in _STICKY_INELIGIBLE_TOOLS
+
+
+def _escape_mrkdwn(text: str) -> str:
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
 
 
 def _chunk_text(text: str, limit: int) -> list[str]:

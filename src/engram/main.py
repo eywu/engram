@@ -39,6 +39,24 @@ def _configure_logging() -> None:
     configure_logging()
 
 
+def _validate_owner_approval_config(config: EngramConfig, log: logging.Logger) -> None:
+    if not config.owner_dm_channel_id:
+        log.warning("engram.owner_approval_config_missing field=owner_dm_channel_id")
+    elif not config.owner_dm_channel_id.startswith("D"):
+        log.warning(
+            "engram.owner_approval_config_invalid field=owner_dm_channel_id value=%s",
+            config.owner_dm_channel_id,
+        )
+
+    if not config.owner_user_id:
+        log.warning("engram.owner_approval_config_missing field=owner_user_id")
+    elif not config.owner_user_id.startswith("U"):
+        log.warning(
+            "engram.owner_approval_config_invalid field=owner_user_id value=%s",
+            config.owner_user_id,
+        )
+
+
 @dataclass
 class _FdAlertTierState:
     consecutive: int = 0
@@ -126,6 +144,7 @@ async def run() -> int:
         len(config.allowed_channels),
         config.paths.state_dir,
     )
+    _validate_owner_approval_config(config, log)
 
     # M2: seed the project-level inheritance layer (~/.engram/project/.claude/)
     # before the router resolves any channels. Idempotent — preserves operator

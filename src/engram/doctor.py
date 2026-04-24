@@ -116,6 +116,8 @@ def run_doctor(config_path: Path | None = None) -> DoctorReport:
         check_python_version(),
         check_config_file(path),
         config_check,
+        check_owner_dm_channel_id(config),
+        check_owner_user_id(config),
         check_slack_bot_token(
             config,
             expected_team_id=_configured_slack_team_id(path),
@@ -278,6 +280,66 @@ def check_config_loads(
             details={"path": str(path)},
         ),
         config,
+    )
+
+
+def check_owner_dm_channel_id(config: EngramConfig | None) -> DoctorCheck:
+    if config is None:
+        return _blocked_by_config("owner_dm_channel_id", "Owner DM channel")
+    channel_id = _optional_str(config.owner_dm_channel_id)
+    details = {"channel_id": channel_id}
+    if not channel_id:
+        return DoctorCheck(
+            id="owner_dm_channel_id",
+            name="Owner DM channel",
+            status=CheckStatus.WARN,
+            message="owner_dm_channel_id is unset; upgrade approvals cannot reach the owner DM.",
+            details=details,
+        )
+    if not channel_id.startswith("D"):
+        return DoctorCheck(
+            id="owner_dm_channel_id",
+            name="Owner DM channel",
+            status=CheckStatus.WARN,
+            message=f"owner_dm_channel_id={channel_id} does not look like a Slack DM channel ID.",
+            details=details,
+        )
+    return DoctorCheck(
+        id="owner_dm_channel_id",
+        name="Owner DM channel",
+        status=CheckStatus.PASS,
+        message=f"owner_dm_channel_id is configured as {channel_id}.",
+        details=details,
+    )
+
+
+def check_owner_user_id(config: EngramConfig | None) -> DoctorCheck:
+    if config is None:
+        return _blocked_by_config("owner_user_id", "Owner user ID")
+    user_id = _optional_str(config.owner_user_id)
+    details = {"user_id": user_id}
+    if not user_id:
+        return DoctorCheck(
+            id="owner_user_id",
+            name="Owner user ID",
+            status=CheckStatus.WARN,
+            message="owner_user_id is unset; upgrade approval buttons cannot verify the owner.",
+            details=details,
+        )
+    if not user_id.startswith("U"):
+        return DoctorCheck(
+            id="owner_user_id",
+            name="Owner user ID",
+            status=CheckStatus.WARN,
+            message=f"owner_user_id={user_id} does not look like a Slack user ID.",
+            details=details,
+        )
+    return DoctorCheck(
+        id="owner_user_id",
+        name="Owner user ID",
+        status=CheckStatus.PASS,
+        message=f"owner_user_id is configured as {user_id}.",
+        details=details,
     )
 
 

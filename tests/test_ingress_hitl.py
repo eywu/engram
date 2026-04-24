@@ -13,6 +13,7 @@ from engram.config import AnthropicConfig, EngramConfig, SlackConfig
 from engram.hitl import PendingQuestion
 from engram.ingress import (
     HITL_ACTION_ID_PATTERN,
+    UPGRADE_ACTION_ID_PATTERN,
     handle_block_action,
     handle_meta_eligibility_command,
     handle_thread_reply,
@@ -174,10 +175,11 @@ def test_register_listeners_attaches_hitl_action_handler():
 
     register_listeners(app, make_config(), Router(), agent=object())
 
-    assert len(app.actions) == 2
+    assert len(app.actions) == 3
     patterns = [pattern for pattern, _handler in app.actions]
     assert HITL_ACTION_ID_PATTERN in patterns
     assert PENDING_CHANNEL_ACTION_ID_PATTERN in patterns
+    assert UPGRADE_ACTION_ID_PATTERN in patterns
     assert HITL_ACTION_ID_PATTERN.match("hitl_choice_0")
     assert HITL_ACTION_ID_PATTERN.match("hitl_choice_4")
     assert HITL_ACTION_ID_PATTERN.match("hitl_choice_always_0")
@@ -187,7 +189,13 @@ def test_register_listeners_attaches_hitl_action_handler():
     assert PENDING_CHANNEL_ACTION_ID_PATTERN.match("pending_channel_approve")
     assert PENDING_CHANNEL_ACTION_ID_PATTERN.match("pending_channel_deny")
     assert PENDING_CHANNEL_ACTION_ID_PATTERN.match("pending_channel_view_manifest")
+    assert UPGRADE_ACTION_ID_PATTERN.match("upgrade_decision_approve_permanent")
+    assert UPGRADE_ACTION_ID_PATTERN.match("upgrade_decision_approve_30d")
+    assert UPGRADE_ACTION_ID_PATTERN.match("upgrade_decision_approve_24h")
+    assert UPGRADE_ACTION_ID_PATTERN.match("upgrade_decision_approve_6h")
+    assert UPGRADE_ACTION_ID_PATTERN.match("upgrade_decision_deny")
     assert [command for command, _handler in app.commands] == [
+        "/engram",
         "/exclude-from-nightly",
         "/include-in-nightly",
     ]

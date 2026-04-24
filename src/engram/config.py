@@ -216,6 +216,8 @@ class EngramConfig:
     # provision. Other DMs get task-assistant. Optional; if unset, every
     # DM is treated as task-assistant (safer default for first-run).
     owner_dm_channel_id: str | None = None
+    # Slack user ID authorized to approve permission upgrades.
+    owner_user_id: str | None = None
     # M3: monthly budget tracking / warning ladder.
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     # M4: human-in-the-loop defaults for permission prompts.
@@ -291,6 +293,10 @@ class EngramConfig:
             owner_dm_channel_id=(
                 raw.get("owner_dm_channel_id")
                 or os.environ.get("ENGRAM_OWNER_DM_CHANNEL_ID")
+            ),
+            owner_user_id=(
+                raw.get("owner_user_id")
+                or os.environ.get("ENGRAM_OWNER_USER_ID")
             ),
             budget=BudgetConfig.from_mapping(raw.get("budget")),
             hitl=HITLConfig.from_mapping(raw.get("hitl")),
