@@ -252,6 +252,10 @@ class Router:
         if session is not None:
             session.manifest = manifest
 
+    def cached_manifest(self, channel_id: str) -> ChannelManifest | None:
+        session = self._sessions.get(channel_id)
+        return session.manifest if session is not None else None
+
     async def invalidate(self, channel_id: str) -> bool:
         """Drop a cached session so the next ``get`` reloads it from disk."""
         session = self._sessions.get(channel_id)

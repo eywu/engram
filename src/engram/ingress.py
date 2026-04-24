@@ -24,12 +24,13 @@ from engram.agent import Agent
 from engram.config import EngramConfig
 from engram.costs import CostLedger, TurnCost
 from engram.egress import (
+    _always_allow_label,
     _suggestion_label,
     post_meta_eligibility_question,
     post_reply,
     update_question_resolved,
 )
-from engram.hitl import PendingQuestion
+from engram.hitl import PendingQuestion, _resolve_question
 from engram.manifest import (
     ChannelStatus,
     ManifestError,
@@ -47,7 +48,7 @@ from engram.router import Router
 log = logging.getLogger(__name__)
 hitl_log = logging.getLogger("engram.hitl")
 _BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
-HITL_ACTION_ID_PATTERN = re.compile(r"^hitl_choice_(?:\d+|deny)$")
+HITL_ACTION_ID_PATTERN = re.compile(r"^hitl_choice_(?:\d+|always_\d+|deny)$")
 CHANNEL_REF_PATTERN = re.compile(r"<#(?P<id>[A-Z0-9]+)(?:\|[^>]+)?>")
 CHANNEL_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]+$")
 
@@ -321,10 +322,12 @@ async def handle_block_action(payload: dict, router, slack_client) -> dict:
 
     action = actions[0]
     value = action.get("value", "")
-    if "|" not in value:
+    parts = value.split("|", 2)
+    if len(parts) < 2:
         return {"ok": False, "error": "malformed value"}
 
-    permission_request_id, choice_key = value.split("|", 1)
+    permission_request_id, choice_key = parts[0], parts[1]
+    tool_name = parts[2] if len(parts) == 3 else None
     q = router.hitl.get_by_id(permission_request_id)
     if q is None:
         return {"ok": False, "error": "question not found (may be resolved)"}
@@ -336,7 +339,13 @@ async def handle_block_action(payload: dict, router, slack_client) -> dict:
         return {"ok": False, "error": "not authorized"}
 
     task = asyncio.create_task(
-        _resolve_block_action(q, choice_key, router, slack_client)
+        _resolve_block_action(
+            q,
+            choice_key,
+            router,
+            slack_client,
+            tool_name=tool_name,
+        )
     )
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
@@ -554,25 +563,45 @@ async def _resolve_pending_channel_label(
     return name if str(name).startswith("#") else f"#{name}"
 
 
-async def _resolve_block_action(q, choice_key, router, slack_client) -> None:
+async def _resolve_block_action(
+    q,
+    choice_key,
+    router,
+    slack_client,
+    *,
+    tool_name: str | None = None,
+) -> None:
     try:
-        if choice_key == "deny":
-            result = PermissionResultDeny(message="user denied", interrupt=True)
+        if choice_key == "always":
+            result = _resolve_question(
+                q,
+                choice="always",
+                tool_name=tool_name or q.tool_name,
+                router=router,
+            )
+            answer_text = (
+                f"{_always_allow_label(tool_name or q.tool_name)} "
+                "(will not ask again in this channel)"
+            )
+        elif choice_key == "deny":
+            result = _resolve_question(q, choice="deny")
             answer_text = "Deny"
         else:
             try:
                 idx = int(choice_key)
                 suggestion = q.suggestions[idx]
-                result = PermissionResultAllow(
-                    updated_input=q.tool_input,
-                    updated_permissions=(
-                        [suggestion] if hasattr(suggestion, "to_dict") else None
-                    ),
+                result = _resolve_question(
+                    q,
+                    choice="allow",
+                    suggestion=suggestion,
                 )
-                answer_text = _suggestion_label(suggestion)
+                answer_text = _suggestion_label(
+                    suggestion,
+                    tool_name=q.tool_name,
+                )
             except (ValueError, IndexError):
-                result = PermissionResultAllow()
-                answer_text = "Allow"
+                result = _resolve_question(q, choice="allow")
+                answer_text = _suggestion_label(None, tool_name=q.tool_name)
 
         resolved = router.hitl.resolve(q.permission_request_id, result)
         if resolved:
@@ -586,7 +615,12 @@ async def _resolve_block_action(q, choice_key, router, slack_client) -> None:
             )
             if q.on_resolve is not None:
                 await q.on_resolve(result)
-        await update_question_resolved(q, answer_text, slack_client)
+        await update_question_resolved(
+            q,
+            answer_text,
+            slack_client,
+            allowed=isinstance(result, PermissionResultAllow),
+        )
     except Exception:
         log.exception("resolve_block_action failed")
 

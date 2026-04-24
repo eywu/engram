@@ -98,12 +98,17 @@ def make_question(
 
 
 def block_action_payload(value: str, *, user_id: str = "U123") -> dict:
-    choice_key = value.split("|", 1)[1] if "|" in value else "0"
+    parts = value.split("|")
+    if len(parts) > 1 and parts[1] == "always":
+        action_id = "hitl_choice_always_0"
+    else:
+        choice_key = parts[1] if len(parts) > 1 else "0"
+        action_id = f"hitl_choice_{choice_key}"
     return {
         "type": "block_actions",
         "actions": [
             {
-                "action_id": f"hitl_choice_{choice_key}",
+                "action_id": action_id,
                 "block_id": "hitl_actions",
                 "value": value,
             }
@@ -143,13 +148,19 @@ async def wait_until(predicate) -> None:
         await asyncio.sleep(0)
 
 
-def _write_channel_manifest(home, channel_id: str, *, meta_eligible: bool = True) -> None:
+def _write_channel_manifest(
+    home,
+    channel_id: str,
+    *,
+    meta_eligible: bool = True,
+    identity: IdentityTemplate = IdentityTemplate.TASK_ASSISTANT,
+) -> None:
     path = channel_manifest_path(channel_id, home)
     path.parent.mkdir(parents=True)
     dump_manifest(
         ChannelManifest(
             channel_id=channel_id,
-            identity=IdentityTemplate.TASK_ASSISTANT,
+            identity=identity,
             status=ChannelStatus.ACTIVE,
             label="#growth",
             meta_eligible=meta_eligible,
@@ -169,6 +180,7 @@ def test_register_listeners_attaches_hitl_action_handler():
     assert PENDING_CHANNEL_ACTION_ID_PATTERN in patterns
     assert HITL_ACTION_ID_PATTERN.match("hitl_choice_0")
     assert HITL_ACTION_ID_PATTERN.match("hitl_choice_4")
+    assert HITL_ACTION_ID_PATTERN.match("hitl_choice_always_0")
     assert HITL_ACTION_ID_PATTERN.match("hitl_choice_deny")
     assert not HITL_ACTION_ID_PATTERN.match("hitl_other_0")
     assert not HITL_ACTION_ID_PATTERN.match("hitl_choice_cancel")
@@ -349,6 +361,59 @@ async def test_block_action_deny_button():
     assert result.message == "user denied"
     assert result.interrupt is True
     assert slack.update_calls[0]["text"] == "Answered: Deny"
+    assert slack.update_calls[0]["blocks"][0]["text"]["text"] == "❌ Answered: Deny"
+
+
+@pytest.mark.asyncio
+async def test_block_action_always_allow_updates_manifest_and_logs(
+    tmp_path,
+    caplog,
+):
+    home = tmp_path / ".engram"
+    _write_channel_manifest(
+        home,
+        "D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+    )
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+    q = make_question(channel_id="D07OWNER")
+    q.tool_name = "WebFetch"
+    router.hitl.register(q)
+
+    with caplog.at_level(logging.INFO, logger="engram.hitl"):
+        ack = await handle_block_action(
+            block_action_payload("prq-1|always|WebFetch"),
+            router,
+            slack,
+        )
+        await wait_until(lambda: q.future.done() and len(slack.update_calls) == 1)
+
+    assert ack == {"ok": True}
+    result = q.future.result()
+    assert isinstance(result, PermissionResultAllow)
+    assert result.updated_permissions is not None
+    update = result.updated_permissions[0]
+    assert update.type == "addRules"
+    assert update.rules is not None
+    assert update.rules[0].tool_name == "WebFetch"
+    manifest = load_manifest(channel_manifest_path("D07OWNER", home))
+    assert manifest.permissions.allow == ["WebFetch"]
+    assert slack.update_calls[0]["text"] == (
+        "Answered: Always allow fetch (will not ask again in this channel)"
+    )
+    assert slack.update_calls[0]["blocks"][0]["text"]["text"] == (
+        "✅ Answered: Always allow fetch (will not ask again in this channel)"
+    )
+    always_records = [
+        record
+        for record in caplog.records
+        if record.name == "engram.hitl"
+        and record.getMessage() == "hitl.always_allow_granted"
+    ]
+    assert len(always_records) == 1
+    assert always_records[0].tool == "WebFetch"
+    assert always_records[0].channel == "D07OWNER"
 
 
 @pytest.mark.asyncio

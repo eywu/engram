@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
@@ -10,7 +11,16 @@ from engram.hitl import (
     HITLRateLimiter,
     HITLRegistry,
     PendingQuestion,
+    _resolve_question,
 )
+from engram.manifest import (
+    ChannelManifest,
+    ChannelStatus,
+    IdentityTemplate,
+    dump_manifest,
+    load_manifest,
+)
+from engram.paths import channel_manifest_path
 
 # NOTE: build_permission_request_hook was removed in GRO-432 (M4.5).
 # Its tests (output-shape probes + hook-based integration tests) were
@@ -37,6 +47,21 @@ def make_question(
         posted_at=datetime(2026, 4, 21, tzinfo=UTC),
         timeout_s=300,
     )
+
+
+def _write_owner_dm_manifest(home: Path, channel_id: str = "D07OWNER") -> Path:
+    path = channel_manifest_path(channel_id, home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dump_manifest(
+        ChannelManifest(
+            channel_id=channel_id,
+            identity=IdentityTemplate.OWNER_DM_FULL,
+            status=ChannelStatus.ACTIVE,
+            label="DM",
+        ),
+        path,
+    )
+    return path
 
 
 def test_registry_register_and_get():
@@ -154,4 +179,54 @@ def test_limiter_midnight_reset():
     assert limiter.check("C07TEST123", now=day_one)[0] is False
     assert limiter.check("C07TEST123", now=day_two) == (True, "")
 
+
+def test_resolve_question_always_persists_allow_rule_and_returns_session_update(
+    tmp_path: Path,
+):
+    home = tmp_path / ".engram"
+    manifest_path = _write_owner_dm_manifest(home)
+    q = make_question(channel_id="D07OWNER")
+    q.tool_name = "WebFetch"
+
+    result = _resolve_question(
+        q,
+        choice="always",
+        tool_name="WebFetch",
+        home=home,
+    )
+
+    assert isinstance(result, PermissionResultAllow)
+    assert result.updated_input == q.tool_input
+    assert result.updated_permissions is not None
+    update = result.updated_permissions[0]
+    assert update.type == "addRules"
+    assert update.behavior == "allow"
+    assert update.destination == "session"
+    assert update.rules is not None
+    assert update.rules[0].tool_name == "WebFetch"
+    assert load_manifest(manifest_path).permissions.allow == ["WebFetch"]
+
+
+def test_resolve_question_always_is_idempotent_on_second_click(tmp_path: Path):
+    home = tmp_path / ".engram"
+    manifest_path = _write_owner_dm_manifest(home)
+    q = make_question(channel_id="D07OWNER")
+    q.tool_name = "WebFetch"
+
+    first = _resolve_question(
+        q,
+        choice="always",
+        tool_name="WebFetch",
+        home=home,
+    )
+    second = _resolve_question(
+        q,
+        choice="always",
+        tool_name="WebFetch",
+        home=home,
+    )
+
+    assert isinstance(first, PermissionResultAllow)
+    assert isinstance(second, PermissionResultAllow)
+    assert load_manifest(manifest_path).permissions.allow == ["WebFetch"]
 

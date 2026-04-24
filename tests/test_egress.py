@@ -19,6 +19,7 @@ from engram.egress import (
     update_question_timeout,
 )
 from engram.hitl import PendingQuestion
+from engram.manifest import ChannelManifest, IdentityTemplate
 
 
 class FakeSlackClient:
@@ -36,13 +37,18 @@ class FakeSlackClient:
         return {"ok": True}
 
 
-def make_question(*, suggestions=None) -> PendingQuestion:
+def make_question(
+    *,
+    suggestions=None,
+    tool_name: str = "Bash",
+    channel_manifest=None,
+) -> PendingQuestion:
     return PendingQuestion(
         permission_request_id="prq-1",
         channel_id="C07TEST123",
         session_id="session-1",
         turn_id="turn-1",
-        tool_name="Bash",
+        tool_name=tool_name,
         tool_input={"cmd": "pytest", "timeout": 30},
         suggestions=list(suggestions or []),
         who_can_answer=None,
@@ -50,6 +56,21 @@ def make_question(*, suggestions=None) -> PendingQuestion:
         timeout_s=300,
         slack_channel_ts="1713800000.000100",
         slack_thread_ts="1713800000.000100",
+        channel_manifest=channel_manifest,
+    )
+
+
+def owner_dm_manifest() -> ChannelManifest:
+    return ChannelManifest(
+        channel_id="D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+    )
+
+
+def team_manifest() -> ChannelManifest:
+    return ChannelManifest(
+        channel_id="C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
     )
 
 
@@ -345,6 +366,66 @@ async def test_post_question_deny_button_has_danger_style():
 
 
 @pytest.mark.asyncio
+async def test_post_question_renders_sticky_button_for_owner_dm_webfetch():
+    slack = FakeSlackClient()
+    q = make_question(
+        suggestions=[],
+        tool_name="WebFetch",
+        channel_manifest=owner_dm_manifest(),
+    )
+
+    await post_question(q, slack)
+
+    elements = slack.post_calls[0]["blocks"][2]["elements"]
+    assert [element["text"]["text"] for element in elements] == [
+        "Allow fetch",
+        "Always allow fetch",
+        "Deny",
+    ]
+    assert elements[0]["style"] == "primary"
+    assert "style" not in elements[1]
+    assert elements[1]["action_id"] == "hitl_choice_always_0"
+    assert elements[1]["value"] == "prq-1|always|WebFetch"
+    assert elements[2]["style"] == "danger"
+
+
+@pytest.mark.asyncio
+async def test_post_question_bash_keeps_two_button_layout():
+    slack = FakeSlackClient()
+    q = make_question(
+        suggestions=[],
+        tool_name="Bash",
+        channel_manifest=owner_dm_manifest(),
+    )
+
+    await post_question(q, slack)
+
+    elements = slack.post_calls[0]["blocks"][2]["elements"]
+    assert [element["text"]["text"] for element in elements] == [
+        "Allow shell command",
+        "Deny",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_post_question_team_channel_webfetch_keeps_two_button_layout():
+    slack = FakeSlackClient()
+    q = make_question(
+        suggestions=[],
+        tool_name="WebFetch",
+        channel_manifest=team_manifest(),
+    )
+
+    await post_question(q, slack)
+
+    elements = slack.post_calls[0]["blocks"][2]["elements"]
+    assert [element["text"]["text"] for element in elements] == [
+        "Allow fetch",
+        "Deny",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_update_question_resolved_strips_buttons():
     slack = FakeSlackClient()
     q = make_question()
@@ -357,7 +438,7 @@ async def test_update_question_resolved_strips_buttons():
     assert call["ts"] == "1713800000.000100"
     assert call["text"] == "Answered: approved"
     assert all(block["type"] != "actions" for block in call["blocks"])
-    assert call["blocks"][0]["text"]["text"] == "✅ Answered: *approved*"
+    assert call["blocks"][0]["text"]["text"] == "✅ Answered: approved"
 
 
 @pytest.mark.asyncio

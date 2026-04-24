@@ -9,13 +9,18 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import (
     CanUseTool,
+    PermissionRuleValue,
+    PermissionUpdate,
     ToolPermissionContext,
 )
+
+from engram.manifest import add_allow_rule
 
 PermissionResult = PermissionResultAllow | PermissionResultDeny
 ToolPrecheck = Callable[
@@ -50,6 +55,7 @@ class PendingQuestion:
     future: asyncio.Future[PermissionResult] = field(default_factory=_create_future)
     slack_channel_ts: str | None = None
     slack_thread_ts: str | None = None
+    channel_manifest: Any | None = None
 
 
 class HITLRegistry:
@@ -193,6 +199,49 @@ def build_hitl_tool_guard(
     return can_use_tool
 
 
+def _resolve_question(
+    q: PendingQuestion,
+    *,
+    choice: str,
+    suggestion: Any | None = None,
+    tool_name: str | None = None,
+    home: Path | None = None,
+    router: Any | None = None,
+) -> PermissionResult:
+    """Build the PermissionResult for a resolved HITL question."""
+    if choice == "deny":
+        return PermissionResultDeny(message="user denied", interrupt=True)
+
+    if choice == "always":
+        resolved_tool_name = tool_name or q.tool_name
+        effective_home = home if home is not None else getattr(router, "home", None)
+        if effective_home is not None:
+            _manifest, updated_manifest, _manifest_path = add_allow_rule(
+                q.channel_id,
+                resolved_tool_name,
+                home=effective_home,
+            )
+            if router is not None:
+                router.replace_cached_manifest(updated_manifest)
+        log.info(
+            "hitl.always_allow_granted",
+            extra={"tool": resolved_tool_name, "channel": q.channel_id},
+        )
+        return PermissionResultAllow(
+            updated_input=q.tool_input,
+            updated_permissions=[
+                _always_allow_permission_update(resolved_tool_name)
+            ],
+        )
+
+    if suggestion is not None:
+        return PermissionResultAllow(
+            updated_input=q.tool_input,
+            updated_permissions=[suggestion] if hasattr(suggestion, "to_dict") else None,
+        )
+    return PermissionResultAllow()
+
+
 async def _request_hitl_decision(
     *,
     router: Any,
@@ -248,6 +297,11 @@ async def _request_hitl_decision(
             who_can_answer=None,
             posted_at=datetime.now(UTC),
             timeout_s=default_timeout_s,
+            channel_manifest=(
+                router.cached_manifest(channel_id)
+                if hasattr(router, "cached_manifest")
+                else None
+            ),
         )
 
         router.hitl.register(q)
@@ -326,3 +380,12 @@ def _decision_label(result: PermissionResult) -> str:
 
 def _duration_ms(started_at: float) -> int:
     return max(0, int((time.monotonic() - started_at) * 1000))
+
+
+def _always_allow_permission_update(tool_name: str) -> PermissionUpdate:
+    return PermissionUpdate(
+        type="addRules",
+        behavior="allow",
+        rules=[PermissionRuleValue(tool_name=tool_name)],
+        destination="session",
+    )

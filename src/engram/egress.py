@@ -21,6 +21,17 @@ from engram.hitl import PendingQuestion
 log = logging.getLogger(__name__)
 
 SLACK_MAX_TEXT_LEN = 12_000  # Slack markdown blocks cap text at 12,000 chars
+_STICKY_INELIGIBLE_TOOLS = {
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Task",
+    "SlashCommand",
+}
 
 
 @dataclass
@@ -116,6 +127,10 @@ async def post_question(q: PendingQuestion, slack_client) -> tuple[str, str]:
     header = f"🤔 Can I proceed with `{q.tool_name}`?"
     input_summary = json.dumps(q.tool_input, indent=2)[:800]
     action_elements = []
+    sticky_eligible = _is_sticky_eligible(
+        q.tool_name,
+        getattr(q, "channel_manifest", None),
+    )
 
     # Always include a primary "Allow" button (index 0), even when the SDK
     # returned no suggestions — otherwise the user would only see "Deny",
@@ -135,6 +150,18 @@ async def post_question(q: PendingQuestion, slack_client) -> tuple[str, str]:
                 **({"style": "primary"} if i == 0 else {}),
             }
         )
+        if i == 0 and sticky_eligible:
+            action_elements.append(
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": _always_allow_label(q.tool_name),
+                    },
+                    "value": f"{q.permission_request_id}|always|{q.tool_name}",
+                    "action_id": f"hitl_choice_always_{i}",
+                }
+            )
 
     action_elements.append(
         {
@@ -227,12 +254,15 @@ async def update_question_resolved(
     q: PendingQuestion,
     answer_text: str,
     slack_client,
+    *,
+    allowed: bool = True,
 ) -> None:
     """Edit the original question message to show the resolved answer."""
+    prefix = "✅" if allowed else "❌"
     blocks = [
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"✅ Answered: *{answer_text}*"},
+            "text": {"type": "mrkdwn", "text": f"{prefix} Answered: {answer_text}"},
         },
         {
             "type": "context",
@@ -336,6 +366,24 @@ def _suggestion_label(suggestion, *, tool_name: str | None = None) -> str:
         if verb:
             return f"Allow {verb}"[:40]
     return "Allow"
+
+
+def _always_allow_label(tool_name: str | None) -> str:
+    allow_label = _suggestion_label(None, tool_name=tool_name)
+    if allow_label == "Allow":
+        return "Always allow"
+    if allow_label.startswith("Allow "):
+        return f"Always allow {allow_label[6:]}"[:40]
+    return "Always allow"
+
+
+def _is_sticky_eligible(tool_name: str, channel_manifest) -> bool:
+    """Return True iff a HITL prompt may offer channel-scoped sticky allow."""
+    if channel_manifest is None or not channel_manifest.is_owner_dm():
+        return False
+    if tool_name.startswith("mcp__"):
+        return False
+    return tool_name not in _STICKY_INELIGIBLE_TOOLS
 
 
 def _chunk_text(text: str, limit: int) -> list[str]:

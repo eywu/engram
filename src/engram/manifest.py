@@ -19,7 +19,10 @@ stored for M3/M4 to consume without revisiting the schema.
 """
 from __future__ import annotations
 
+import contextlib
+import os
 import re
+import tempfile
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -426,15 +429,17 @@ def load_manifest(path: Path) -> ChannelManifest:
 
 def dump_manifest(manifest: ChannelManifest, path: Path) -> None:
     """Write a manifest to YAML. Parent dir must exist."""
+    path.write_text(_manifest_yaml(manifest))
+
+
+def _manifest_yaml(manifest: ChannelManifest) -> str:
+    """Render a manifest to stable YAML."""
     data = manifest.model_dump(mode="json", exclude_none=False)
-    # Pretty: stable key order, no flow style for nested mappings.
-    path.write_text(
-        yaml.safe_dump(
-            data,
-            sort_keys=False,
-            default_flow_style=False,
-            indent=2,
-        )
+    return yaml.safe_dump(
+        data,
+        sort_keys=False,
+        default_flow_style=False,
+        indent=2,
     )
 
 
@@ -452,4 +457,51 @@ def set_channel_status(
 
     updated = manifest.model_copy(update={"status": new_status})
     dump_manifest(updated, manifest_path)
+    return manifest, updated, manifest_path
+
+
+def _write_manifest_atomic(manifest: ChannelManifest, path: Path) -> None:
+    """Atomically replace a manifest file via temp-file + rename."""
+    text = _manifest_yaml(manifest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp_name, path)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+        raise
+
+
+def add_allow_rule(
+    channel_id: str,
+    tool_name: str,
+    *,
+    home: Path | None = None,
+) -> tuple[ChannelManifest, ChannelManifest, Path]:
+    """Persist a deduped ``permissions.allow`` entry for a channel manifest."""
+    manifest_path = paths.channel_manifest_path(channel_id, home)
+    manifest = load_manifest(manifest_path)
+    normalized_rule = _validate_rule(tool_name)
+    allow_rules = list(
+        dict.fromkeys([*manifest.permissions.allow, normalized_rule])
+    )
+    if allow_rules == manifest.permissions.allow:
+        return manifest, manifest, manifest_path
+
+    updated = manifest.model_copy(
+        update={
+            "permissions": manifest.permissions.model_copy(
+                update={"allow": allow_rules}
+            )
+        }
+    )
+    _write_manifest_atomic(updated, manifest_path)
     return manifest, updated, manifest_path
