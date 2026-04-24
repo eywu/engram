@@ -12,6 +12,7 @@ identity: owner-dm-full
 label: "DM"
 status: active
 meta_eligible: true
+permission_tier: owner-scoped
 
 setting_sources: [user]
 
@@ -20,25 +21,9 @@ tools: {}
 mcp_servers: {}
 skills: {}
 
-# Permission rules (native Claude Code `Tool(specifier)` syntax).
-# Even on your own machine, a small deny list protects against accidental
-# secret exfiltration if Claude decides to grep for config files.
-# These are suggestions — edit freely to match your layout. The read-only
-# allow-list removes HITL prompts for safe inspection-only tools; deny still
-# wins when a specific rule matches.
-permissions:
-  allow:
-    - Read
-    - Grep
-    - Glob
-    - WebFetch
-    - WebSearch
-    - TodoWrite
-  deny:
-    - "Read(~/.ssh/**)"
-    - "Read(~/.aws/**)"
-    - "Read(~/.gnupg/**)"
-    - "Read(**/.env*)"
+# Permission rules and HITL max_per_day are tier-derived in code from
+# `_TIER_DEFAULTS`. Keep per-channel overrides here only when deviating from
+# the owner-scoped baseline.
 
 behavior:
   style: balanced
@@ -54,7 +39,6 @@ cost_budget:
 hitl:
   enabled: true
   timeout_s: 300
-  max_per_day: 5
 
 nightly:
   model: opus

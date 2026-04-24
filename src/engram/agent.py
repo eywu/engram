@@ -51,6 +51,7 @@ from engram.mcp_tools import (
     make_memory_search_server,
 )
 from engram.memory_hooks import make_memory_hooks_with_embeddings
+from engram.manifest import PermissionTier
 from engram.router import Router, SessionState
 from engram.scope import build_scope_decision, build_tool_guard
 from engram.telemetry import cli_stderr_logger
@@ -484,7 +485,11 @@ class Agent:
             # Behavior overrides
             if manifest.behavior.max_turns is not None:
                 max_turns = manifest.behavior.max_turns
-            permission_mode = manifest.behavior.permission_mode
+            permission_mode = (
+                "bypassPermissions"
+                if manifest.tier_effective() == PermissionTier.YOLO
+                else manifest.behavior.permission_mode
+            )
 
             # Static scope
             decision = build_scope_decision(manifest)

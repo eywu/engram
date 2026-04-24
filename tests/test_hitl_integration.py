@@ -681,7 +681,7 @@ async def test_full_happy_path_thread_reply():
 
 @pytest.mark.asyncio
 async def test_daily_cap_across_sessions():
-    router = Router()
+    router = Router(hitl=HITLConfig(max_per_day=5))
     harness = HITLHarness(router=router)
     for _ in range(5):
         router.hitl_limiter.reserve(CHANNEL_ID)

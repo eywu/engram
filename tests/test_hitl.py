@@ -158,7 +158,7 @@ def test_limiter_second_open_question_denied():
 
 
 def test_limiter_daily_cap_enforced():
-    limiter = HITLRateLimiter(HITLRegistry())
+    limiter = HITLRateLimiter(HITLRegistry(), max_per_day=5)
     now = datetime(2026, 4, 21, 12, 0, tzinfo=UTC)
     for _ in range(5):
         limiter.reserve("C07TEST123", now=now)
@@ -170,7 +170,7 @@ def test_limiter_daily_cap_enforced():
 
 
 def test_limiter_midnight_reset():
-    limiter = HITLRateLimiter(HITLRegistry())
+    limiter = HITLRateLimiter(HITLRegistry(), max_per_day=5)
     day_one = datetime(2026, 4, 21, 23, 59, tzinfo=UTC)
     day_two = datetime(2026, 4, 22, 0, 1, tzinfo=UTC)
     for _ in range(5):
@@ -229,4 +229,3 @@ def test_resolve_question_always_is_idempotent_on_second_click(tmp_path: Path):
     assert isinstance(first, PermissionResultAllow)
     assert isinstance(second, PermissionResultAllow)
     assert load_manifest(manifest_path).permissions.allow == ["WebFetch"]
-

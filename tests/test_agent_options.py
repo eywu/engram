@@ -21,6 +21,7 @@ from engram.manifest import (
     ChannelStatus,
     IdentityTemplate,
     MemoryScope,
+    PermissionTier,
     PermissionsRules,
     ScopeList,
 )
@@ -356,6 +357,20 @@ def test_permission_mode_plumbed():
     a = Agent(_cfg())
     opts = a._build_options(_session(m))
     assert opts.permission_mode == "plan"
+
+
+def test_yolo_tier_uses_bypass_permissions():
+    m = ChannelManifest(
+        channel_id="C1",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        permission_tier=PermissionTier.YOLO,
+        behavior=Behavior(permission_mode="plan"),
+    )
+    a = Agent(_cfg())
+
+    opts = a._build_options(_session(m))
+
+    assert opts.permission_mode == "bypassPermissions"
 
 
 # ── Runtime guard behavior via a full dispatch ─────────────────────────

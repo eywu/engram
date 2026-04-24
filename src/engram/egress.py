@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 from engram.agent import AgentTurn
 from engram.hitl import PendingQuestion
+from engram.manifest import PermissionTier
 
 log = logging.getLogger(__name__)
 
@@ -379,7 +380,10 @@ def _always_allow_label(tool_name: str | None) -> str:
 
 def _is_sticky_eligible(tool_name: str, channel_manifest) -> bool:
     """Return True iff a HITL prompt may offer channel-scoped sticky allow."""
-    if channel_manifest is None or not channel_manifest.is_owner_dm():
+    if (
+        channel_manifest is None
+        or channel_manifest.tier_effective() != PermissionTier.OWNER_SCOPED
+    ):
         return False
     if tool_name.startswith("mcp__"):
         return False

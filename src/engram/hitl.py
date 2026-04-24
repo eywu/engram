@@ -103,7 +103,7 @@ class HITLRegistry:
 class HITLRateLimiter:
     """Per-channel rate limiter for HITL questions."""
 
-    def __init__(self, registry: HITLRegistry, max_per_day: int = 5) -> None:
+    def __init__(self, registry: HITLRegistry, max_per_day: int = 1000) -> None:
         self._registry = registry
         self._max_per_day = max_per_day
         self._daily_counts: dict[str, tuple[date, int]] = {}

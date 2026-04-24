@@ -24,7 +24,7 @@ from pathlib import Path
 
 from engram import paths
 from engram.manifest import (
-    OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES,
+    _apply_tier_defaults,
     ChannelManifest,
     ChannelStatus,
     IdentityTemplate,
@@ -211,27 +211,8 @@ def apply_manifest_migrations(
     manifest: ChannelManifest,
     manifest_path: Path,
 ) -> ChannelManifest:
-    """Apply idempotent manifest migrations and persist any changes."""
-    if (
-        not manifest.is_owner_dm()
-        or manifest.permissions.allow
-    ):
-        return manifest
-
-    updated_permissions = manifest.permissions.model_copy(
-        update={"allow": list(OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES)}
-    )
-    updated_manifest = manifest.model_copy(
-        update={"permissions": updated_permissions}
-    )
-    dump_manifest(updated_manifest, manifest_path)
-    log.info(
-        "channel.owner_dm_permission_defaults_migrated channel_id=%s path=%s allow=%s",
-        updated_manifest.channel_id,
-        manifest_path,
-        list(OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES),
-    )
-    return updated_manifest
+    """Deprecated wrapper. `load_manifest()` now performs load-time migrations."""
+    return manifest
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -272,7 +253,11 @@ def _render_manifest(
     data["channel_id"] = channel_id
     if label is not None:
         data["label"] = label
-    manifest = ChannelManifest.model_validate(data)
+    hydrated_data, _ = _apply_tier_defaults(
+        data,
+        infer_legacy_tier=False,
+    )
+    manifest = ChannelManifest.model_validate(hydrated_data)
 
     if status_override is not None:
         manifest = manifest.model_copy(update={"status": status_override})

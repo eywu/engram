@@ -44,7 +44,7 @@ class PathsConfig:
 class HITLConfig:
     enabled: bool = True
     timeout_s: int = 300
-    max_per_day: int = 5
+    max_per_day: int = 1000
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "enabled", _bool(self.enabled))
@@ -57,7 +57,7 @@ class HITLConfig:
         return cls(
             enabled=raw.get("enabled", True),
             timeout_s=raw.get("timeout_s", 300),
-            max_per_day=raw.get("max_per_day", 5),
+            max_per_day=raw.get("max_per_day", 1000),
         )
 
 

@@ -19,7 +19,7 @@ from engram.egress import (
     update_question_timeout,
 )
 from engram.hitl import PendingQuestion
-from engram.manifest import ChannelManifest, IdentityTemplate
+from engram.manifest import ChannelManifest, IdentityTemplate, PermissionTier
 
 
 class FakeSlackClient:
@@ -64,6 +64,7 @@ def owner_dm_manifest() -> ChannelManifest:
     return ChannelManifest(
         channel_id="D07OWNER",
         identity=IdentityTemplate.OWNER_DM_FULL,
+        permission_tier=PermissionTier.OWNER_SCOPED,
     )
 
 

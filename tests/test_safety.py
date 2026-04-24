@@ -7,6 +7,7 @@ from engram.egress import _is_sticky_eligible
 from engram.manifest import (
     ChannelManifest,
     IdentityTemplate,
+    PermissionTier,
     PermissionsRules,
     _assert_sticky_eligible,
     add_allow_rule,
@@ -20,6 +21,7 @@ def owner_dm_manifest(
     return ChannelManifest(
         channel_id="D07OWNER",
         identity=IdentityTemplate.OWNER_DM_FULL,
+        permission_tier=PermissionTier.OWNER_SCOPED,
         permissions=permissions or PermissionsRules(),
     )
 

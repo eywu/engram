@@ -38,7 +38,7 @@ def test_hitl_config_defaults():
 
     assert cfg.enabled is True
     assert cfg.timeout_s == 300
-    assert cfg.max_per_day == 5
+    assert cfg.max_per_day == 1000
 
 
 def test_nightly_config_defaults():

@@ -27,12 +27,12 @@ HITL only runs where it is enabled for the channel:
 hitl:
   enabled: true
   timeout_s: 300
-  max_per_day: 5
+  max_per_day: 1000
 ```
 
 Owner DMs and task-assistant channels both enable HITL by default, but their scopes differ. Owner DMs inherit user settings and allow more tools, so you are more likely to see a card for `Write`, `Edit`, or `Bash`. Task-assistant channels are stricter because they are shared rooms.
 
-For a concrete shared-channel deny list, see [`src/engram/templates/manifests/task-assistant.yaml`](../src/engram/templates/manifests/task-assistant.yaml). Its default `tools.disallowed` block denies these write-side and shell tools before HITL can ask:
+For the shared-channel baseline, see the task-assistant tier defaults in [`src/engram/manifest.py`](../src/engram/manifest.py). The task-assistant template still declares the write-side tool exclusions directly:
 
 ```yaml
 tools:
@@ -45,16 +45,11 @@ tools:
     - NotebookEdit
 ```
 
-That same template also denies common secret paths through native Claude Code permission rules:
+The task-assistant tier also denies common secret paths through native Claude Code permission rules:
 
 ```yaml
-permissions:
-  deny:
-    - "Read(~/.ssh/**)"
-    - "Read(~/.aws/**)"
-    - "Read(~/.gnupg/**)"
-    - "Read(~/.config/**)"
-    - "Read(**/.env*)"
+permission_tier: task-assistant
+# deny rules come from `_TIER_DEFAULTS` in src/engram/manifest.py
 ```
 
 Those scope and permission denies are intentionally different from HITL prompts. A deny rule says "never ask here." HITL says "ask the human before this specific tool call proceeds."
@@ -184,7 +179,7 @@ The built-in global defaults are:
 hitl:
   enabled: true
   timeout_s: 300
-  max_per_day: 5
+  max_per_day: 1000
 ```
 
 Field meanings:
@@ -199,9 +194,10 @@ Values are normalized when loaded. `timeout_s` and `max_per_day` are converted t
 
 ### Owner-DM Default
 
-Owner DMs are private and inherit user-level settings, so they get the global daily cap:
+Owner DMs are private and inherit user-level settings, so the owner-scoped tier sets their default daily cap:
 
 ```yaml
+permission_tier: owner-scoped
 setting_sources: [user]
 
 tools: {}
@@ -211,7 +207,7 @@ skills: {}
 hitl:
   enabled: true
   timeout_s: 300
-  max_per_day: 5
+  max_per_day: 1000
 ```
 
 Source: [`src/engram/templates/manifests/owner-dm.yaml`](../src/engram/templates/manifests/owner-dm.yaml).
@@ -220,10 +216,11 @@ Use this shape when you want Engram to have broad personal capability while stil
 
 ### Task-Assistant Default
 
-Task-assistant channels are shared by default. They start pending, use project-level settings, disallow shell and write tools, and use a lower daily HITL cap:
+Task-assistant channels are shared by default. They start pending, use project-level settings, disallow shell and write tools, and derive their permission/HITL defaults from the task-assistant tier:
 
 ```yaml
 status: pending
+permission_tier: task-assistant
 setting_sources: [project]
 
 tools:
@@ -238,7 +235,7 @@ tools:
 hitl:
   enabled: true
   timeout_s: 300
-  max_per_day: 3
+  max_per_day: 1000
 ```
 
 Source: [`src/engram/templates/manifests/task-assistant.yaml`](../src/engram/templates/manifests/task-assistant.yaml).
@@ -263,7 +260,7 @@ Common adjustments:
 | Reduce stale cards | Lower `timeout_s`, for example `120`. |
 | Prevent prompt spam in a busy room | Lower `max_per_day`, for example `1` or `2`. |
 | Disable HITL for non-interactive jobs | Set `enabled: false`. |
-| Give the owner more review bandwidth | Keep owner-DM at `max_per_day: 5` or raise it locally. |
+| Give the owner more review bandwidth | Owner-scoped already defaults to `max_per_day: 1000`; raise or lower it locally only if needed. |
 
 Do not disable HITL in a live Slack channel unless the channel's tool scope is already tight enough for unattended tool execution.
 

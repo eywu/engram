@@ -14,6 +14,7 @@ identity: task-assistant
 label: "{{channel_label}}"
 status: pending        # operator must approve before bot responds
 meta_eligible: true
+permission_tier: task-assistant
 
 # Team channels use project-level priming, NOT user-level.
 # Prevents the operator's personal MCPs / settings from leaking into a
@@ -43,32 +44,9 @@ mcp_servers:
 # Skills: inherit all by default. Exclude per-channel as needed.
 skills: {}
 
-# Permission rules (native Claude Code `Tool(specifier)` syntax).
-# Aggressive deny list for shared channels — a coworker could innocently
-# ask the bot to read a config file that contains secrets, and Slack would
-# broadcast the answer to the whole channel. This list blocks the most
-# common leak paths. Add more entries as your environment demands.
-permissions:
-  deny:
-    # Personal credentials
-    - "Read(~/.ssh/**)"
-    - "Read(~/.aws/**)"
-    - "Read(~/.gnupg/**)"
-    - "Read(~/.config/**)"
-    # Environment / dotenv files anywhere
-    - "Read(**/.env*)"
-    # Shell history / keychain-like files
-    - "Read(~/.zsh_history)"
-    - "Read(~/.bash_history)"
-    - "Read(~/Library/Keychains/**)"
-    # Same patterns for Grep / Glob — searching inside secrets is as bad
-    # as reading them directly.
-    - "Grep(~/.ssh/**)"
-    - "Grep(~/.aws/**)"
-    - "Grep(**/.env*)"
-    - "Glob(~/.ssh/**)"
-    - "Glob(~/.aws/**)"
-    - "Glob(**/.env*)"
+# Permission rules and HITL max_per_day are tier-derived in code from
+# `_TIER_DEFAULTS`. Keep per-channel overrides here only when deviating from
+# the task-assistant baseline.
 
 behavior:
   style: concise
@@ -83,7 +61,6 @@ cost_budget:
 hitl:
   enabled: true
   timeout_s: 300
-  max_per_day: 3
 
 nightly:
   model: sonnet

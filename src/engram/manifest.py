@@ -19,10 +19,13 @@ stored for M3/M4 to consume without revisiting the schema.
 """
 from __future__ import annotations
 
+import copy
 import contextlib
+import logging
 import os
 import re
 import tempfile
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -33,6 +36,8 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from engram import paths
 from engram.config import HITLConfig
+
+log = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Identity & status
@@ -59,13 +64,62 @@ class ChannelStatus(StrEnum):
     DENIED = "denied"
 
 
-OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES: tuple[str, ...] = (
-    "Read",
-    "Grep",
-    "Glob",
-    "WebFetch",
-    "WebSearch",
-    "TodoWrite",
+class PermissionTier(StrEnum):
+    """Channel trust tier used for default permissions and HITL posture."""
+
+    TASK_ASSISTANT = "task-assistant"
+    OWNER_SCOPED = "owner-scoped"
+    YOLO = "yolo"
+
+
+ABSOLUTE_DENY_RULES: tuple[str, ...] = (
+    "Read(~/.ssh/**)",
+    "Read(~/.aws/**)",
+    "Read(~/.gnupg/**)",
+    "Read(**/.env*)",
+)
+
+_TASK_ASSISTANT_DENY_RULES: tuple[str, ...] = (
+    *ABSOLUTE_DENY_RULES,
+    "Read(~/.config/**)",
+    "Read(~/.zsh_history)",
+    "Read(~/.bash_history)",
+    "Read(~/Library/Keychains/**)",
+    "Grep(~/.ssh/**)",
+    "Grep(~/.aws/**)",
+    "Grep(**/.env*)",
+    "Glob(~/.ssh/**)",
+    "Glob(~/.aws/**)",
+    "Glob(**/.env*)",
+)
+
+_TIER_DEFAULTS: dict[PermissionTier, dict[str, tuple[str, ...] | int]] = {
+    PermissionTier.TASK_ASSISTANT: {
+        "allow_rules": (),
+        "deny_rules": _TASK_ASSISTANT_DENY_RULES,
+        "hitl_max_per_day": 1000,
+    },
+    PermissionTier.OWNER_SCOPED: {
+        "allow_rules": (
+            "Read",
+            "Grep",
+            "Glob",
+            "WebFetch",
+            "WebSearch",
+            "TodoWrite",
+        ),
+        "deny_rules": ABSOLUTE_DENY_RULES,
+        "hitl_max_per_day": 1000,
+    },
+    PermissionTier.YOLO: {
+        "allow_rules": (),
+        "deny_rules": ABSOLUTE_DENY_RULES,
+        "hitl_max_per_day": 1000,
+    },
+}
+
+OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES: tuple[str, ...] = tuple(
+    _TIER_DEFAULTS[PermissionTier.OWNER_SCOPED]["allow_rules"]
 )
 
 
@@ -323,6 +377,22 @@ class ChannelManifest(BaseModel):
             "nightly meta-summary. Defaults true per OQ31 opt-in."
         ),
     )
+    permission_tier: PermissionTier = Field(
+        default=PermissionTier.TASK_ASSISTANT,
+        description=(
+            "Trust tier controlling default permission rules and HITL limits."
+        ),
+    )
+    yolo_until: datetime | None = Field(
+        default=None,
+        description=(
+            "Optional expiry for time-boxed YOLO access. Must be timezone-aware."
+        ),
+    )
+    pre_yolo_tier: PermissionTier | None = Field(
+        default=None,
+        description="Tier to restore when a YOLO window expires.",
+    )
 
     # ── Scope (exclusion-first; M2-enforced) ─────────────────────
     setting_sources: list[SettingSource] = Field(
@@ -384,10 +454,155 @@ class ChannelManifest(BaseModel):
             )
         return v
 
+    @field_validator("yolo_until")
+    @classmethod
+    def _yolo_until_must_be_timezone_aware(
+        cls, value: datetime | None
+    ) -> datetime | None:
+        if value is not None and (
+            value.tzinfo is None or value.utcoffset() is None
+        ):
+            raise ValueError("yolo_until must be timezone-aware")
+        return value
+
     # ── Helpers ──────────────────────────────────────────────────
     def is_owner_dm(self) -> bool:
-        """True iff this manifest uses the owner-DM identity."""
+        """Deprecated thin wrapper. Prefer `tier_effective()` for policy."""
         return self.identity == IdentityTemplate.OWNER_DM_FULL
+
+    def tier_effective(
+        self, *, now: datetime | None = None
+    ) -> PermissionTier:
+        """Return the effective tier, lazily demoting expired YOLO state."""
+        if self.permission_tier != PermissionTier.YOLO:
+            return self.permission_tier
+        if self.yolo_until is None:
+            return PermissionTier.YOLO
+
+        current_time = now or datetime.now(UTC)
+        if self.yolo_until <= current_time:
+            return self.pre_yolo_tier or PermissionTier.TASK_ASSISTANT
+        return PermissionTier.YOLO
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Tier defaults + legacy migrations
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _default_permission_tier(
+    identity: IdentityTemplate | str | None,
+) -> PermissionTier:
+    if identity == IdentityTemplate.OWNER_DM_FULL:
+        return PermissionTier.OWNER_SCOPED
+    if identity == IdentityTemplate.OWNER_DM_FULL.value:
+        return PermissionTier.OWNER_SCOPED
+    return PermissionTier.TASK_ASSISTANT
+
+
+def _merge_rules(*groups: list[str] | tuple[str, ...]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for rule in group:
+            text = str(rule).strip()
+            if not text or text in seen:
+                continue
+            merged.append(text)
+            seen.add(text)
+    return merged
+
+
+def _apply_tier_defaults(
+    raw: dict,
+    *,
+    infer_legacy_tier: bool,
+) -> tuple[dict, bool]:
+    data = copy.deepcopy(raw)
+    changed = False
+
+    permission_tier = data.get("permission_tier")
+    if permission_tier in (None, ""):
+        resolved_tier = (
+            _default_permission_tier(data.get("identity"))
+            if infer_legacy_tier
+            else PermissionTier.TASK_ASSISTANT
+        )
+        data["permission_tier"] = resolved_tier.value
+        permission_tier = resolved_tier.value
+        changed = True
+
+    try:
+        tier = PermissionTier(permission_tier)
+    except (TypeError, ValueError):
+        return data, changed
+
+    defaults = _TIER_DEFAULTS[tier]
+
+    permissions = data.get("permissions")
+    if permissions is None:
+        permissions = {}
+        data["permissions"] = permissions
+        changed = True
+    if isinstance(permissions, dict):
+        allow_rules = permissions.get("allow")
+        default_allow_rules = list(defaults["allow_rules"])
+        if (allow_rules is None or allow_rules == []) and default_allow_rules:
+            permissions["allow"] = default_allow_rules
+            changed = True
+
+        deny_rules = permissions.get("deny")
+        desired_deny_rules = (
+            list(defaults["deny_rules"])
+            if not deny_rules
+            else _merge_rules(ABSOLUTE_DENY_RULES, deny_rules)
+        )
+        if permissions.get("deny") != desired_deny_rules:
+            permissions["deny"] = desired_deny_rules
+            changed = True
+
+    hitl = data.get("hitl")
+    if hitl is None:
+        hitl = {}
+        data["hitl"] = hitl
+        changed = True
+    if isinstance(hitl, dict) and hitl.get("max_per_day") is None:
+        hitl["max_per_day"] = int(defaults["hitl_max_per_day"])
+        changed = True
+
+    return data, changed
+
+
+def _demote_expired_yolo(
+    manifest: ChannelManifest,
+    *,
+    path: Path | None = None,
+) -> tuple[ChannelManifest, bool]:
+    effective_tier = manifest.tier_effective()
+    if manifest.permission_tier != PermissionTier.YOLO:
+        return manifest, False
+    if effective_tier == PermissionTier.YOLO:
+        return manifest, False
+
+    expired_at = manifest.yolo_until
+    rematerialized_raw, _ = _apply_tier_defaults(
+        {
+            **manifest.model_dump(mode="json"),
+            "permission_tier": effective_tier.value,
+            "yolo_until": None,
+            "pre_yolo_tier": None,
+        },
+        infer_legacy_tier=False,
+    )
+    updated_manifest = ChannelManifest.model_validate(rematerialized_raw)
+    log.info(
+        "channel.yolo_expired channel_id=%s path=%s expired_at=%s restored_tier=%s",
+        updated_manifest.channel_id,
+        path,
+        expired_at.isoformat() if expired_at is not None else None,
+        effective_tier,
+    )
+    return updated_manifest, True
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -420,11 +635,20 @@ def load_manifest(path: Path) -> ChannelManifest:
         )
 
     try:
-        return ChannelManifest.model_validate(raw)
+        hydrated_raw, changed = _apply_tier_defaults(
+            raw,
+            infer_legacy_tier=True,
+        )
+        manifest = ChannelManifest.model_validate(hydrated_raw)
+        manifest, yolo_changed = _demote_expired_yolo(manifest, path=path)
     except ValidationError as e:
         raise ManifestError(
             f"Manifest validation failed for {path}:\n{e}"
         ) from e
+
+    if changed or yolo_changed:
+        _write_manifest_atomic(manifest, path)
+    return manifest
 
 
 def dump_manifest(manifest: ChannelManifest, path: Path) -> None:

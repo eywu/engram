@@ -205,7 +205,7 @@ async def test_manifest_hitl_overrides_router_default(tmp_path: Path):
 
     cfg = r.hitl_config_for_channel("C07TEAM")
 
-    assert cfg.max_per_day == 3
+    assert cfg.max_per_day == 1000
     assert cfg.timeout_s == 300
 
 

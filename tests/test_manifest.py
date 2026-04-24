@@ -19,7 +19,10 @@ from engram.manifest import (
     IdentityTemplate,
     ManifestError,
     MemoryScope,
+    PermissionTier,
+    PermissionsRules,
     ScopeList,
+    _TIER_DEFAULTS,
     dump_manifest,
     load_manifest,
 )
@@ -171,11 +174,17 @@ def test_ask_user_question_defaults():
 
 def test_manifest_loads_hitl_section(tmp_path: Path):
     templates = [
-        ("owner-dm.yaml", "D07OWNER", "DM", 5),
-        ("task-assistant.yaml", "C07TEAM", "#test-team", 3),
+        ("owner-dm.yaml", "D07OWNER", "DM", PermissionTier.OWNER_SCOPED, 1000),
+        (
+            "task-assistant.yaml",
+            "C07TEAM",
+            "#test-team",
+            PermissionTier.TASK_ASSISTANT,
+            1000,
+        ),
     ]
 
-    for template_name, channel_id, label, max_per_day in templates:
+    for template_name, channel_id, label, permission_tier, max_per_day in templates:
         template = paths.TEMPLATES_MANIFESTS_DIR / template_name
         rendered = (
             template.read_text()
@@ -187,6 +196,7 @@ def test_manifest_loads_hitl_section(tmp_path: Path):
 
         manifest = load_manifest(manifest_path)
 
+        assert manifest.permission_tier == permission_tier
         assert manifest.hitl.enabled is True
         assert manifest.hitl.timeout_s == 300
         assert manifest.hitl.max_per_day == max_per_day
@@ -286,6 +296,7 @@ setting_sources: [user]
     m = load_manifest(p)
     assert m.channel_id == "D07OWNER"
     assert m.identity == IdentityTemplate.OWNER_DM_FULL
+    assert m.permission_tier == PermissionTier.OWNER_SCOPED
     assert m.status == ChannelStatus.ACTIVE
     assert m.setting_sources == ["user"]
     assert m.tools.is_unrestricted()
@@ -316,6 +327,7 @@ cost_budget:
 """
     )
     m = load_manifest(p)
+    assert m.permission_tier == PermissionTier.TASK_ASSISTANT
     assert m.meta_eligible is False
     assert m.tools.disallowed == ["Bash", "Write", "Edit"]
     assert m.mcp_servers.disallowed == ["personal-notes"]
@@ -332,7 +344,11 @@ def test_round_trip(tmp_path: Path):
         identity=IdentityTemplate.TASK_ASSISTANT,
         label="#round",
         status=ChannelStatus.ACTIVE,
+        permission_tier=PermissionTier.TASK_ASSISTANT,
         tools=ScopeList(disallowed=["Bash"]),
+        permissions=PermissionsRules(
+            deny=list(_TIER_DEFAULTS[PermissionTier.TASK_ASSISTANT]["deny_rules"])
+        ),
         behavior=Behavior(style="thorough", max_turns=10),
         cost_budget=CostBudget(monthly_usd=20.0),
     )

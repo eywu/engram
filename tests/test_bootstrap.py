@@ -13,6 +13,7 @@ from engram.manifest import (
     ChannelManifest,
     ChannelStatus,
     IdentityTemplate,
+    PermissionTier,
     ScopeList,
     dump_manifest,
     load_manifest,
@@ -76,6 +77,7 @@ def test_provision_owner_dm_creates_manifest_and_claude_md(tmp_path: Path):
     m = load_manifest(result.manifest_path)
     assert m.channel_id == "D07OWNER"
     assert m.identity == IdentityTemplate.OWNER_DM_FULL
+    assert m.permission_tier == PermissionTier.OWNER_SCOPED
     assert m.status == ChannelStatus.ACTIVE  # owner-DM template defaults active
     assert m.setting_sources == ["user"]
     assert m.tools.is_unrestricted()
@@ -115,6 +117,7 @@ def test_provision_task_assistant_defaults_pending(tmp_path: Path):
     )
     assert result.created
     m = load_manifest(result.manifest_path)
+    assert m.permission_tier == PermissionTier.TASK_ASSISTANT
     assert m.status == ChannelStatus.PENDING  # must be approved before use
     assert m.setting_sources == ["project"]
     # Default exclusions from template
@@ -182,7 +185,6 @@ def test_provision_channel_idempotent(tmp_path: Path):
 
 def test_provision_channel_migrates_owner_dm_empty_permission_allow(
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ):
     result = provision_channel(
         "D07OWNER",
@@ -198,7 +200,6 @@ def test_provision_channel_migrates_owner_dm_empty_permission_allow(
     )
     dump_manifest(migrated, result.manifest_path)
 
-    caplog.set_level(logging.INFO)
     reloaded = provision_channel(
         "D07OWNER",
         identity=IdentityTemplate.OWNER_DM_FULL,
@@ -213,12 +214,10 @@ def test_provision_channel_migrates_owner_dm_empty_permission_allow(
     assert load_manifest(reloaded.manifest_path).permissions.allow == list(
         OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES
     )
-    assert "channel.owner_dm_permission_defaults_migrated" in caplog.text
 
 
 def test_provision_channel_leaves_owner_dm_custom_permission_allow_alone(
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ):
     result = provision_channel(
         "D07OWNER",
@@ -236,7 +235,6 @@ def test_provision_channel_leaves_owner_dm_custom_permission_allow_alone(
     )
     dump_manifest(customized, result.manifest_path)
 
-    caplog.set_level(logging.INFO)
     reloaded = provision_channel(
         "D07OWNER",
         identity=IdentityTemplate.OWNER_DM_FULL,
@@ -246,7 +244,6 @@ def test_provision_channel_leaves_owner_dm_custom_permission_allow_alone(
 
     assert not reloaded.created
     assert reloaded.manifest.permissions.allow == ["Read"]
-    assert "channel.owner_dm_permission_defaults_migrated" not in caplog.text
 
 
 def test_provision_channel_preserves_custom_claude_md(tmp_path: Path):
