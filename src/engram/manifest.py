@@ -138,7 +138,7 @@ _TIER_DEFAULTS: dict[PermissionTier, dict[str, tuple[str, ...] | int]] = {
     PermissionTier.TASK_ASSISTANT: {
         "allow_rules": (),
         "deny_rules": _TASK_ASSISTANT_DENY_RULES,
-        "hitl_max_per_day": 1000,
+        "hitl_max_per_day": 3,
     },
     PermissionTier.OWNER_SCOPED: {
         "allow_rules": (
@@ -644,10 +644,83 @@ def _normalize_manifest_tier_aliases(
     return data, migrations, changed
 
 
+def _tier_default_allow_rules(tier: PermissionTier) -> list[str]:
+    return list(_TIER_DEFAULTS[tier]["allow_rules"])
+
+
+def _tier_default_deny_rules(tier: PermissionTier) -> list[str]:
+    return list(_TIER_DEFAULTS[tier]["deny_rules"])
+
+
+def _tier_default_hitl_max_per_day(tier: PermissionTier) -> int:
+    return int(_TIER_DEFAULTS[tier]["hitl_max_per_day"])
+
+
+def _infer_tier_drift_source(
+    data: dict,
+    *,
+    current_tier: PermissionTier,
+) -> PermissionTier | None:
+    hitl = data.get("hitl")
+    if not isinstance(hitl, dict):
+        return None
+
+    max_per_day = hitl.get("max_per_day")
+    current_default = _tier_default_hitl_max_per_day(current_tier)
+    if max_per_day is None or max_per_day == current_default:
+        return None
+
+    permissions = data.get("permissions")
+    scored_candidates: list[tuple[int, PermissionTier]] = []
+    for candidate in PermissionTier:
+        if candidate == current_tier:
+            continue
+        if max_per_day != _tier_default_hitl_max_per_day(candidate):
+            continue
+
+        score = 1
+        if isinstance(permissions, dict):
+            if permissions.get("allow") == _tier_default_allow_rules(candidate):
+                score += 1
+            if permissions.get("deny") == _tier_default_deny_rules(candidate):
+                score += 1
+        scored_candidates.append((score, candidate))
+
+    if not scored_candidates:
+        return None
+
+    scored_candidates.sort(
+        key=lambda item: (
+            item[0],
+            item[1].value,
+        )
+    )
+    return scored_candidates[-1][1]
+
+
+def _record_tier_drift_correction(
+    *,
+    channel_id: str | None,
+    tier: PermissionTier,
+    field: str,
+    previous_value: object,
+    updated_value: object,
+) -> None:
+    log.info(
+        "manifest.tier_drift_corrected channel_id=%s tier=%s field=%s from=%s to=%s",
+        channel_id,
+        tier.value,
+        field,
+        previous_value,
+        updated_value,
+    )
+
+
 def _apply_tier_defaults(
     raw: dict,
     *,
     infer_legacy_tier: bool,
+    previous_tier: PermissionTier | None = None,
 ) -> tuple[dict, bool]:
     data = copy.deepcopy(raw)
     changed = False
@@ -668,6 +741,12 @@ def _apply_tier_defaults(
     except (TypeError, ValueError):
         return data, changed
 
+    inferred_previous_tier = (
+        previous_tier
+        if previous_tier is not None
+        else _infer_tier_drift_source(data, current_tier=tier)
+    )
+
     if "nightly_included" not in data:
         if "meta_eligible" in data:
             data["nightly_included"] = data.pop("meta_eligible")
@@ -681,7 +760,28 @@ def _apply_tier_defaults(
         data["nightly_included"] = False
         changed = True
 
-    defaults = _TIER_DEFAULTS[tier]
+    default_allow_rules = _tier_default_allow_rules(tier)
+    default_deny_rules = _tier_default_deny_rules(tier)
+    default_hitl_max_per_day = _tier_default_hitl_max_per_day(tier)
+    previous_allow_rules = (
+        _tier_default_allow_rules(inferred_previous_tier)
+        if inferred_previous_tier is not None
+        else None
+    )
+    previous_deny_rules = (
+        _tier_default_deny_rules(inferred_previous_tier)
+        if inferred_previous_tier is not None
+        else None
+    )
+    previous_hitl_max_per_day = (
+        _tier_default_hitl_max_per_day(inferred_previous_tier)
+        if inferred_previous_tier is not None
+        else None
+    )
+    log_drift_corrections = (
+        previous_tier is None and inferred_previous_tier is not None
+    )
+    channel_id = str(data.get("channel_id") or "")
 
     permissions = data.get("permissions")
     if permissions is None:
@@ -690,31 +790,89 @@ def _apply_tier_defaults(
         changed = True
     if isinstance(permissions, dict):
         allow_rules = permissions.get("allow")
-        default_allow_rules = list(defaults["allow_rules"])
         if (allow_rules is None or allow_rules == []) and default_allow_rules:
             permissions["allow"] = default_allow_rules
             changed = True
+        elif (
+            previous_allow_rules is not None
+            and allow_rules == previous_allow_rules
+            and allow_rules != default_allow_rules
+        ):
+            permissions["allow"] = default_allow_rules
+            changed = True
+            if log_drift_corrections:
+                _record_tier_drift_correction(
+                    channel_id=channel_id,
+                    tier=tier,
+                    field="permissions.allow",
+                    previous_value=allow_rules,
+                    updated_value=default_allow_rules,
+                )
 
         deny_rules = permissions.get("deny")
-        desired_deny_rules = (
-            list(defaults["deny_rules"])
-            if not deny_rules
-            else _merge_rules(defaults["deny_rules"], deny_rules)
-        )
+        desired_deny_rules = default_deny_rules
+        if deny_rules and not (
+            previous_deny_rules is not None and deny_rules == previous_deny_rules
+        ):
+            desired_deny_rules = _merge_rules(default_deny_rules, deny_rules)
         if permissions.get("deny") != desired_deny_rules:
             permissions["deny"] = desired_deny_rules
             changed = True
+            if (
+                log_drift_corrections
+                and previous_deny_rules is not None
+                and deny_rules == previous_deny_rules
+            ):
+                _record_tier_drift_correction(
+                    channel_id=channel_id,
+                    tier=tier,
+                    field="permissions.deny",
+                    previous_value=deny_rules,
+                    updated_value=desired_deny_rules,
+                )
 
     hitl = data.get("hitl")
     if hitl is None:
         hitl = {}
         data["hitl"] = hitl
         changed = True
-    if isinstance(hitl, dict) and hitl.get("max_per_day") is None:
-        hitl["max_per_day"] = int(defaults["hitl_max_per_day"])
-        changed = True
+    if isinstance(hitl, dict):
+        max_per_day = hitl.get("max_per_day")
+        if max_per_day is None:
+            hitl["max_per_day"] = default_hitl_max_per_day
+            changed = True
+        elif (
+            previous_hitl_max_per_day is not None
+            and max_per_day == previous_hitl_max_per_day
+            and max_per_day != default_hitl_max_per_day
+        ):
+            hitl["max_per_day"] = default_hitl_max_per_day
+            changed = True
+            if log_drift_corrections:
+                _record_tier_drift_correction(
+                    channel_id=channel_id,
+                    tier=tier,
+                    field="hitl.max_per_day",
+                    previous_value=max_per_day,
+                    updated_value=default_hitl_max_per_day,
+                )
 
     return data, changed
+
+
+def _rematerialize_manifest(
+    manifest: ChannelManifest,
+    *,
+    update_data: dict[str, object],
+    previous_tier: PermissionTier | None = None,
+) -> ChannelManifest:
+    staged_manifest = manifest.model_copy(update=update_data)
+    rematerialized_raw, _ = _apply_tier_defaults(
+        staged_manifest.model_dump(mode="json"),
+        infer_legacy_tier=False,
+        previous_tier=previous_tier or manifest.permission_tier,
+    )
+    return ChannelManifest.model_validate(rematerialized_raw)
 
 
 def _demote_expired_temporary_tier(
@@ -731,17 +889,16 @@ def _demote_expired_temporary_tier(
         return manifest, False
 
     expired_at = manifest.yolo_until
-    rematerialized_raw, _ = _apply_tier_defaults(
-        {
-            **manifest.model_dump(mode="json"),
-            "permission_tier": effective_tier.value,
+    updated_manifest = _rematerialize_manifest(
+        manifest,
+        update_data={
+            "permission_tier": effective_tier,
             "yolo_granted_at": None,
             "yolo_until": None,
             "pre_yolo_tier": None,
         },
-        infer_legacy_tier=False,
+        previous_tier=manifest.permission_tier,
     )
-    updated_manifest = ChannelManifest.model_validate(rematerialized_raw)
     log.info(
         "channel.yolo_expired channel_id=%s path=%s expired_at=%s restored_tier=%s",
         updated_manifest.channel_id,
@@ -772,17 +929,16 @@ def expired_yolo_demotion(
     if expired_at is not None and manifest.yolo_granted_at is not None:
         duration_used = max(expired_at - manifest.yolo_granted_at, timedelta())
 
-    rematerialized_raw, _ = _apply_tier_defaults(
-        {
-            **manifest.model_dump(mode="json"),
-            "permission_tier": effective_tier.value,
+    updated_manifest = _rematerialize_manifest(
+        manifest,
+        update_data={
+            "permission_tier": effective_tier,
             "yolo_granted_at": None,
             "yolo_until": None,
             "pre_yolo_tier": None,
         },
-        infer_legacy_tier=False,
+        previous_tier=manifest.permission_tier,
     )
-    updated_manifest = ChannelManifest.model_validate(rematerialized_raw)
     log.info(
         "channel.yolo_expired channel_id=%s path=%s expired_at=%s pre_yolo_tier=%s duration_used_s=%s trigger=%s",
         manifest.channel_id,
@@ -1113,7 +1269,11 @@ def set_channel_permission_tier(
         )
         update_data["pre_yolo_tier"] = restore_tier
 
-    updated = manifest.model_copy(update=update_data)
+    updated = _rematerialize_manifest(
+        manifest,
+        update_data=update_data,
+        previous_tier=manifest.permission_tier,
+    )
     if updated == manifest:
         return manifest, manifest, manifest_path, normalized_duration
 

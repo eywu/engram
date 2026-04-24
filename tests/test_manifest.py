@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 from engram import paths
+from engram.config import HITLConfig
 from engram.manifest import (
     _TIER_DEFAULTS,
     OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES,
@@ -23,9 +24,47 @@ from engram.manifest import (
     PermissionsRules,
     PermissionTier,
     ScopeList,
+    _apply_tier_defaults,
     dump_manifest,
     load_manifest,
 )
+
+_UNSET = object()
+
+
+def _raw_tiered_manifest(
+    *,
+    tier: PermissionTier,
+    channel_id: str = "C07TEST123",
+    allow: object = _UNSET,
+    deny: object = _UNSET,
+    max_per_day: object = _UNSET,
+    nightly_included: object = _UNSET,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "channel_id": channel_id,
+        "identity": IdentityTemplate.TASK_ASSISTANT.value,
+        "label": "#growth",
+        "status": ChannelStatus.ACTIVE.value,
+        "permission_tier": tier.value,
+        "setting_sources": ["project"],
+        "permissions": {},
+        "hitl": {"enabled": True, "timeout_s": 300},
+    }
+    permissions = payload["permissions"]
+    hitl = payload["hitl"]
+    assert isinstance(permissions, dict)
+    assert isinstance(hitl, dict)
+
+    if allow is not _UNSET:
+        permissions["allow"] = allow
+    if deny is not _UNSET:
+        permissions["deny"] = deny
+    if max_per_day is not _UNSET:
+        hitl["max_per_day"] = max_per_day
+    if nightly_included is not _UNSET:
+        payload["nightly_included"] = nightly_included
+    return payload
 
 # ── Defaults & inheritance model ────────────────────────────────────────
 
@@ -189,7 +228,7 @@ def test_manifest_loads_hitl_section(tmp_path: Path):
             "C07TEAM",
             "#test-team",
             PermissionTier.TASK_ASSISTANT,
-            1000,
+            3,
             False,
         ),
     ]
@@ -218,6 +257,115 @@ def test_manifest_loads_hitl_section(tmp_path: Path):
         assert manifest.hitl.timeout_s == 300
         assert manifest.hitl.max_per_day == max_per_day
         assert manifest.nightly_included is nightly_included
+
+
+def test_apply_tier_defaults_upgrades_hitl_when_value_matches_previous_tier_default():
+    raw = _raw_tiered_manifest(
+        tier=PermissionTier.TASK_ASSISTANT,
+        max_per_day=3,
+    )
+    raw["permission_tier"] = PermissionTier.OWNER_SCOPED.value
+
+    updated, changed = _apply_tier_defaults(
+        raw,
+        infer_legacy_tier=False,
+        previous_tier=PermissionTier.TASK_ASSISTANT,
+    )
+
+    assert changed is True
+    assert updated["hitl"]["max_per_day"] == 1000
+
+
+def test_apply_tier_defaults_preserves_custom_hitl_override_on_upgrade():
+    raw = _raw_tiered_manifest(
+        tier=PermissionTier.TASK_ASSISTANT,
+        max_per_day=7,
+    )
+    raw["permission_tier"] = PermissionTier.OWNER_SCOPED.value
+
+    updated, _changed = _apply_tier_defaults(
+        raw,
+        infer_legacy_tier=False,
+        previous_tier=PermissionTier.TASK_ASSISTANT,
+    )
+
+    assert updated["hitl"]["max_per_day"] == 7
+
+
+def test_apply_tier_defaults_downgrades_hitl_when_value_matches_previous_tier_default():
+    raw = _raw_tiered_manifest(
+        tier=PermissionTier.OWNER_SCOPED,
+        max_per_day=1000,
+    )
+    raw["permission_tier"] = PermissionTier.TASK_ASSISTANT.value
+
+    updated, changed = _apply_tier_defaults(
+        raw,
+        infer_legacy_tier=False,
+        previous_tier=PermissionTier.OWNER_SCOPED,
+    )
+
+    assert changed is True
+    assert updated["hitl"]["max_per_day"] == 3
+
+
+@pytest.mark.parametrize(
+    ("field_name", "raw", "target_tier", "previous_tier", "expected"),
+    [
+        (
+            "permissions.allow",
+            _raw_tiered_manifest(
+                tier=PermissionTier.TASK_ASSISTANT,
+                allow=[],
+            ),
+            PermissionTier.OWNER_SCOPED,
+            PermissionTier.TASK_ASSISTANT,
+            list(OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES),
+        ),
+        (
+            "permissions.deny",
+            _raw_tiered_manifest(
+                tier=PermissionTier.TASK_ASSISTANT,
+                deny=list(_TIER_DEFAULTS[PermissionTier.TASK_ASSISTANT]["deny_rules"]),
+            ),
+            PermissionTier.OWNER_SCOPED,
+            PermissionTier.TASK_ASSISTANT,
+            list(_TIER_DEFAULTS[PermissionTier.OWNER_SCOPED]["deny_rules"]),
+        ),
+        (
+            "nightly_included",
+            _raw_tiered_manifest(
+                tier=PermissionTier.OWNER_SCOPED,
+                nightly_included=True,
+            ),
+            PermissionTier.TASK_ASSISTANT,
+            PermissionTier.OWNER_SCOPED,
+            False,
+        ),
+    ],
+)
+def test_apply_tier_defaults_reconciles_each_tier_derived_field(
+    field_name: str,
+    raw: dict[str, object],
+    target_tier: PermissionTier,
+    previous_tier: PermissionTier,
+    expected: object,
+):
+    raw["permission_tier"] = target_tier.value
+
+    updated, changed = _apply_tier_defaults(
+        raw,
+        infer_legacy_tier=False,
+        previous_tier=previous_tier,
+    )
+
+    assert changed is True
+    if field_name == "permissions.allow":
+        assert updated["permissions"]["allow"] == expected
+    elif field_name == "permissions.deny":
+        assert updated["permissions"]["deny"] == expected
+    else:
+        assert updated["nightly_included"] is expected
 
 
 def test_manifest_loads_nightly_model_from_templates(tmp_path: Path):
@@ -390,6 +538,7 @@ def test_round_trip(tmp_path: Path):
         permissions=PermissionsRules(
             deny=list(_TIER_DEFAULTS[PermissionTier.TASK_ASSISTANT]["deny_rules"])
         ),
+        hitl=HITLConfig(max_per_day=3),
         behavior=Behavior(style="thorough", max_turns=10),
         cost_budget=CostBudget(monthly_usd=20.0),
     )

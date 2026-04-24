@@ -147,6 +147,23 @@ class HITLRateLimiter:
         self._daily_counts[channel_id] = (today, count + 1)
 
 
+def _daily_hitl_cap_message(
+    *,
+    tier_name: str | None,
+    daily_limit: int,
+) -> str:
+    details = (
+        f"current tier: {tier_name}, cap: {daily_limit}"
+        if tier_name is not None
+        else f"cap: {daily_limit}"
+    )
+    return (
+        "Engram has hit its per-channel HITL prompt cap for today "
+        f"({details}). To raise the cap, upgrade with `/engram upgrade` "
+        "or override via the channel manifest."
+    )
+
+
 # NOTE: build_permission_request_hook was removed in GRO-432 (M4.5).
 # It wrapped the Claude Agent SDK's PermissionRequest hook, which is
 # notify-only: the SDK does NOT wait for the hook's PermissionResult
@@ -302,7 +319,25 @@ async def _request_hitl_decision(
                 "hitl.rate_limited",
                 extra={"reason": reason, "channel_id": channel_id},
             )
-            result = PermissionResultDeny(message=f"HITL rate-limited: {reason}")
+            if reason.startswith("daily question budget exhausted"):
+                manifest = (
+                    router.cached_manifest(channel_id)
+                    if hasattr(router, "cached_manifest")
+                    else None
+                )
+                tier_name = (
+                    manifest.tier_effective().value
+                    if manifest is not None
+                    else None
+                )
+                result = PermissionResultDeny(
+                    message=_daily_hitl_cap_message(
+                        tier_name=tier_name,
+                        daily_limit=int(daily_limit),
+                    )
+                )
+            else:
+                result = PermissionResultDeny(message=f"HITL unavailable: {reason}")
             return result
 
         permission_request_id = str(uuid.uuid4())

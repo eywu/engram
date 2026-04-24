@@ -36,7 +36,7 @@ def test_permission_tier_enum_round_trip():
 
 def test_tier_defaults_exposed():
     assert set(_TIER_DEFAULTS) == set(PermissionTier)
-    assert _TIER_DEFAULTS[PermissionTier.TASK_ASSISTANT]["hitl_max_per_day"] == 1000
+    assert _TIER_DEFAULTS[PermissionTier.TASK_ASSISTANT]["hitl_max_per_day"] == 3
     assert tuple(_TIER_DEFAULTS[PermissionTier.OWNER_SCOPED]["allow_rules"]) == (
         OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES
     )
@@ -191,3 +191,85 @@ permissions:
     assert "Read(./secrets/**)" in manifest.permissions.deny
     for rule in _TIER_DEFAULTS[PermissionTier.TASK_ASSISTANT]["deny_rules"]:
         assert rule in manifest.permissions.deny, f"tier rule dropped: {rule}"
+
+
+def test_load_manifest_corrects_inferred_tier_drift_on_boot(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    path = tmp_path / "channel-manifest.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "channel_id": "C07TEST123",
+                "identity": IdentityTemplate.TASK_ASSISTANT.value,
+                "label": "#growth",
+                "status": "active",
+                "permission_tier": PermissionTier.OWNER_SCOPED.value,
+                "setting_sources": ["project"],
+                "permissions": {
+                    "allow": [],
+                    "deny": list(
+                        _TIER_DEFAULTS[PermissionTier.TASK_ASSISTANT]["deny_rules"]
+                    ),
+                },
+                "hitl": {
+                    "enabled": True,
+                    "timeout_s": 300,
+                    "max_per_day": 3,
+                },
+            },
+            sort_keys=False,
+        )
+    )
+
+    with caplog.at_level(logging.INFO, logger="engram.manifest"):
+        manifest = load_manifest(path)
+
+    assert manifest.permission_tier == PermissionTier.OWNER_SCOPED
+    assert manifest.hitl.max_per_day == 1000
+    assert manifest.permissions.allow == list(OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES)
+    assert manifest.permissions.deny == list(ABSOLUTE_DENY_RULES)
+    assert (
+        "manifest.tier_drift_corrected channel_id=C07TEST123 tier=trusted "
+        "field=hitl.max_per_day from=3 to=1000"
+    ) in caplog.text
+
+
+def test_load_manifest_skips_drift_correction_after_manual_hitl_patch(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    path = tmp_path / "channel-manifest.yaml"
+    safe_defaults = list(_TIER_DEFAULTS[PermissionTier.TASK_ASSISTANT]["deny_rules"])
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "channel_id": "C07TEST123",
+                "identity": IdentityTemplate.TASK_ASSISTANT.value,
+                "label": "#growth",
+                "status": "active",
+                "permission_tier": PermissionTier.OWNER_SCOPED.value,
+                "setting_sources": ["project"],
+                "permissions": {
+                    "allow": [],
+                    "deny": safe_defaults,
+                },
+                "hitl": {
+                    "enabled": True,
+                    "timeout_s": 300,
+                    "max_per_day": 1000,
+                },
+            },
+            sort_keys=False,
+        )
+    )
+
+    with caplog.at_level(logging.INFO, logger="engram.manifest"):
+        manifest = load_manifest(path)
+
+    assert manifest.permission_tier == PermissionTier.OWNER_SCOPED
+    assert manifest.hitl.max_per_day == 1000
+    assert manifest.permissions.allow == list(OWNER_DM_DEFAULT_PERMISSION_ALLOW_RULES)
+    assert manifest.permissions.deny == safe_defaults
+    assert "manifest.tier_drift_corrected" not in caplog.text

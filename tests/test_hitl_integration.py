@@ -24,6 +24,12 @@ from engram.egress import post_question, update_question_timeout
 from engram.hitl import PendingQuestion, build_hitl_tool_guard
 from engram.ingress import handle_block_action, handle_thread_reply
 from engram.main import _schedule_timeout_update
+from engram.manifest import (
+    ChannelManifest,
+    ChannelStatus,
+    IdentityTemplate,
+    PermissionTier,
+)
 from engram.router import Router
 
 CHANNEL_ID = "C07TEST123"
@@ -680,8 +686,18 @@ async def test_full_happy_path_thread_reply():
 
 
 @pytest.mark.asyncio
-async def test_daily_cap_across_sessions():
-    router = Router(hitl=HITLConfig(max_per_day=5))
+async def test_daily_cap_across_sessions(tmp_path: Path):
+    router = Router(home=tmp_path, hitl=HITLConfig(max_per_day=5))
+    await router.get(CHANNEL_ID, is_dm=False)
+    router.replace_cached_manifest(
+        ChannelManifest(
+            channel_id=CHANNEL_ID,
+            identity=IdentityTemplate.TASK_ASSISTANT,
+            status=ChannelStatus.ACTIVE,
+            permission_tier=PermissionTier.OWNER_SCOPED,
+            hitl=HITLConfig(max_per_day=5),
+        )
+    )
     harness = HITLHarness(router=router)
     for _ in range(5):
         router.hitl_limiter.reserve(CHANNEL_ID)
@@ -689,7 +705,11 @@ async def test_daily_cap_across_sessions():
     old_session_output = await harness.ask(tool_use_id="tool-old")
     new_session_output = await harness.ask(tool_use_id="tool-new")
 
-    expected_message = "HITL rate-limited: daily question budget exhausted (5/day)"
+    expected_message = (
+        "Engram has hit its per-channel HITL prompt cap for today "
+        "(current tier: trusted, cap: 5). To raise the cap, upgrade with "
+        "`/engram upgrade` or override via the channel manifest."
+    )
     assert isinstance(old_session_output, PermissionResultDeny)
     assert old_session_output.message == expected_message
     assert isinstance(new_session_output, PermissionResultDeny)

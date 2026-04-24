@@ -14,6 +14,7 @@ from typer.testing import CliRunner
 
 from engram.bootstrap import provision_channel
 from engram.cli_channels import app
+from engram.config import HITLConfig
 from engram.manifest import (
     ChannelStatus,
     IdentityTemplate,
@@ -252,7 +253,41 @@ def test_upgrade_sets_trusted_tier(cli, tmp_path: Path):
     assert "trusted" in result.output
     manifest = load_manifest(channel_manifest_path("C07TEAM", tmp_path / ".engram"))
     assert manifest.permission_tier == PermissionTier.OWNER_SCOPED
+    assert manifest.hitl.max_per_day == 1000
     assert manifest.yolo_until is None
+
+
+def test_upgrade_preserves_custom_hitl_override(cli, tmp_path: Path):
+    from engram.bootstrap import provision_channel as pc
+
+    home = tmp_path / ".engram"
+    pc(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        home=home,
+    )
+    manifest_path = channel_manifest_path("C07TEAM", home)
+    manifest = load_manifest(manifest_path)
+    dump_manifest(
+        manifest.model_copy(
+            update={
+                "hitl": HITLConfig(
+                    enabled=manifest.hitl.enabled,
+                    timeout_s=manifest.hitl.timeout_s,
+                    max_per_day=7,
+                )
+            }
+        ),
+        manifest_path,
+    )
+
+    trusted = cli.invoke(app, ["upgrade", "C07TEAM", "trusted"])
+    yolo = cli.invoke(app, ["upgrade", "C07TEAM", "yolo", "--until", "24h"])
+
+    updated = load_manifest(manifest_path)
+    assert trusted.exit_code == 0
+    assert yolo.exit_code == 0
+    assert updated.hitl.max_per_day == 7
 
 
 def test_upgrade_accepts_deprecated_tier_alias_with_warning(cli, tmp_path: Path):
