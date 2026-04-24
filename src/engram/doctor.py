@@ -24,8 +24,7 @@ from engram.config import EngramConfig
 from engram.runtime import fd_usage_snapshot, read_latest_fd_snapshot
 
 SLACK_AUTH_TEST_URL = "https://slack.com/api/auth.test"
-ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_DOCTOR_MODEL = "claude-3-5-haiku-latest"
+ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
 GEMINI_EMBED_URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent?key={api_key}"
 )
@@ -539,19 +538,13 @@ def check_anthropic_api_key(
     if config is None:
         return _blocked_by_config("anthropic_api_key", "Anthropic API key")
 
-    request = requester or _post_json
+    request = requester or _get_json
     try:
         response = request(
-            ANTHROPIC_MESSAGES_URL,
+            ANTHROPIC_MODELS_URL,
             headers={
                 "x-api-key": config.anthropic.api_key,
                 "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            payload={
-                "model": ANTHROPIC_DOCTOR_MODEL,
-                "max_tokens": 1,
-                "messages": [{"role": "user", "content": "ping"}],
             },
         )
     except Exception as exc:
@@ -559,46 +552,69 @@ def check_anthropic_api_key(
             id="anthropic_api_key",
             name="Anthropic API key",
             status=CheckStatus.WARN,
-            message=f"Could not reach Anthropic messages API: {type(exc).__name__}: {exc}",
+            message=f"Could not reach Anthropic models API: {type(exc).__name__}: {exc}",
             details={
                 "error_class": type(exc).__name__,
-                "model": ANTHROPIC_DOCTOR_MODEL,
                 "configured_model": config.anthropic.model,
             },
         )
 
     details = {
         "status_code": response.status_code,
-        "model": ANTHROPIC_DOCTOR_MODEL,
         "configured_model": config.anthropic.model,
     }
-    if response.status_code == 200:
+    if response.status_code == 401:
         return DoctorCheck(
             id="anthropic_api_key",
             name="Anthropic API key",
-            status=CheckStatus.PASS,
-            message=f"Anthropic messages API accepted the key for {ANTHROPIC_DOCTOR_MODEL}.",
+            status=CheckStatus.FAIL,
+            message="Anthropic API key was rejected with 401; check ANTHROPIC_API_KEY.",
             details=details,
         )
-    if response.status_code == 401:
-        message = "Anthropic API key was rejected with 401; check ANTHROPIC_API_KEY."
-    elif response.status_code == 403:
-        message = "Anthropic API key is unauthorized for this request (403)."
-    elif response.status_code == 429:
+    if response.status_code == 429:
         return DoctorCheck(
             id="anthropic_api_key",
             name="Anthropic API key",
             status=CheckStatus.WARN,
-            message="Anthropic API is rate limited; the key reached the service.",
+            message="Anthropic models API is rate limited; the key reached the service.",
             details=details,
         )
-    else:
-        message = f"Anthropic messages API returned HTTP {response.status_code}."
+    if response.status_code != 200:
+        return DoctorCheck(
+            id="anthropic_api_key",
+            name="Anthropic API key",
+            status=CheckStatus.WARN,
+            message=f"Anthropic models API returned unexpected HTTP {response.status_code}.",
+            details=details,
+        )
+
+    models = response.payload.get("data")
+    available_models = sorted(
+        str(model_id)
+        for item in models
+        if isinstance(item, dict) and (model_id := item.get("id"))
+    ) if isinstance(models, list) else []
+    details["available_models"] = available_models
+
+    configured_model = config.anthropic.model
+    if configured_model not in available_models:
+        available_text = ", ".join(available_models) if available_models else "(none returned)"
+        return DoctorCheck(
+            id="anthropic_api_key",
+            name="Anthropic API key",
+            status=CheckStatus.FAIL,
+            message=(
+                f"Configured Anthropic model '{configured_model}' is not accessible with this key. "
+                f"Available: {available_text}"
+            ),
+            details=details,
+        )
+
     return DoctorCheck(
         id="anthropic_api_key",
         name="Anthropic API key",
-        status=CheckStatus.FAIL,
-        message=message,
+        status=CheckStatus.PASS,
+        message=f"Anthropic key valid; configured model '{configured_model}' is accessible.",
         details=details,
     )
 
@@ -950,6 +966,34 @@ def _post_json(
         data=data,
         headers=headers,
         method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            text = response.read().decode("utf-8", errors="replace")
+            return HttpResult(
+                status_code=response.status,
+                payload=_parse_json_payload(text),
+                text=text,
+            )
+    except urllib.error.HTTPError as exc:
+        text = exc.read().decode("utf-8", errors="replace")
+        return HttpResult(
+            status_code=exc.code,
+            payload=_parse_json_payload(text),
+            text=text,
+        )
+
+
+def _get_json(
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: float = 3.0,
+) -> HttpResult:
+    request = urllib.request.Request(
+        url,
+        headers=headers,
+        method="GET",
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:

@@ -249,16 +249,64 @@ def test_check_slack_slash_commands_warns_when_recent_logs_are_inconclusive(
     assert "should autocomplete" in check.message
 
 
-def test_check_anthropic_api_key_validates_messages_api(tmp_path: Path) -> None:
-    def requester(*_args, **kwargs) -> HttpResult:
-        assert kwargs["payload"]["max_tokens"] == 1
-        assert kwargs["payload"]["model"] == "claude-3-5-haiku-latest"
-        return HttpResult(200, {"id": "msg_test"})
+def test_check_anthropic_api_key_validates_configured_model_access(tmp_path: Path) -> None:
+    def requester(url: str, **kwargs) -> HttpResult:
+        assert url == "https://api.anthropic.com/v1/models"
+        assert kwargs["headers"]["x-api-key"] == "sk-ant-test"
+        assert "payload" not in kwargs
+        return HttpResult(
+            200,
+            {
+                "data": [
+                    {"id": "claude-test-model"},
+                    {"id": "claude-sonnet-4-6"},
+                ]
+            },
+        )
 
     check = check_anthropic_api_key(_config(tmp_path), requester=requester)
 
     assert check.status == CheckStatus.PASS
     assert check.details["status_code"] == 200
+    assert check.details["available_models"] == [
+        "claude-sonnet-4-6",
+        "claude-test-model",
+    ]
+
+
+def test_check_anthropic_api_key_fails_when_configured_model_not_accessible(
+    tmp_path: Path,
+) -> None:
+    cfg = EngramConfig(
+        slack=SlackConfig(bot_token="xoxb-test", app_token="xapp-test"),
+        anthropic=AnthropicConfig(api_key="sk-ant-test", model="claude-missing"),
+        paths=PathsConfig(
+            state_dir=tmp_path / "state",
+            contexts_dir=tmp_path / "contexts",
+            log_dir=tmp_path / "logs",
+        ),
+    )
+
+    def requester(*_args, **_kwargs) -> HttpResult:
+        return HttpResult(
+            200,
+            {
+                "data": [
+                    {"id": "claude-opus-4-6"},
+                    {"id": "claude-sonnet-4-6"},
+                ]
+            },
+        )
+
+    check = check_anthropic_api_key(cfg, requester=requester)
+
+    assert check.status == CheckStatus.FAIL
+    assert "claude-missing" in check.message
+    assert "claude-opus-4-6, claude-sonnet-4-6" in check.message
+    assert check.details["available_models"] == [
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+    ]
 
 
 def test_check_gemini_api_key_absent_is_keyword_only_memory(tmp_path: Path) -> None:
@@ -432,7 +480,13 @@ def test_doctor_cli_json_against_tmp_config(
             return HttpResult(200, {"ok": True, "team_id": "T123"})
         return HttpResult(200, {"ok": True})
 
+    def get_json(url: str, **_kwargs) -> HttpResult:
+        if url == "https://api.anthropic.com/v1/models":
+            return HttpResult(200, {"data": [{"id": "claude-test-model"}]})
+        raise AssertionError(f"unexpected GET url: {url}")
+
     monkeypatch.setattr("engram.doctor._post_json", post_json)
+    monkeypatch.setattr("engram.doctor._get_json", get_json)
 
     result = CliRunner().invoke(app, ["doctor", "--json"])
 
