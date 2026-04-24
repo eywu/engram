@@ -13,7 +13,6 @@ import contextlib
 import datetime
 import logging
 import re
-import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -32,9 +31,7 @@ from engram.egress import (
     _suggestion_label,
     build_footgun_confirmation_modal,
     post_reply,
-    post_upgrade_request_dm,
     post_upgrade_result_in_channel,
-    post_upgrade_waiting_message,
     post_yolo_expired_notification,
     render_active_yolo_grants,
     update_question_resolved,
@@ -83,6 +80,7 @@ CHANNELS_DASHBOARD_PAGE_SIZE = 20
 CHANNELS_DASHBOARD_BLOCK_ID_PATTERN = re.compile(
     r"^engram_channels:(?P<page>\d+):(?P<kind>nav|channel:[A-Z0-9]+)$"
 )
+UPGRADE_PICKER_BLOCK_ID_PREFIX = "engram_upgrade_picker:"
 CHANNEL_REF_PATTERN = re.compile(r"<#(?P<id>[A-Z0-9]+)(?:\|[^>]+)?>")
 CHANNEL_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]+$")
 _PENDING_UPGRADE_REQUESTS: dict[str, PendingUpgradeRequest] = {}
@@ -301,7 +299,7 @@ def register_listeners(
     async def on_channels_tier_pick(ack, body, client, respond):
         await ack()
         try:
-            result = await handle_channels_dashboard_action(
+            result = await handle_tier_pick_action(
                 payload=body,
                 router=router,
                 config=config,
@@ -1007,16 +1005,14 @@ async def handle_engram_command(
 
     if subcommand == "upgrade":
         if len(parts) < 2:
-            await _post_ephemeral_reply(
-                slack_client,
-                channel_id=source_channel_id,
+            return await handle_upgrade_picker_command(
+                router=router,
+                config=config,
+                slack_client=slack_client,
+                source_channel_id=source_channel_id,
+                source_channel_name=source_channel_name,
                 user_id=user_id,
-                text=(
-                    "Usage: /engram upgrade "
-                    f"<{permission_tier_choices_text()}> [reason...]"
-                ),
             )
-            return {"ok": False, "error": "missing tier"}
 
         try:
             tier, _deprecated_alias = parse_permission_tier(parts[1])
@@ -1459,18 +1455,56 @@ async def handle_upgrade_command(
     if not source_channel_id:
         return {"ok": False, "error": "missing source channel"}
 
-    owner_dm_channel_id = config.owner_dm_channel_id or router.owner_dm_channel_id
-    if not owner_dm_channel_id or not config.owner_user_id:
+    if not config.owner_user_id:
         await _post_ephemeral_reply(
             slack_client,
             channel_id=source_channel_id,
             user_id=user_id,
             text=(
                 "Permission upgrades are not configured yet. "
-                "Ask the operator to set owner_dm_channel_id and owner_user_id."
+                "Ask the operator to set owner_user_id."
             ),
         )
-        return {"ok": False, "error": "owner approval config missing"}
+        return {"ok": False, "error": "owner user is not configured"}
+
+    result = await _set_channel_tier_from_request(
+        router=router,
+        config=config,
+        slack_client=slack_client,
+        channel_id=source_channel_id,
+        channel_name=source_channel_name,
+        clicker_user_id=user_id,
+        target_tier=requested_tier,
+        yolo_duration=_YOLO_DURATION_ALIASES["24"] if requested_tier == PermissionTier.YOLO else None,
+    )
+    if result["ok"]:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=str(result["ack_text"]),
+        )
+    else:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=str(result["message"]),
+        )
+    return result
+
+
+async def handle_upgrade_picker_command(
+    *,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+    source_channel_id: str,
+    source_channel_name: str | None,
+    user_id: str | None,
+) -> dict[str, object]:
+    if not source_channel_id:
+        return {"ok": False, "error": "missing source channel"}
 
     session = await router.get(
         source_channel_id,
@@ -1478,70 +1512,131 @@ async def handle_upgrade_command(
         is_dm=source_channel_id.startswith("D"),
     )
     manifest = session.manifest
-    source_channel_label = (
-        _manifest_display_label(manifest)
+    current_tier = (
+        manifest.tier_effective()
         if manifest is not None
-        else (_channel_label_from_name(source_channel_name) or source_channel_id)
+        else PermissionTier.TASK_ASSISTANT
     )
-    from_tier = (
+    is_owner = _is_owner_user(config=config, user_id=user_id)
+    text, blocks = build_tier_picker_blocks(
+        channel_id=source_channel_id,
+        current_tier=current_tier,
+        is_owner=is_owner,
+        invoker_user_id=user_id,
+    )
+    await _post_ephemeral_reply(
+        slack_client,
+        channel_id=source_channel_id,
+        user_id=user_id,
+        text=text,
+        blocks=blocks,
+    )
+    return {
+        "ok": True,
+        "picker": True,
+        "tier": current_tier.value,
+        "is_owner": is_owner,
+    }
+
+
+async def handle_tier_pick_action(
+    *,
+    payload: dict[str, object],
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+) -> dict[str, object]:
+    actions = payload.get("actions") or []
+    if not actions:
+        return {"ok": False, "error": "no actions"}
+
+    action = actions[0]
+    block_id = str(action.get("block_id") or "")
+    if CHANNELS_DASHBOARD_BLOCK_ID_PATTERN.match(block_id):
+        return await handle_channels_dashboard_action(
+            payload=payload,
+            router=router,
+            config=config,
+            slack_client=slack_client,
+        )
+    if not block_id.startswith(UPGRADE_PICKER_BLOCK_ID_PREFIX):
+        return {"ok": False, "error": "unsupported action"}
+
+    clicker_user_id = str(payload.get("user", {}).get("id") or "") or None
+    parsed = _decode_upgrade_picker_value(str(action.get("value") or ""))
+    if parsed is None:
+        return {
+            "ok": False,
+            "error": "malformed value",
+            "response": _replace_original_ephemeral(
+                text="Could not change channel tier."
+            ),
+        }
+
+    channel_id, target_tier, invoker_user_id = parsed
+    if clicker_user_id != invoker_user_id:
+        return {
+            "ok": False,
+            "error": "identity mismatch",
+            "response": _replace_original_ephemeral(
+                text="This picker was opened for a different user. Run `/engram upgrade` yourself."
+            ),
+        }
+
+    session = await router.get(
+        channel_id,
+        channel_name=None,
+        is_dm=channel_id.startswith("D"),
+    )
+    manifest = session.manifest
+    current_tier = (
         manifest.tier_effective()
         if manifest is not None
         else PermissionTier.TASK_ASSISTANT
     )
 
-    await _supersede_pending_upgrade_for_channel(
-        source_channel_id=source_channel_id,
-        slack_client=slack_client,
-    )
+    if target_tier == PermissionTier.YOLO:
+        if not _is_owner_user(config=config, user_id=clicker_user_id):
+            return {
+                "ok": False,
+                "error": "not owner",
+                "response": _replace_original_ephemeral(
+                    text="Only the channel owner can upgrade."
+                ),
+            }
+        text, blocks = _render_yolo_duration_picker(channel_id=channel_id)
+        return {
+            "ok": True,
+            "response": _replace_original_ephemeral(text=text, blocks=blocks),
+        }
 
-    source_message_ts = await post_upgrade_waiting_message(
-        slack_client,
-        channel_id=source_channel_id,
-    )
-    request_id = str(uuid.uuid4())
-    owner_dm_message_ts = await post_upgrade_request_dm(
-        slack_client,
-        owner_dm_channel_id=owner_dm_channel_id,
-        source_channel_id=source_channel_id,
-        source_channel_label=source_channel_label,
-        requested_by_user_id=user_id,
-        from_tier=from_tier,
-        to_tier=requested_tier,
-        reason=reason,
-        action_value=_encode_upgrade_action_value(
-            request_id=request_id,
-            channel_id=source_channel_id,
-        ),
-    )
-    request = PendingUpgradeRequest(
-        request_id=request_id,
-        source_channel_id=source_channel_id,
-        source_channel_label=source_channel_label,
-        source_message_ts=source_message_ts,
-        owner_dm_channel_id=owner_dm_channel_id,
-        owner_dm_message_ts=owner_dm_message_ts,
-        requested_by_user_id=user_id,
-        from_tier=from_tier,
-        to_tier=requested_tier,
-        reason=reason,
-    )
-    _PENDING_UPGRADE_REQUESTS[request_id] = request
-    _PENDING_UPGRADE_REQUESTS_BY_CHANNEL[source_channel_id] = request_id
-    log.info(
-        "permission.upgrade_requested",
-        extra={
-            "channel": source_channel_id,
-            "user": user_id,
-            "from_tier": from_tier.value,
-            "to_tier": requested_tier.value,
-            "reason": reason or "",
-        },
+    if target_tier == current_tier:
+        return {
+            "ok": True,
+            "changed": False,
+            "response": _replace_original_ephemeral(
+                text=f"Already on `{current_tier.value}` — no change."
+            ),
+        }
+
+    result = await _set_channel_tier_from_request(
+        router=router,
+        config=config,
+        slack_client=slack_client,
+        channel_id=channel_id,
+        channel_name=session.channel_name,
+        clicker_user_id=clicker_user_id,
+        target_tier=target_tier,
     )
     return {
-        "ok": True,
-        "request_id": request_id,
-        "source_message_ts": source_message_ts,
-        "owner_dm_message_ts": owner_dm_message_ts,
+        **result,
+        "response": _replace_original_ephemeral(
+            text=(
+                str(result["ack_text"])
+                if result["ok"]
+                else str(result["message"])
+            )
+        ),
     }
 
 
@@ -1927,6 +2022,80 @@ def _channels_dashboard_replace_original(
     return _replace_original_ephemeral(text=text, blocks=blocks)
 
 
+async def _set_channel_tier_from_request(
+    *,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+    channel_id: str,
+    channel_name: str | None,
+    clicker_user_id: str | None,
+    target_tier: PermissionTier,
+    yolo_duration: str | None = None,
+) -> dict[str, object]:
+    session = await router.get(
+        channel_id,
+        channel_name=_channel_label_from_name(channel_name),
+        is_dm=channel_id.startswith("D"),
+    )
+    manifest = session.manifest
+    current_tier = (
+        manifest.tier_effective()
+        if manifest is not None
+        else PermissionTier.TASK_ASSISTANT
+    )
+    is_owner = _is_owner_user(config=config, user_id=clicker_user_id)
+
+    if _is_tier_upgrade(current_tier, target_tier) and not is_owner:
+        return {
+            "ok": False,
+            "error": "not owner",
+            "message": "Only the channel owner can upgrade.",
+        }
+
+    if target_tier == PermissionTier.YOLO:
+        return await _activate_yolo_grant(
+            router=router,
+            slack_client=slack_client,
+            channel_id=channel_id,
+            duration=yolo_duration or _YOLO_DURATION_ALIASES["24"],
+            clicker_user_id=clicker_user_id,
+        )
+
+    if target_tier == current_tier:
+        return {
+            "ok": True,
+            "changed": False,
+            "ack_text": f"Already on `{current_tier.value}` — no change.",
+        }
+
+    try:
+        previous, updated, _manifest_path, _normalized_duration = set_channel_permission_tier(
+            channel_id,
+            target_tier,
+            duration="permanent",
+            home=router.home,
+        )
+    except (ManifestError, ValueError) as exc:
+        return {"ok": False, "error": "set tier failed", "message": str(exc)}
+
+    router.replace_cached_manifest(updated)
+    await slack_client.chat_postMessage(
+        channel=channel_id,
+        text=_tier_change_public_notice(
+            previous_tier=current_tier,
+            target_tier=target_tier,
+            clicker_user_id=clicker_user_id,
+        ),
+    )
+    return {
+        "ok": True,
+        "changed": previous != updated,
+        "tier": updated.permission_tier.value,
+        "ack_text": _tier_change_ack_text(target_tier),
+    }
+
+
 async def _set_dashboard_nightly_included(
     *,
     router: Router,
@@ -2216,6 +2385,150 @@ def _channels_dashboard_tier_label(tier: PermissionTier) -> str:
     if tier == PermissionTier.YOLO:
         return "🚀 yolo"
     return "✨ trusted"
+
+
+def _tier_rank(tier: PermissionTier) -> int:
+    return {
+        PermissionTier.TASK_ASSISTANT: 0,
+        PermissionTier.OWNER_SCOPED: 1,
+        PermissionTier.YOLO: 2,
+    }[tier]
+
+
+def _is_tier_upgrade(current_tier: PermissionTier, target_tier: PermissionTier) -> bool:
+    return _tier_rank(target_tier) > _tier_rank(current_tier)
+
+
+def _tier_picker_button_text(
+    tier: PermissionTier,
+    *,
+    current_tier: PermissionTier,
+    is_owner: bool,
+) -> str:
+    base = {
+        PermissionTier.TASK_ASSISTANT: "🔒 Safe",
+        PermissionTier.OWNER_SCOPED: "✨ Trusted",
+        PermissionTier.YOLO: "🚀 YOLO",
+    }[tier]
+    if tier == current_tier:
+        return f"{base} (current)"
+    if not is_owner and _is_tier_upgrade(current_tier, tier):
+        return f"{base} (owner only)"
+    return base
+
+
+def _tier_picker_button_style(
+    tier: PermissionTier,
+    *,
+    current_tier: PermissionTier,
+    is_owner: bool,
+) -> str | None:
+    if tier == current_tier:
+        return None
+    if not is_owner and _is_tier_upgrade(current_tier, tier):
+        return None
+    return "primary"
+
+
+def build_tier_picker_blocks(
+    *,
+    channel_id: str,
+    current_tier: PermissionTier,
+    is_owner: bool,
+    invoker_user_id: str | None,
+) -> tuple[str, list[dict[str, object]]]:
+    current_text = f"Current tier: {current_tier.value}"
+    if is_owner:
+        intro = "Pick a new tier:"
+    elif current_tier == PermissionTier.TASK_ASSISTANT:
+        intro = "Only the channel owner can upgrade. This channel is already on the lowest tier."
+    else:
+        intro = "Only the channel owner can upgrade. You can downgrade:"
+
+    buttons = [
+        _dashboard_button(
+            text=_tier_picker_button_text(
+                tier,
+                current_tier=current_tier,
+                is_owner=is_owner,
+            ),
+            action_id=ACTION_ID_TIER_PICK,
+            value=f"{channel_id}|{tier.value}|{invoker_user_id or ''}",
+            style=_tier_picker_button_style(
+                tier,
+                current_tier=current_tier,
+                is_owner=is_owner,
+            ),
+        )
+        for tier in (
+            PermissionTier.TASK_ASSISTANT,
+            PermissionTier.OWNER_SCOPED,
+            PermissionTier.YOLO,
+        )
+    ]
+    text = f"{current_text}\n{intro}"
+    return text, [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{current_text}*\n{intro}"},
+        },
+        {
+            "type": "actions",
+            "block_id": f"{UPGRADE_PICKER_BLOCK_ID_PREFIX}{channel_id}",
+            "elements": buttons,
+        },
+    ]
+
+
+def _decode_upgrade_picker_value(
+    raw: str,
+) -> tuple[str, PermissionTier, str] | None:
+    channel_id, first_sep, remainder = raw.partition("|")
+    if not first_sep or not CHANNEL_ID_PATTERN.match(channel_id):
+        return None
+    target_tier_raw, second_sep, invoker_user_id = remainder.partition("|")
+    if not second_sep or not invoker_user_id:
+        return None
+    try:
+        target_tier, _deprecated_alias = parse_permission_tier(target_tier_raw)
+    except ValueError:
+        return None
+    return channel_id, target_tier, invoker_user_id
+
+
+def _tier_change_summary(target_tier: PermissionTier) -> str:
+    if target_tier == PermissionTier.TASK_ASSISTANT:
+        return "Read-only tools no longer auto-allow."
+    if target_tier == PermissionTier.OWNER_SCOPED:
+        return "Read-only tools now auto-allow."
+    return "HITL gates are bypassed temporarily."
+
+
+def _tier_change_icon(target_tier: PermissionTier) -> str:
+    if target_tier == PermissionTier.TASK_ASSISTANT:
+        return "🔒"
+    if target_tier == PermissionTier.YOLO:
+        return "🚀"
+    return "✨"
+
+
+def _tier_change_ack_text(target_tier: PermissionTier) -> str:
+    return f"Tier set to `{target_tier.value}`. {_tier_change_summary(target_tier)}"
+
+
+def _tier_change_public_notice(
+    *,
+    previous_tier: PermissionTier,
+    target_tier: PermissionTier,
+    clicker_user_id: str | None,
+) -> str:
+    actor = f"<@{clicker_user_id}>" if clicker_user_id else "Someone"
+    verb = "upgraded" if _is_tier_upgrade(previous_tier, target_tier) else "downgraded"
+    return (
+        f"{_tier_change_icon(target_tier)} {actor} {verb} this channel to "
+        f"`{target_tier.value}`. {_tier_change_summary(target_tier)} "
+        "Type `/engram` to see current settings."
+    )
 
 
 def _channels_dashboard_expiry_text(expires_at: datetime.datetime) -> str:

@@ -1,8 +1,6 @@
-"""Tests for GRO-501 tier-upgrade request and approval flows."""
+"""Tests for GRO-511 button-driven tier changes."""
 from __future__ import annotations
 
-import logging
-from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -10,10 +8,9 @@ import pytest
 
 from engram.config import AnthropicConfig, EngramConfig, SlackConfig
 from engram.ingress import (
-    _PENDING_UPGRADE_REQUESTS,
-    _PENDING_UPGRADE_REQUESTS_BY_CHANNEL,
-    handle_upgrade_action,
-    handle_upgrade_command,
+    ACTION_ID_TIER_PICK,
+    handle_engram_command,
+    handle_tier_pick_action,
 )
 from engram.manifest import (
     ChannelManifest,
@@ -30,8 +27,8 @@ from engram.router import Router
 class FakeSlackClient:
     def __init__(self) -> None:
         self.post_calls: list[dict[str, Any]] = []
-        self.update_calls: list[dict[str, Any]] = []
         self.ephemeral_calls: list[dict[str, Any]] = []
+        self.update_calls: list[dict[str, Any]] = []
         self.chat_postMessage = self._chat_post_message
         self.chat_postEphemeral = self._chat_post_ephemeral
 
@@ -47,15 +44,6 @@ class FakeSlackClient:
     async def chat_update(self, **kwargs):
         self.update_calls.append(kwargs)
         return {"ok": True}
-
-
-@pytest.fixture(autouse=True)
-def clear_pending_requests() -> None:
-    _PENDING_UPGRADE_REQUESTS.clear()
-    _PENDING_UPGRADE_REQUESTS_BY_CHANNEL.clear()
-    yield
-    _PENDING_UPGRADE_REQUESTS.clear()
-    _PENDING_UPGRADE_REQUESTS_BY_CHANNEL.clear()
 
 
 def make_config() -> EngramConfig:
@@ -90,115 +78,166 @@ def write_active_manifest(
     dump_manifest(ChannelManifest(**payload), path)
 
 
-def owner_action_payload(*, action_id: str, value: str, user_id: str = "U07OWNER") -> dict[str, Any]:
+def picker_payload(
+    *,
+    value: str,
+    user_id: str,
+    channel_id: str = "C07TEAM",
+) -> dict[str, Any]:
     return {
-        "actions": [{"action_id": action_id, "value": value}],
-        "channel": {"id": "D07OWNER"},
+        "actions": [
+            {
+                "action_id": ACTION_ID_TIER_PICK,
+                "block_id": f"engram_upgrade_picker:{channel_id}",
+                "value": value,
+            }
+        ],
+        "channel": {"id": channel_id},
         "user": {"id": user_id},
     }
 
 
-@pytest.mark.asyncio
-async def test_upgrade_command_posts_waiting_message_and_owner_dm(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    home = tmp_path / ".engram"
-    write_active_manifest(home, "C07TEAM")
-    router = Router(home=home, owner_dm_channel_id="D07OWNER")
-    slack = FakeSlackClient()
-
-    with caplog.at_level(logging.INFO, logger="engram.ingress"):
-        result = await handle_upgrade_command(
-            router=router,
-            config=make_config(),
-            slack_client=slack,
-            source_channel_id="C07TEAM",
-            source_channel_name="growth",
-            user_id="U07REQUESTER",
-            requested_tier=PermissionTier.OWNER_SCOPED,
-            reason="private workspace",
-        )
-
-    assert result["ok"] is True
-    assert len(slack.post_calls) == 2
-    assert slack.post_calls[0]["channel"] == "C07TEAM"
-    assert slack.post_calls[0]["text"] == (
-        "⏳ Permission upgrade requested — waiting for owner approval."
-    )
-    assert slack.post_calls[1]["channel"] == "D07OWNER"
-    assert slack.post_calls[1]["text"] == "Permission upgrade request"
-    button_texts = [
-        element["text"]["text"]
-        for element in slack.post_calls[1]["blocks"][1]["elements"]
-    ]
-    assert button_texts == [
-        "Approve until revoked",
-        "Approve 30d",
-        "Deny",
-    ]
-    record = next(
-        item for item in caplog.records if item.getMessage() == "permission.upgrade_requested"
-    )
-    assert record.channel == "C07TEAM"
-    assert record.user == "U07REQUESTER"
-    assert record.from_tier == "safe"
-    assert record.to_tier == "trusted"
-    assert record.reason == "private workspace"
+def action_texts(blocks: list[dict[str, Any]]) -> list[str]:
+    return [str(element["text"]["text"]) for element in blocks[1]["elements"]]
 
 
 @pytest.mark.asyncio
-async def test_upgrade_approve_permanent_updates_manifest_and_messages(
+async def test_bare_upgrade_command_shows_owner_picker_with_all_tiers(
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     home = tmp_path / ".engram"
-    write_active_manifest(home, "C07TEAM")
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
     router = Router(home=home, owner_dm_channel_id="D07OWNER")
     slack = FakeSlackClient()
 
-    await handle_upgrade_command(
+    result = await handle_engram_command(
         router=router,
         config=make_config(),
         slack_client=slack,
         source_channel_id="C07TEAM",
         source_channel_name="growth",
-        user_id="U07REQUESTER",
-        requested_tier=PermissionTier.OWNER_SCOPED,
-        reason="private workspace",
+        user_id="U07OWNER",
+        command_text="upgrade",
     )
-    approve_value = slack.post_calls[1]["blocks"][1]["elements"][0]["value"]
 
-    with caplog.at_level(logging.INFO, logger="engram.ingress"):
-        result = await handle_upgrade_action(
-            payload=owner_action_payload(
-                action_id="upgrade_decision_approve_permanent",
-                value=approve_value,
-            ),
-            router=router,
-            slack_client=slack,
-            owner_user_id="U07OWNER",
-        )
-
-    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
-    assert result == {"ok": True, "decision": "approve", "duration": "permanent"}
-    assert manifest.permission_tier == PermissionTier.OWNER_SCOPED
-    assert manifest.nightly_included is False
-    assert manifest.yolo_until is None
-    assert manifest.pre_yolo_tier is None
-    assert [call["channel"] for call in slack.update_calls] == ["C07TEAM", "D07OWNER"]
-    assert slack.update_calls[0]["text"] == "✅ Upgraded to trusted by <@U07OWNER>."
-    assert slack.update_calls[1]["text"] == "✅ Approved by <@U07OWNER>."
-    record = next(
-        item for item in caplog.records if item.getMessage() == "permission.upgrade_granted"
-    )
-    assert record.channel == "C07TEAM"
-    assert record.approver == "U07OWNER"
-    assert record.duration == "permanent"
+    assert result == {"ok": True, "picker": True, "tier": "safe", "is_owner": True}
+    assert slack.post_calls == []
+    assert slack.ephemeral_calls[0]["text"] == "Current tier: safe\nPick a new tier:"
+    assert action_texts(slack.ephemeral_calls[0]["blocks"]) == [
+        "🔒 Safe (current)",
+        "✨ Trusted",
+        "🚀 YOLO",
+    ]
+    assert [element.get("style") for element in slack.ephemeral_calls[0]["blocks"][1]["elements"]] == [
+        None,
+        "primary",
+        "primary",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_upgrade_to_safe_auto_excludes_and_posts_notice(
+async def test_bare_upgrade_command_shows_non_owner_only_downgrade_enabled(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.OWNER_SCOPED)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OTHER",
+        command_text="upgrade",
+    )
+
+    assert result == {"ok": True, "picker": True, "tier": "trusted", "is_owner": False}
+    assert (
+        slack.ephemeral_calls[0]["text"]
+        == "Current tier: trusted\nOnly the channel owner can upgrade. You can downgrade:"
+    )
+    assert action_texts(slack.ephemeral_calls[0]["blocks"]) == [
+        "🔒 Safe",
+        "✨ Trusted (current)",
+        "🚀 YOLO (owner only)",
+    ]
+    assert [element.get("style") for element in slack.ephemeral_calls[0]["blocks"][1]["elements"]] == [
+        "primary",
+        None,
+        None,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tier_pick_action_reverifies_invoker_identity(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_tier_pick_action(
+        payload=picker_payload(
+            value="C07TEAM|trusted|U07OWNER",
+            user_id="U07OTHER",
+        ),
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+    )
+
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result["ok"] is False
+    assert result["error"] == "identity mismatch"
+    assert (
+        result["response"]["text"]
+        == "This picker was opened for a different user. Run `/engram upgrade` yourself."
+    )
+    assert manifest.permission_tier == PermissionTier.TASK_ASSISTANT
+    assert slack.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_owner_tier_pick_updates_manifest_and_posts_public_notice(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_tier_pick_action(
+        payload=picker_payload(
+            value="C07TEAM|trusted|U07OWNER",
+            user_id="U07OWNER",
+        ),
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+    )
+
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result["ok"] is True
+    assert manifest.permission_tier == PermissionTier.OWNER_SCOPED
+    assert result["response"]["text"] == "Tier set to `trusted`. Read-only tools now auto-allow."
+    assert slack.post_calls == [
+        {
+            "channel": "C07TEAM",
+            "text": (
+                "✨ <@U07OWNER> upgraded this channel to `trusted`. "
+                "Read-only tools now auto-allow. Type `/engram` to see current settings."
+            ),
+            "_ts": slack.post_calls[0]["_ts"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_non_owner_downgrade_via_picker_is_allowed(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / ".engram"
@@ -211,207 +250,155 @@ async def test_upgrade_to_safe_auto_excludes_and_posts_notice(
     router = Router(home=home, owner_dm_channel_id="D07OWNER")
     slack = FakeSlackClient()
 
-    await handle_upgrade_command(
-        router=router,
-        config=make_config(),
-        slack_client=slack,
-        source_channel_id="C07TEAM",
-        source_channel_name="growth",
-        user_id="U07REQUESTER",
-        requested_tier=PermissionTier.TASK_ASSISTANT,
-        reason="lock it down",
-    )
-    approve_value = slack.post_calls[1]["blocks"][1]["elements"][0]["value"]
-
-    result = await handle_upgrade_action(
-        payload=owner_action_payload(
-            action_id="upgrade_decision_approve_permanent",
-            value=approve_value,
-        ),
-        router=router,
-        slack_client=slack,
-        owner_user_id="U07OWNER",
-    )
-
-    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
-    assert result == {"ok": True, "decision": "approve", "duration": "permanent"}
-    assert manifest.permission_tier == PermissionTier.TASK_ASSISTANT
-    assert manifest.nightly_included is False
-    assert slack.update_calls[0]["text"] == "✅ Upgraded to safe by <@U07OWNER>."
-    assert slack.post_calls[-1]["channel"] == "C07TEAM"
-    assert (
-        slack.post_calls[-1]["text"]
-        == "Downgrading to `safe` also excluded this channel from nightly summary (required for safe tier)."
-    )
-
-
-@pytest.mark.asyncio
-async def test_upgrade_approve_bounded_yolo_sets_expiry(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / ".engram"
-    write_active_manifest(home, "C07TEAM")
-    router = Router(home=home, owner_dm_channel_id="D07OWNER")
-    slack = FakeSlackClient()
-
-    await handle_upgrade_command(
-        router=router,
-        config=make_config(),
-        slack_client=slack,
-        source_channel_id="C07TEAM",
-        source_channel_name="growth",
-        user_id="U07REQUESTER",
-        requested_tier=PermissionTier.YOLO,
-        reason="need fast iteration",
-    )
-
-    dm_buttons = slack.post_calls[1]["blocks"][1]["elements"]
-    assert [button["text"]["text"] for button in dm_buttons] == [
-        "Approve 24h",
-        "Approve 6h",
-        "Deny",
-    ]
-
-    result = await handle_upgrade_action(
-        payload=owner_action_payload(
-            action_id="upgrade_decision_approve_24h",
-            value=dm_buttons[0]["value"],
-        ),
-        router=router,
-        slack_client=slack,
-        owner_user_id="U07OWNER",
-    )
-
-    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
-    assert result == {"ok": True, "decision": "approve", "duration": "24h"}
-    assert manifest.permission_tier == PermissionTier.YOLO
-    assert manifest.yolo_granted_at is not None
-    assert manifest.yolo_until is not None
-    assert manifest.yolo_until - manifest.yolo_granted_at == timedelta(hours=24)
-    assert manifest.pre_yolo_tier == PermissionTier.TASK_ASSISTANT
-    assert slack.update_calls[0]["text"] == "✅ Upgraded to yolo by <@U07OWNER>."
-    assert slack.update_calls[1]["text"] == "✅ Approved by <@U07OWNER>."
-
-
-@pytest.mark.asyncio
-async def test_upgrade_deny_updates_messages_and_logs(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    home = tmp_path / ".engram"
-    write_active_manifest(home, "C07TEAM")
-    router = Router(home=home, owner_dm_channel_id="D07OWNER")
-    slack = FakeSlackClient()
-
-    await handle_upgrade_command(
-        router=router,
-        config=make_config(),
-        slack_client=slack,
-        source_channel_id="C07TEAM",
-        source_channel_name="growth",
-        user_id="U07REQUESTER",
-        requested_tier=PermissionTier.OWNER_SCOPED,
-        reason=None,
-    )
-    deny_value = slack.post_calls[1]["blocks"][1]["elements"][2]["value"]
-
-    with caplog.at_level(logging.INFO, logger="engram.ingress"):
-        result = await handle_upgrade_action(
-            payload=owner_action_payload(
-                action_id="upgrade_decision_deny",
-                value=deny_value,
-            ),
-            router=router,
-            slack_client=slack,
-            owner_user_id="U07OWNER",
-        )
-
-    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
-    assert result == {"ok": True, "decision": "deny"}
-    assert manifest.permission_tier == PermissionTier.TASK_ASSISTANT
-    assert slack.update_calls[0]["text"] == "❌ Request denied."
-    assert slack.update_calls[1]["text"] == "❌ Denied by <@U07OWNER>."
-    record = next(
-        item for item in caplog.records if item.getMessage() == "permission.upgrade_denied"
-    )
-    assert record.channel == "C07TEAM"
-    assert record.approver == "U07OWNER"
-
-
-@pytest.mark.asyncio
-async def test_non_owner_upgrade_click_gets_ephemeral_denial(tmp_path: Path) -> None:
-    home = tmp_path / ".engram"
-    write_active_manifest(home, "C07TEAM")
-    router = Router(home=home, owner_dm_channel_id="D07OWNER")
-    slack = FakeSlackClient()
-
-    await handle_upgrade_command(
-        router=router,
-        config=make_config(),
-        slack_client=slack,
-        source_channel_id="C07TEAM",
-        source_channel_name="growth",
-        user_id="U07REQUESTER",
-        requested_tier=PermissionTier.OWNER_SCOPED,
-        reason=None,
-    )
-    approve_value = slack.post_calls[1]["blocks"][1]["elements"][0]["value"]
-
-    result = await handle_upgrade_action(
-        payload=owner_action_payload(
-            action_id="upgrade_decision_approve_permanent",
-            value=approve_value,
+    result = await handle_tier_pick_action(
+        payload=picker_payload(
+            value="C07TEAM|safe|U07OTHER",
             user_id="U07OTHER",
         ),
         router=router,
+        config=make_config(),
         slack_client=slack,
-        owner_user_id="U07OWNER",
     )
 
     manifest = load_manifest(channel_manifest_path("C07TEAM", home))
-    assert result == {"ok": False, "error": "not owner"}
+    assert result["ok"] is True
     assert manifest.permission_tier == PermissionTier.TASK_ASSISTANT
-    assert slack.update_calls == []
-    assert slack.ephemeral_calls == [
+    assert manifest.nightly_included is False
+    assert result["response"]["text"] == "Tier set to `safe`. Read-only tools no longer auto-allow."
+    assert slack.post_calls == [
         {
-            "channel": "D07OWNER",
-            "user": "U07OTHER",
-            "text": "Only the owner can approve upgrades.",
+            "channel": "C07TEAM",
+            "text": (
+                "🔒 <@U07OTHER> downgraded this channel to `safe`. "
+                "Read-only tools no longer auto-allow. Type `/engram` to see current settings."
+            ),
+            "_ts": slack.post_calls[0]["_ts"],
         }
     ]
 
 
 @pytest.mark.asyncio
-async def test_new_request_supersedes_old_dm_card(tmp_path: Path) -> None:
+async def test_non_owner_upgrade_via_picker_is_rejected(
+    tmp_path: Path,
+) -> None:
     home = tmp_path / ".engram"
-    write_active_manifest(home, "C07TEAM")
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
     router = Router(home=home, owner_dm_channel_id="D07OWNER")
     slack = FakeSlackClient()
 
-    first = await handle_upgrade_command(
+    result = await handle_tier_pick_action(
+        payload=picker_payload(
+            value="C07TEAM|trusted|U07OTHER",
+            user_id="U07OTHER",
+        ),
         router=router,
         config=make_config(),
         slack_client=slack,
-        source_channel_id="C07TEAM",
-        source_channel_name="growth",
-        user_id="U07REQUESTER",
-        requested_tier=PermissionTier.OWNER_SCOPED,
-        reason="first",
-    )
-    second = await handle_upgrade_command(
-        router=router,
-        config=make_config(),
-        slack_client=slack,
-        source_channel_id="C07TEAM",
-        source_channel_name="growth",
-        user_id="U07REQUESTER",
-        requested_tier=PermissionTier.YOLO,
-        reason="second",
     )
 
-    assert first["ok"] is True
-    assert second["ok"] is True
-    assert len(slack.post_calls) == 4
-    assert len(slack.update_calls) == 1
-    assert slack.update_calls[0]["channel"] == "D07OWNER"
-    assert slack.update_calls[0]["text"] == "⚪ Superseded by newer request."
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result["ok"] is False
+    assert result["error"] == "not owner"
+    assert result["response"]["text"] == "Only the channel owner can upgrade."
+    assert manifest.permission_tier == PermissionTier.TASK_ASSISTANT
+    assert slack.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_yolo_picker_action_returns_duration_picker(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.OWNER_SCOPED)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_tier_pick_action(
+        payload=picker_payload(
+            value="C07TEAM|yolo|U07OWNER",
+            user_id="U07OWNER",
+        ),
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+    )
+
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result["ok"] is True
+    assert manifest.permission_tier == PermissionTier.OWNER_SCOPED
+    assert result["response"]["text"].startswith("YOLO mode will bypass HITL gates")
+    assert [element["text"]["text"] for element in result["response"]["blocks"][1]["elements"]] == [
+        "⏱️ 6h",
+        "⏱️ 24h",
+        "⏱️ 72h",
+        "✕ Cancel",
+    ]
+    assert slack.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_current_tier_click_is_noop_without_public_notice(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_tier_pick_action(
+        payload=picker_payload(
+            value="C07TEAM|safe|U07OWNER",
+            user_id="U07OWNER",
+        ),
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+    )
+
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result["ok"] is True
+    assert manifest.permission_tier == PermissionTier.TASK_ASSISTANT
+    assert result["changed"] is False
+    assert result["response"]["text"] == "Already on `safe` — no change."
+    assert slack.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_arg_upgrade_shortcut_executes_immediately(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OWNER",
+        command_text="upgrade trusted Working on docs",
+    )
+
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result["ok"] is True
+    assert manifest.permission_tier == PermissionTier.OWNER_SCOPED
+    assert slack.ephemeral_calls == [
+        {
+            "channel": "C07TEAM",
+            "user": "U07OWNER",
+            "text": "Tier set to `trusted`. Read-only tools now auto-allow.",
+        }
+    ]
+    assert slack.post_calls == [
+        {
+            "channel": "C07TEAM",
+            "text": (
+                "✨ <@U07OWNER> upgraded this channel to `trusted`. "
+                "Read-only tools now auto-allow. Type `/engram` to see current settings."
+            ),
+            "_ts": slack.post_calls[0]["_ts"],
+        }
+    ]
