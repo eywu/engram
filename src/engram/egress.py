@@ -52,6 +52,29 @@ class ActiveYoloGrantRow:
     pre_yolo_tier: PermissionTier
 
 
+def build_session_greeting(
+    *,
+    model: str,
+    identity: str,
+    mcp_server_names: list[str],
+    memory_count: int,
+) -> str:
+    """Build the one-time greeting prepended to the first reply after /engram new.
+
+    Format:
+    👋 Fresh session loaded. Model: <model> • Identity: <identity> •
+    MCPs: <name, name> • Memory: <N> entries searchable
+    """
+    mcp_text = ", ".join(mcp_server_names) if mcp_server_names else "none"
+    return (
+        f"👋 Fresh session loaded. "
+        f"Model: {model} • "
+        f"Identity: {identity} • "
+        f"MCPs: {mcp_text} • "
+        f"Memory: {memory_count:,} entries searchable"
+    )
+
+
 async def post_reply(
     slack_client,
     channel_id: str,
@@ -59,13 +82,19 @@ async def post_reply(
     *,
     thread_ts: str | None = None,
     session_label: str = "",
+    greeting_prefix: str | None = None,
 ) -> EgressResult:
     """Post an agent turn back to Slack.
 
     Agent replies are sent through Slack's native ``markdown`` block so
     CommonMark emitted by the model renders cleanly in Slack clients.
+
+    When *greeting_prefix* is provided it is prepended as a separate paragraph
+    before the model's reply text.  Used by the `/engram new` flow to confirm
+    the fresh session loaded correctly.
     """
-    text = turn.text or "(empty reply)"
+    body_text = turn.text or "(empty reply)"
+    text = f"{greeting_prefix}\n\n{body_text}" if greeting_prefix else body_text
     footer = ""
     if turn.cost_usd is not None:
         footer = f"\n\ncost: ${turn.cost_usd:.4f} · {turn.duration_ms or 0}ms"

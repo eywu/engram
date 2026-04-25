@@ -22,7 +22,7 @@ from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from slack_bolt.async_app import AsyncApp
 
 from engram import paths
-from engram.agent import Agent
+from engram.agent import Agent, archive_session_transcript
 from engram.config import EngramConfig
 from engram.costs import CostLedger, TurnCost
 from engram.egress import (
@@ -30,6 +30,7 @@ from engram.egress import (
     _always_allow_label,
     _suggestion_label,
     build_footgun_confirmation_modal,
+    build_session_greeting,
     post_reply,
     post_upgrade_result_in_channel,
     post_yolo_expired_notification,
@@ -92,6 +93,10 @@ ACTION_ID_CHANNELS_PAGE_PREFIX = "engram_channels_page"
 ACTION_ID_CHANNELS_PAGE = ACTION_ID_CHANNELS_PAGE_PREFIX
 CHANNELS_PAGE_ACTION_PATTERN = re.compile(
     rf"^{re.escape(ACTION_ID_CHANNELS_PAGE_PREFIX)}(?::.+)?$"
+)
+ACTION_ID_SESSION_NEW_PREFIX = "engram_session_new"
+SESSION_NEW_ACTION_PATTERN = re.compile(
+    r"^engram_session_new_(confirm|cancel):[A-Z][A-Z0-9]+$"
 )
 CHANNELS_DASHBOARD_PAGE_SIZE = 20
 CHANNELS_DASHBOARD_BLOCK_ID_PATTERN = re.compile(
@@ -388,6 +393,31 @@ def register_listeners(
         except Exception:
             log.exception("ingress.channels_page_handler_failed")
 
+    @app.action(SESSION_NEW_ACTION_PATTERN)
+    async def on_session_new_action(ack, body, client, respond):
+        await ack()
+
+        async def _run() -> None:
+            try:
+                result = await handle_new_confirm_action(
+                    payload=body,
+                    router=router,
+                    config=config,
+                    slack_client=client,
+                )
+                await _maybe_respond_with_dashboard(result=result, respond=respond)
+                if not result.get("ok"):
+                    log.warning(
+                        "ingress.session_new_action_failed error=%s",
+                        result.get("error", "unknown"),
+                    )
+            except Exception:
+                log.exception("ingress.session_new_action_handler_failed")
+
+        task = asyncio.create_task(_run())
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
+
     @app.command("/engram")
     async def on_engram(ack, body, client):
         await ack()
@@ -595,6 +625,11 @@ def register_listeners(
             len(text),
         )
 
+        greeting_prefix: str | None = None
+        if session.session_just_started:
+            session.session_just_started = False
+            greeting_prefix = _build_session_greeting(session, router, config)
+
         try:
             turn = await agent.run_turn(session, text, user_id=user_id)
         except Exception:
@@ -611,6 +646,7 @@ def register_listeners(
             turn,
             thread_ts=thread_ts if not is_dm else None,
             session_label=session.label(),
+            greeting_prefix=greeting_prefix,
         )
 
         await _send_budget_warnings(
@@ -992,7 +1028,8 @@ async def handle_engram_command(
             text=(
                 "Usage: /engram channels | /engram include | /engram exclude "
                 "| /engram upgrade <tier> [reason...] "
-                "| /engram yolo <list|off|extend> ..."
+                "| /engram yolo <list|off|extend> ... "
+                "| /engram new"
             ),
         )
         return {"ok": False, "error": "missing subcommand"}
@@ -1065,6 +1102,16 @@ async def handle_engram_command(
             source_channel_id=source_channel_id,
             user_id=user_id,
             args=parts[1:],
+        )
+
+    if subcommand == "new":
+        return await handle_new_command(
+            router=router,
+            config=config,
+            slack_client=slack_client,
+            source_channel_id=source_channel_id,
+            source_channel_name=source_channel_name,
+            user_id=user_id,
         )
 
     await _post_ephemeral_reply(
@@ -1456,6 +1503,221 @@ async def handle_yolo_command(
         text=f"Unknown /engram yolo subcommand: {action}",
     )
     return {"ok": False, "error": "unknown yolo subcommand"}
+
+
+async def handle_new_command(
+    *,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+    source_channel_id: str,
+    source_channel_name: str | None,
+    user_id: str | None,
+) -> dict[str, object]:
+    """Handle `/engram new` — show ephemeral confirm before resetting the session."""
+    if not source_channel_id:
+        return {"ok": False, "error": "missing source channel"}
+
+    # Only the owner may reset a session.
+    if not _is_owner_user(config=config, user_id=user_id):
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text="Owner-only. Only the owner can start a fresh conversation.",
+        )
+        return {"ok": False, "error": "not owner"}
+
+    channel_label = _channel_label_from_name(source_channel_name) or source_channel_id
+    text = (
+        f"Start a new conversation in {channel_label}?\n"
+        "• Memory is preserved (semantic search across past sessions still works)\n"
+        "• The current Claude CLI session ends; a fresh one starts on your next message\n"
+        "• MCP servers and project config are reloaded"
+    )
+    confirm_action_id = f"{ACTION_ID_SESSION_NEW_PREFIX}_confirm:{source_channel_id}"
+    cancel_action_id = f"{ACTION_ID_SESSION_NEW_PREFIX}_cancel:{source_channel_id}"
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        {
+            "type": "actions",
+            "block_id": f"{ACTION_ID_SESSION_NEW_PREFIX}:{source_channel_id}",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Start fresh"},
+                    "style": "primary",
+                    "action_id": confirm_action_id,
+                    "value": f"{source_channel_id}|{user_id or ''}",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Cancel"},
+                    "action_id": cancel_action_id,
+                    "value": f"{source_channel_id}|{user_id or ''}",
+                },
+            ],
+        },
+    ]
+    await _post_ephemeral_reply(
+        slack_client,
+        channel_id=source_channel_id,
+        user_id=user_id,
+        text=text,
+        blocks=blocks,
+    )
+    return {"ok": True, "pending_confirm": True}
+
+
+async def handle_new_confirm_action(
+    *,
+    payload: dict[str, object],
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+) -> dict[str, object]:
+    """Handle the [Start fresh] or [Cancel] button from handle_new_command."""
+    actions = payload.get("actions") or []
+    if not actions:
+        return {"ok": False, "error": "no actions"}
+
+    action = actions[0]
+    action_id = str(action.get("action_id") or "")
+    m = SESSION_NEW_ACTION_PATTERN.match(action_id)
+    if not m:
+        return {"ok": False, "error": "unsupported action"}
+
+    kind = m.group(1)  # "confirm" or "cancel"
+    raw_value = str(action.get("value") or "")
+    channel_id, sep, invoker_user_id = raw_value.partition("|")
+    if not sep or not CHANNEL_ID_PATTERN.match(channel_id):
+        return {
+            "ok": False,
+            "error": "malformed value",
+            "response": _replace_original_ephemeral(
+                text="Could not start fresh conversation (malformed request)."
+            ),
+        }
+
+    clicker_user_id = str(payload.get("user", {}).get("id") or "") or None
+    if clicker_user_id != invoker_user_id:
+        return {
+            "ok": False,
+            "error": "identity mismatch",
+            "response": _replace_original_ephemeral(
+                text="This prompt was opened for a different user. Run `/engram new` yourself."
+            ),
+        }
+
+    if kind == "cancel":
+        return {
+            "ok": True,
+            "cancelled": True,
+            "response": _replace_original_ephemeral(
+                text="Cancelled. Current session unchanged."
+            ),
+        }
+
+    # ── Perform the reset ────────────────────────────────────────────────
+    session = await router.get(
+        channel_id,
+        channel_name=None,
+        is_dm=channel_id.startswith("D"),
+    )
+    async with session.agent_lock:
+        if session.agent_client is not None:
+            try:
+                await session.agent_client.disconnect()
+            except Exception:
+                log.debug(
+                    "ingress.new_session_disconnect_failed session=%s",
+                    session.label(),
+                    exc_info=True,
+                )
+            session.agent_client = None
+        archive_session_transcript(session.session_id, session.cwd)
+        session.agent_session_initialized = False
+        session.session_just_started = True
+
+    log.info(
+        "ingress.session_reset session=%s by_user=%s",
+        session.label(),
+        clicker_user_id,
+    )
+
+    # ── Build the public follow-up message ───────────────────────────────
+    manifest = session.manifest
+    if manifest is not None:
+        effective_tier = manifest.tier_effective()
+        if effective_tier == PermissionTier.YOLO and manifest.yolo_until is not None:
+            expiry = manifest.yolo_until.strftime("%Y-%m-%d %H:%M UTC")
+            tier_label = f"yolo (until {expiry})"
+        else:
+            tier_label = effective_tier.value
+
+        mcp_names = list(manifest.mcp_servers.allowed or [])
+        mcp_text = ", ".join(mcp_names) if mcp_names else "none"
+
+        memory_count = _count_memory_entries(channel_id, router)
+        follow_up = (
+            f"🔄 Started a fresh conversation. "
+            f"Tier: {tier_label} • "
+            f"Memory: {memory_count:,} entries available • "
+            f"MCP: {mcp_text}"
+        )
+    else:
+        follow_up = "🔄 Started a fresh conversation."
+
+    await slack_client.chat_postMessage(
+        channel=channel_id,
+        text=follow_up,
+    )
+
+    return {
+        "ok": True,
+        "reset": True,
+        "response": _replace_original_ephemeral(
+            text="✅ Fresh conversation started. Say anything to begin."
+        ),
+    }
+
+
+def _count_memory_entries(channel_id: str, router: Router) -> int:
+    """Return transcript row count for *channel_id* from the memory DB."""
+    try:
+        from engram.memory import open_memory_db  # local import avoids circular dep
+
+        home = router.home or paths.engram_home()
+        db_path = home / "memory.db"
+        if not db_path.exists():
+            return 0
+        conn = open_memory_db(db_path)
+        row = conn.execute(
+            "SELECT count(*) FROM transcripts WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+        conn.close()
+        return int(row[0]) if row else 0
+    except Exception:
+        log.debug("ingress.memory_count_failed channel=%s", channel_id, exc_info=True)
+        return 0
+
+
+def _build_session_greeting(session, router: Router, config: EngramConfig) -> str:
+    """Build the one-time greeting block for the first reply of a new session."""
+    manifest = session.manifest
+    model = config.anthropic.model
+    identity = manifest.identity.value if manifest is not None else "unknown"
+    mcp_names: list[str] = []
+    if manifest is not None:
+        mcp_names = list(manifest.mcp_servers.allowed or [])
+    memory_count = _count_memory_entries(session.channel_id, router)
+    return build_session_greeting(
+        model=model,
+        identity=identity,
+        mcp_server_names=mcp_names,
+        memory_count=memory_count,
+    )
 
 
 async def handle_upgrade_command(
