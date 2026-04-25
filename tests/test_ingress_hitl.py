@@ -278,7 +278,7 @@ def test_register_listeners_attaches_hitl_action_handler():
 
     register_listeners(app, make_config(), Router(), agent=object())
 
-    assert len(app.actions) == 10
+    assert len(app.actions) == 11
     patterns = [pattern for pattern, _handler in app.actions]
     assert HITL_ACTION_ID_PATTERN in patterns
     assert PENDING_CHANNEL_ACTION_ID_PATTERN in patterns
