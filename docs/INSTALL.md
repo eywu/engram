@@ -438,6 +438,36 @@ You skipped the Gemini step in setup. Either:
 
 Restart with `launchctl kickstart gui/$(id -u)/com.engram.bridge`.
 
+### Recovering from MCP/config changes
+
+When you edit `~/.engram/project/.claude/settings.json` to add or remove MCP
+servers, or change any per-channel project config, the running bridge won't
+pick up the change automatically — Claude CLI reads MCP config at subprocess
+spawn time.
+
+**Recommended:** run `/engram new` in the affected channel (or DM). This:
+
+1. Archives the existing Claude CLI JSONL transcript (retained for recovery).
+2. Drops the in-memory client so the next message spawns a fresh subprocess
+   with the updated config.
+3. Posts a public channel notice and a greeting on the first reply confirming
+   which MCPs loaded.
+
+Memory is **preserved** — semantic search across past conversations still works.
+Tier settings, YOLO grants, and permission manifests are untouched.
+
+**CLI equivalent:**
+
+```bash
+engram channels new <channel_id>          # prompts for confirmation
+engram channels new <channel_id> --yes    # skip confirmation
+```
+
+> **Note:** `/engram new` is a soft reset — it doesn't bounce the bridge,
+> clear memory, or reset permissions. If you need to fully restart the bridge
+> (e.g. after editing `~/.engram/config.yaml`), use:
+> `launchctl kickstart -k gui/$(id -u)/com.engram.bridge`
+
 ### Cost looks unexpectedly high
 
 Check `engram cost --by-channel` to see which channel is spending. Each
