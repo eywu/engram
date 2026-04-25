@@ -5,7 +5,7 @@
 #
 # What it does:
 #   1. Resolves absolute paths to this repo + the uv binary
-#   2. Renders launchd/com.engram.bridge.plist template into
+#   2. Renders the canonical launchd/com.engram.bridge.plist template into
 #      ~/Library/LaunchAgents/com.engram.bridge.plist
 #   3. Unloads any existing copy, then loads + starts the service
 #   4. Waits briefly and confirms `engram.ready` appeared in the log
@@ -168,66 +168,12 @@ echo "==> env file:  $BRIDGE_ENV_FILE"
 
 # 2. Render the plist
 mkdir -p "$HOME/Library/LaunchAgents"
-cat > "$PLIST_DST" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-        "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>$SERVICE_LABEL</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>$UV_BIN</string>
-        <string>run</string>
-        <string>--project</string>
-        <string>$REPO_ROOT</string>
-        <string>python</string>
-        <string>-m</string>
-        <string>engram.main</string>
-    </array>
-
-    <key>WorkingDirectory</key>
-    <string>$REPO_ROOT</string>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>LANG</key>
-        <string>en_US.UTF-8</string>
-        <key>HOME</key>
-        <string>$HOME</string>
-        <key>ENGRAM_ENV_FILE</key>
-        <string>$BRIDGE_ENV_FILE</string>
-    </dict>
-
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-        <key>Crashed</key>
-        <true/>
-    </dict>
-
-    <key>ThrottleInterval</key>
-    <integer>30</integer>
-
-    <key>StandardOutPath</key>
-    <string>/tmp/engram.bridge.out.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>/tmp/engram.bridge.err.log</string>
-
-    <key>ProcessType</key>
-    <string>Background</string>
-</dict>
-</plist>
-PLIST
+sed \
+    -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/uv|$(escape_sed_replacement "$UV_BIN")|g" \
+    -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/engram-repo|$(escape_sed_replacement "$REPO_ROOT")|g" \
+    -e "s|/REPLACE/WITH/HOME|$(escape_sed_replacement "$HOME")|g" \
+    -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/engram.env|$(escape_sed_replacement "$BRIDGE_ENV_FILE")|g" \
+    "$PLIST_SRC" > "$PLIST_DST"
 echo "==> wrote $PLIST_DST"
 
 # 3. Reload the service

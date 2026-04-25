@@ -301,6 +301,17 @@ def status(
         rprint(f"[bold]Bridge[/bold] running (pid {bridge['pid']})")
     else:
         rprint("[bold]Bridge[/bold] not running")
+    bridge_fds = bridge.get("fds")
+    if isinstance(bridge_fds, dict) and bridge_fds.get("in_use") is not None:
+        soft_limit = bridge_fds.get("soft_limit") or "unknown"
+        high_water = bridge_fds.get("high_water")
+        if isinstance(high_water, dict) and high_water.get("in_use") is not None:
+            rprint(
+                f"fds: {bridge_fds['in_use']} / {soft_limit} current, "
+                f"high-water {high_water['in_use']}"
+            )
+        else:
+            rprint(f"fds: {bridge_fds['in_use']} / {soft_limit} current")
     if snapshot.get("config_error"):
         rprint(f"[yellow]Config[/yellow] {snapshot['config_error']}")
     nightly = snapshot["nightly"]
@@ -548,6 +559,13 @@ def _build_status_snapshot() -> dict[str, Any]:
     runtime = read_json(status_path(paths.state_dir)) or {}
     pid = _pid_from_file(paths.state_dir) or _bridge_pid()
     bridge_up = bool(pid and process_exists(pid))
+    runtime_bridge = runtime.get("bridge") if isinstance(runtime, dict) else None
+    health = read_json(health_path(paths.state_dir))
+    bridge_fds = None
+    if isinstance(runtime_bridge, dict):
+        bridge_fds = runtime_bridge.get("fds")
+    if bridge_fds is None and isinstance(health, dict):
+        bridge_fds = health.get("fds")
 
     channels = _merge_channels(
         runtime_channels=runtime.get("channels") or [],
@@ -568,7 +586,8 @@ def _build_status_snapshot() -> dict[str, Any]:
         "bridge": {
             "up": bridge_up,
             "pid": pid,
-            "health": read_json(health_path(paths.state_dir)),
+            "health": health,
+            "fds": bridge_fds,
         },
         "nightly": _nightly_status(home),
         "channels": channels,

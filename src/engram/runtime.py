@@ -43,16 +43,18 @@ async def write_runtime_snapshot(
     state_dir: Path,
     router: Router,
     cost_db: CostDatabase | None,
+    fd_usage: dict[str, int | None] | None = None,
+    fd_high_water: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write health.json and status.json for CLI probes."""
     state_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.datetime.now(datetime.UTC).isoformat()
     pid = os.getpid()
-    fd_usage = fd_usage_snapshot()
+    current_fd_usage = fd_usage if fd_usage is not None else fd_usage_snapshot()
     pid_path(state_dir).write_text(str(pid), encoding="utf-8")
     health = {"ok": True, "pid": pid, "ts": now}
-    if fd_usage is not None:
-        health["fds"] = fd_usage
+    if current_fd_usage is not None:
+        health["fds"] = _fd_payload(current_fd_usage, fd_high_water)
     write_json(health_path(state_dir), health)
 
     channels = []
@@ -64,9 +66,9 @@ async def write_runtime_snapshot(
         "channels": channels,
         "memory": memory_tool_metrics(),
     }
-    if fd_usage is not None:
-        snapshot["bridge"]["fds"] = fd_usage
-        _warn_if_fd_usage_high(fd_usage)
+    if current_fd_usage is not None:
+        snapshot["bridge"]["fds"] = _fd_payload(current_fd_usage, fd_high_water)
+        _warn_if_fd_usage_high(current_fd_usage)
     write_json(status_path(state_dir), snapshot)
     return snapshot
 
@@ -221,6 +223,25 @@ def _warn_if_fd_usage_high(fd_usage: dict[str, int | None]) -> None:
 
     if not over_threshold:
         _fd_warning_active = False
+
+
+def _fd_payload(
+    current: dict[str, int | None],
+    high_water: dict[str, Any] | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = dict(current)
+    if high_water is None and current.get("in_use") is not None:
+        payload["high_water"] = {
+            "in_use": current.get("in_use"),
+            "soft_limit": current.get("soft_limit"),
+            "hard_limit": current.get("hard_limit"),
+            "window_started_at": None,
+            "observed_at": None,
+        }
+        return payload
+    if high_water is not None:
+        payload["high_water"] = dict(high_water)
+    return payload
 
 
 def write_fd_snapshot(

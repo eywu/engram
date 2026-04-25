@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import logging
 import signal
 import sys
@@ -28,7 +29,12 @@ from engram.embeddings import EmbeddingQueue, GeminiEmbedder
 from engram.hitl import PendingQuestion
 from engram.ingress import register_listeners
 from engram.router import Router
-from engram.runtime import prune_fd_snapshot_files, write_fd_snapshot, write_runtime_snapshot
+from engram.runtime import (
+    fd_usage_snapshot,
+    prune_fd_snapshot_files,
+    write_fd_snapshot,
+    write_runtime_snapshot,
+)
 from engram.telemetry import configure_logging
 
 READY_LOG_LINE = "engram.ready"  # stable string for health probes / test harnesses
@@ -68,6 +74,7 @@ class _RuntimeSnapshotLoopState:
     warn: _FdAlertTierState = field(default_factory=_FdAlertTierState)
     critical: _FdAlertTierState = field(default_factory=_FdAlertTierState)
     next_fd_snapshot_at: float = 0.0
+    fd_high_water: dict[str, Any] | None = None
 
 
 async def _discover_template_vars(
@@ -323,18 +330,29 @@ async def _runtime_snapshot_loop(
     log_dir: Path | None = None,
     fd_snapshots_enabled: bool = True,
     fd_snapshot_interval_seconds: float = 3600.0,
+    fd_high_water_sample_interval_seconds: float = 0.25,
+    fd_usage_reader: Callable[[], dict[str, int | None] | None] = fd_usage_snapshot,
 ) -> None:
     loop_log = logging.getLogger("engram.main")
     state = _RuntimeSnapshotLoopState(
         next_fd_snapshot_at=asyncio.get_running_loop().time()
     )
     while True:
-        await asyncio.sleep(interval_seconds)
+        await _sample_fd_high_water_for_interval(
+            state,
+            duration_seconds=interval_seconds,
+            sample_interval_seconds=fd_high_water_sample_interval_seconds,
+            usage_reader=fd_usage_reader,
+        )
         try:
+            current_fd_usage = fd_usage_reader()
+            fd_high_water = _consume_fd_high_water(state, current_fd_usage)
             snapshot = await write_runtime_snapshot(
                 state_dir=state_dir,
                 router=router,
                 cost_db=cost_db,
+                fd_usage=current_fd_usage,
+                fd_high_water=fd_high_water,
             )
             bridge = snapshot.get("bridge", {})
             fd_usage = bridge.get("fds")
@@ -360,6 +378,62 @@ async def _runtime_snapshot_loop(
                 "engram.runtime_snapshot_failed",
                 exc_info=True,
             )
+
+
+async def _sample_fd_high_water_for_interval(
+    state: _RuntimeSnapshotLoopState,
+    *,
+    duration_seconds: float,
+    sample_interval_seconds: float,
+    usage_reader: Callable[[], dict[str, int | None] | None],
+) -> None:
+    if duration_seconds <= 0:
+        return
+    remaining = duration_seconds
+    while remaining > 0:
+        delay = min(sample_interval_seconds, remaining) if sample_interval_seconds > 0 else remaining
+        await asyncio.sleep(delay)
+        remaining = max(0.0, remaining - delay)
+        _observe_fd_high_water(state, usage_reader())
+
+
+def _observe_fd_high_water(
+    state: _RuntimeSnapshotLoopState,
+    fd_usage: dict[str, int | None] | None,
+) -> None:
+    if fd_usage is None:
+        return
+    in_use = fd_usage.get("in_use")
+    if in_use is None:
+        return
+    observed_at = datetime.datetime.now(datetime.UTC).isoformat()
+    current = state.fd_high_water
+    if current is None:
+        state.fd_high_water = {
+            "in_use": in_use,
+            "soft_limit": fd_usage.get("soft_limit"),
+            "hard_limit": fd_usage.get("hard_limit"),
+            "window_started_at": observed_at,
+            "observed_at": observed_at,
+        }
+        return
+    if current.get("window_started_at") is None:
+        current["window_started_at"] = observed_at
+    if current.get("in_use") is None or int(in_use) >= int(current["in_use"]):
+        current["in_use"] = in_use
+        current["soft_limit"] = fd_usage.get("soft_limit")
+        current["hard_limit"] = fd_usage.get("hard_limit")
+        current["observed_at"] = observed_at
+
+
+def _consume_fd_high_water(
+    state: _RuntimeSnapshotLoopState,
+    current_fd_usage: dict[str, int | None] | None,
+) -> dict[str, Any] | None:
+    _observe_fd_high_water(state, current_fd_usage)
+    high_water = state.fd_high_water
+    state.fd_high_water = None
+    return dict(high_water) if high_water is not None else None
 
 
 async def _maybe_alert_on_fd_pressure(

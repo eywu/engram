@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import plistlib
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from engram.doctor import (
     check_config_loads,
     check_disk_space,
     check_gemini_api_key,
+    check_launchd_bridge_plist_drift,
     check_launchd_job,
     check_log_dir_writable,
     check_owner_dm_channel_id,
@@ -31,6 +33,7 @@ from engram.doctor import (
     check_slack_slash_commands,
     check_uv_on_path,
 )
+from engram.launchd import render_bridge_plist, write_bridge_env_file
 
 
 @pytest.fixture
@@ -341,6 +344,42 @@ def test_check_launchd_nightly_job_not_installed_fails() -> None:
     assert check.details["state"] == "not_installed"
 
 
+def test_check_launchd_bridge_plist_drift_warns_on_missing_soft_resource_limits(
+    tmp_path: Path,
+) -> None:
+    installed_path = tmp_path / "Library" / "LaunchAgents" / "com.engram.bridge.plist"
+    installed_path.parent.mkdir(parents=True)
+    with installed_path.open("wb") as handle:
+        plistlib.dump(
+            {
+                "Label": "com.engram.bridge",
+                "ProgramArguments": ["/tmp/engram", "run"],
+                "WorkingDirectory": "/tmp/repo",
+                "EnvironmentVariables": {
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "LANG": "en_US.UTF-8",
+                },
+                "RunAtLoad": True,
+                "StandardOutPath": "/tmp/engram.bridge.out.log",
+                "StandardErrorPath": "/tmp/engram.bridge.err.log",
+                "ProcessType": "Background",
+            },
+            handle,
+            sort_keys=False,
+        )
+
+    check = check_launchd_bridge_plist_drift(
+        repo_root=Path.cwd(),
+        home=tmp_path,
+        commit_resolver=lambda _repo_root: "abc1234",
+    )
+
+    assert check.status == CheckStatus.WARN
+    assert "SoftResourceLimits.NumberOfFiles" in check.message
+    assert check.details["template_commit"] == "abc1234"
+    assert "SoftResourceLimits.NumberOfFiles" in check.details["issues"]
+
+
 def test_check_disk_space_requires_one_gb(tmp_path: Path) -> None:
     check = check_disk_space(tmp_path, disk_usage=lambda _path: (2_000_000_000, 0, 1_500_000_000))
 
@@ -488,14 +527,30 @@ def test_doctor_cli_json_against_tmp_config(
     monkeypatch.setattr("engram.doctor._post_json", post_json)
     monkeypatch.setattr("engram.doctor._get_json", get_json)
 
+    env_file = write_bridge_env_file(
+        anthropic_key="sk-ant-test",
+        gemini_key="gemini-test",
+        home=tmp_path,
+    )
+    installed_plist = tmp_path / "Library" / "LaunchAgents" / "com.engram.bridge.plist"
+    installed_plist.parent.mkdir(parents=True, exist_ok=True)
+    payload = render_bridge_plist(
+        repo_root=Path.cwd(),
+        uv_bin=Path("/tmp/uv"),
+        env_file=env_file,
+        home=tmp_path,
+    )
+    with installed_plist.open("wb") as handle:
+        plistlib.dump(payload, handle, sort_keys=False)
+
     result = CliRunner().invoke(app, ["doctor", "--json"])
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["schema_version"] == 1
     assert payload["summary"] == {
-        "total": 17,
-        "passed": 17,
+        "total": 18,
+        "passed": 18,
         "warnings": 0,
         "failed": 0,
         "exit_code": 0,
@@ -514,6 +569,7 @@ def test_doctor_cli_json_against_tmp_config(
         "anthropic_api_key",
         "gemini_api_key",
         "launchd_bridge",
+        "launchd_bridge_plist",
         "launchd_nightly",
         "fd_pressure",
         "memory_db_disk_space",

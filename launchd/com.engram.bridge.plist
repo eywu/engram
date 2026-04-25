@@ -5,29 +5,33 @@
   Engram user-launchd manifest.
 
   Install:
-    cp launchd/com.engram.bridge.plist ~/Library/LaunchAgents/
-    # Edit the file to set absolute paths for ProgramArguments and WorkingDirectory.
-    launchctl load ~/Library/LaunchAgents/com.engram.bridge.plist
+    engram setup
+    # or: scripts/install_launchd.sh
 
   Uninstall:
     launchctl unload ~/Library/LaunchAgents/com.engram.bridge.plist
     rm ~/Library/LaunchAgents/com.engram.bridge.plist
 
   Logs:
-    tail -f ~/.engram/logs/bridge.out.log
-    tail -f ~/.engram/logs/bridge.err.log
+    tail -f /tmp/engram.bridge.out.log
+    tail -f /tmp/engram.bridge.err.log
 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
     <string>com.engram.bridge</string>
 
-    <!-- EDIT: absolute path to `engram` entrypoint.
-         Get it with: `which engram` after install.sh finishes. -->
+    <!-- EDIT: absolute path to `uv`.
+         Get it with: `which uv` after install.sh finishes. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/engram</string>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/uv</string>
         <string>run</string>
+        <string>--project</string>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/engram-repo</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>engram.main</string>
     </array>
 
     <!-- EDIT: absolute path to the repo checkout. -->
@@ -36,13 +40,16 @@
 
     <key>EnvironmentVariables</key>
     <dict>
-        <!-- The setup wizard writes everything to ~/.engram/config.yaml,
-             so launchd doesn't need to know the tokens. But the PATH
-             is important — the SDK spawns `claude` as a subprocess. -->
+        <!-- Keep in sync with the deployed bridge env. HOME is explicit so
+             ~/.engram resolves the same way under launchd and a login shell. -->
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <string>/REPLACE/WITH/HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>LANG</key>
         <string>en_US.UTF-8</string>
+        <key>HOME</key>
+        <string>/REPLACE/WITH/HOME</string>
+        <key>ENGRAM_ENV_FILE</key>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/engram.env</string>
     </dict>
 
     <key>RunAtLoad</key>
@@ -64,6 +71,12 @@
     <dict>
         <key>NumberOfFiles</key>
         <integer>4096</integer>
+    </dict>
+
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
     </dict>
 
     <key>StandardOutPath</key>

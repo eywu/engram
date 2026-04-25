@@ -152,6 +152,7 @@ def test_launchd_smoketest_plist_is_manual_one_shot_and_copies_bridge_env():
 
     assert smoke["Label"] == "com.engram.v3.smoketest"
     assert bridge["SoftResourceLimits"]["NumberOfFiles"] == 4096
+    assert bridge["HardResourceLimits"]["NumberOfFiles"] == 8192
     assert smoke["RunAtLoad"] is False
     assert "StartInterval" not in smoke
     assert "StartCalendarInterval" not in smoke
@@ -296,6 +297,8 @@ def test_install_launchd_bridge_writes_explicit_env_file_into_plist(tmp_path: Pa
     installed = _plist(home / "Library" / "LaunchAgents" / "com.engram.bridge.plist")
     assert installed["Label"] == "com.engram.bridge"
     assert installed["EnvironmentVariables"]["ENGRAM_ENV_FILE"] == str(env_file)
+    assert installed["SoftResourceLimits"]["NumberOfFiles"] == 4096
+    assert installed["HardResourceLimits"]["NumberOfFiles"] == 8192
 
 
 def test_install_launchd_bridge_prefers_home_env_file_over_repo_env(tmp_path: Path):
@@ -369,13 +372,19 @@ def _plist(path: Path) -> dict[str, Any]:
 def _bridge_install_fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, str]]:
     repo_root = tmp_path / "repo"
     script_dir = repo_root / "scripts"
+    launchd_dir = repo_root / "launchd"
     script_dir.mkdir(parents=True)
+    launchd_dir.mkdir(parents=True)
     script = script_dir / "install_launchd.sh"
     script.write_text(
         Path("scripts/install_launchd.sh").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     script.chmod(0o755)
+    (launchd_dir / "com.engram.bridge.plist").write_text(
+        Path("launchd/com.engram.bridge.plist").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
 
     home = tmp_path / "home"
     bin_dir = tmp_path / "bin"

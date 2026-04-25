@@ -7,6 +7,7 @@ Walks the user through first-time configuration:
   4. Collect GEMINI_API_KEY (optional; unlocks semantic memory search)
   5. Discover MCPs and echo them (zero-MCP is supported — OQ19)
   6. Write ~/.engram/config.yaml
+  7. Sync ~/Library/LaunchAgents/com.engram.bridge.plist
 """
 from __future__ import annotations
 
@@ -23,6 +24,16 @@ from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
 from engram.config import DEFAULT_CONFIG_PATH
+from engram.launchd import (
+    find_repo_root,
+    installed_bridge_plist_path,
+    load_plist,
+    render_bridge_plist,
+    resolve_uv_bin,
+    setup_bridge_plist_issues,
+    write_bridge_env_file,
+    write_plist,
+)
 
 console = Console()
 
@@ -111,13 +122,17 @@ def run_wizard() -> None:
     rprint()
 
     _write_config(slack=slack, anthropic_key=anthropic_key, gemini_key=gemini_key)
+    rprint()
+
+    _step_launchd_sync(anthropic_key=anthropic_key, gemini_key=gemini_key)
     rprint("\n[bold green]✓ Setup complete.[/bold green]")
     rprint(f"  Config written to: {DEFAULT_CONFIG_PATH}")
     rprint()
     rprint("Next steps:")
-    rprint("  1. [cyan]engram run[/cyan]           — start the bridge")
-    rprint('  2. Test in Slack: DM the bot ("Hello")')
-    rprint("  3. Verify slash commands: type `/engram` in any channel — Slack should autocomplete")
+    rprint("  1. [cyan]engram status[/cyan]        — verify config + launchd health")
+    rprint("  2. [cyan]engram run[/cyan]           — start the bridge in foreground if you want")
+    rprint('  3. Test in Slack: DM the bot ("Hello")')
+    rprint("  4. Verify slash commands: type `/engram` in any channel — Slack should autocomplete")
     rprint("     If not: re-paste the manifest at api.slack.com/apps and reinstall the app.")
     rprint()
 
@@ -280,3 +295,65 @@ def _write_config(
     # Tight permissions — secrets live here.
     DEFAULT_CONFIG_PATH.chmod(0o600)
     rprint(f"  [green]✓[/green] wrote {DEFAULT_CONFIG_PATH} (mode 600)")
+
+
+def _step_launchd_sync(*, anthropic_key: str, gemini_key: str | None) -> None:
+    rprint("[bold]Step 7 — Launchd Bridge[/bold]")
+
+    repo_root = find_repo_root()
+    if repo_root is None:
+        rprint("  [yellow]⚠[/yellow] repo root not found from the current directory — skipping plist sync.")
+        rprint("    Run `engram setup` from the repo checkout or refresh with `scripts/install_launchd.sh`.")
+        return
+
+    uv_bin = resolve_uv_bin()
+    if uv_bin is None:
+        rprint("  [yellow]⚠[/yellow] uv is not on PATH — skipping launchd plist sync.")
+        return
+
+    env_file = write_bridge_env_file(
+        anthropic_key=anthropic_key,
+        gemini_key=gemini_key,
+    )
+    rprint(f"  [green]✓[/green] wrote {env_file} (mode 600)")
+
+    expected = render_bridge_plist(
+        repo_root=repo_root,
+        uv_bin=uv_bin,
+        env_file=env_file,
+    )
+    installed_path = installed_bridge_plist_path()
+    if not installed_path.exists():
+        if Confirm.ask("  Install launchd bridge plist now?", default=True):
+            write_plist(installed_path, expected)
+            rprint(f"  [green]✓[/green] wrote {installed_path}")
+        else:
+            rprint("  [yellow]⚠[/yellow] skipped launchd plist install.")
+        return
+
+    try:
+        installed = load_plist(installed_path)
+    except Exception as exc:
+        rprint(
+            "  [yellow]⚠[/yellow] installed plist could not be parsed "
+            f"({type(exc).__name__}: {exc})."
+        )
+        if Confirm.ask("  Overwrite the installed launchd plist now?", default=True):
+            write_plist(installed_path, expected)
+            rprint(f"  [green]✓[/green] refreshed {installed_path}")
+            rprint("    Restart the bridge with `launchctl unload && launchctl load` to apply it.")
+        return
+
+    issues = setup_bridge_plist_issues(installed, expected)
+    if not issues:
+        rprint("  [green]✓[/green] installed launchd plist is already in sync.")
+        return
+
+    categories = sorted({issue.category.replace("_", " ") for issue in issues})
+    rprint(f"  [yellow]⚠[/yellow] installed launchd plist drift detected: {', '.join(categories)}.")
+    if Confirm.ask("  Update the installed launchd plist now?", default=True):
+        write_plist(installed_path, expected)
+        rprint(f"  [green]✓[/green] refreshed {installed_path}")
+        rprint("    Restart the bridge with `launchctl unload && launchctl load` to apply it.")
+    else:
+        rprint("  [yellow]⚠[/yellow] left the installed launchd plist unchanged.")

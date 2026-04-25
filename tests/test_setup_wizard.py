@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import plistlib
 import re
 from pathlib import Path
 
-from engram.setup_wizard import SLACK_APP_MANIFEST, run_wizard
+import pytest
+
+from engram.setup_wizard import SLACK_APP_MANIFEST, _step_launchd_sync, run_wizard
 
 
 def _docs_manifest_block() -> str:
@@ -23,7 +26,10 @@ def test_setup_wizard_manifest_matches_install_doc() -> None:
 
 def test_run_wizard_prints_slash_command_verification_hint(monkeypatch) -> None:
     output: list[str] = []
-    monkeypatch.setattr("engram.setup_wizard.rprint", lambda *args, **_kwargs: output.append(" ".join(map(str, args))))
+    monkeypatch.setattr(
+        "engram.setup_wizard.rprint",
+        lambda *args, **_kwargs: output.append(" ".join(map(str, args))),
+    )
     monkeypatch.setattr("engram.setup_wizard._step_claude_cli", lambda: None)
     monkeypatch.setattr(
         "engram.setup_wizard._step_slack",
@@ -33,9 +39,70 @@ def test_run_wizard_prints_slash_command_verification_hint(monkeypatch) -> None:
     monkeypatch.setattr("engram.setup_wizard._step_gemini", lambda: None)
     monkeypatch.setattr("engram.setup_wizard._step_mcp_inventory", lambda: None)
     monkeypatch.setattr("engram.setup_wizard._write_config", lambda **_kwargs: None)
+    monkeypatch.setattr("engram.setup_wizard._step_launchd_sync", lambda **_kwargs: None)
 
     run_wizard()
 
     rendered = "\n".join(output)
     assert "Verify slash commands: type `/engram` in any channel" in rendered
     assert "api.slack.com/apps and reinstall the app." in rendered
+
+
+def test_step_launchd_sync_refreshes_drifted_plist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(Path.cwd())
+    monkeypatch.setenv("HOME", str(tmp_path))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    uv = bin_dir / "uv"
+    uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    uv.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setattr("engram.setup_wizard.Confirm.ask", lambda *_args, **_kwargs: True)
+
+    installed_path = tmp_path / "Library" / "LaunchAgents" / "com.engram.bridge.plist"
+    installed_path.parent.mkdir(parents=True)
+    with installed_path.open("wb") as handle:
+        plistlib.dump(
+            {
+                "Label": "com.engram.bridge",
+                "ProgramArguments": ["/tmp/old-engram", "run"],
+                "WorkingDirectory": "/tmp/old-repo",
+                "EnvironmentVariables": {
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "LANG": "en_US.UTF-8",
+                },
+                "RunAtLoad": True,
+                "StandardOutPath": "/tmp/engram.bridge.out.log",
+                "StandardErrorPath": "/tmp/engram.bridge.err.log",
+                "ProcessType": "Background",
+            },
+            handle,
+            sort_keys=False,
+        )
+
+    _step_launchd_sync(anthropic_key="sk-ant-test", gemini_key="gemini-test")
+
+    with installed_path.open("rb") as handle:
+        installed = plistlib.load(handle)
+    assert installed["SoftResourceLimits"]["NumberOfFiles"] == 4096
+    assert installed["HardResourceLimits"]["NumberOfFiles"] == 8192
+    assert installed["ProgramArguments"][1:] == [
+        "run",
+        "--project",
+        str(Path.cwd()),
+        "python",
+        "-m",
+        "engram.main",
+    ]
+    assert installed["EnvironmentVariables"]["ENGRAM_ENV_FILE"] == str(
+        tmp_path / ".engram" / ".env"
+    )
+
+    env_file = tmp_path / ".engram" / ".env"
+    assert env_file.read_text(encoding="utf-8").splitlines() == [
+        "ANTHROPIC_API_KEY=sk-ant-test",
+        "GEMINI_API_KEY=gemini-test",
+    ]

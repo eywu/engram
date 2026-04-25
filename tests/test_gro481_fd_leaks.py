@@ -320,14 +320,14 @@ async def test_runtime_snapshot_warns_when_fd_usage_exceeds_half_limit(
             cost_db=None,
         )
 
-    assert snapshot["bridge"]["fds"] == {
-        "in_use": 205,
-        "soft_limit": 400,
-        "hard_limit": 800,
-    }
+    assert snapshot["bridge"]["fds"]["in_use"] == 205
+    assert snapshot["bridge"]["fds"]["soft_limit"] == 400
+    assert snapshot["bridge"]["fds"]["hard_limit"] == 800
+    assert snapshot["bridge"]["fds"]["high_water"]["in_use"] == 205
     status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
     health = json.loads((tmp_path / "health.json").read_text(encoding="utf-8"))
     assert status["bridge"]["fds"]["in_use"] == 205
+    assert status["bridge"]["fds"]["high_water"]["in_use"] == 205
     assert health["fds"]["soft_limit"] == 400
 
     warnings = [

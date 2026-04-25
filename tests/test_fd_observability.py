@@ -196,6 +196,52 @@ async def test_runtime_snapshot_loop_offloads_fd_snapshot_writes(
     assert to_thread_calls == [(fake_write_fd_snapshot, (), {"log_dir": tmp_path})]
 
 
+@pytest.mark.asyncio
+async def test_runtime_snapshot_loop_records_fd_high_water_between_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed_high_water: list[dict[str, object] | None] = []
+    samples = iter(
+        [
+            {"in_use": 38, "soft_limit": 4096, "hard_limit": 8192},
+            {"in_use": 120, "soft_limit": 4096, "hard_limit": 8192},
+            {"in_use": 42, "soft_limit": 4096, "hard_limit": 8192},
+            {"in_use": 42, "soft_limit": 4096, "hard_limit": 8192},
+        ]
+    )
+
+    async def fake_write_runtime_snapshot(**kwargs):
+        observed_high_water.append(kwargs.get("fd_high_water"))
+        raise asyncio.CancelledError
+
+    async def fake_sleep(_interval: float) -> None:
+        return None
+
+    monkeypatch.setattr(main, "write_runtime_snapshot", fake_write_runtime_snapshot)
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._runtime_snapshot_loop(
+            state_dir=tmp_path,
+            router=Router(),
+            cost_db=None,
+            interval_seconds=0.75,
+            fd_high_water_sample_interval_seconds=0.25,
+            fd_usage_reader=lambda: next(samples),
+            fd_snapshots_enabled=False,
+        )
+
+    assert len(observed_high_water) == 1
+    high_water = observed_high_water[0]
+    assert high_water is not None
+    assert high_water["in_use"] == 120
+    assert high_water["soft_limit"] == 4096
+    assert high_water["hard_limit"] == 8192
+    assert high_water["window_started_at"] is not None
+    assert high_water["observed_at"] is not None
+
+
 def test_fd_pressure_thresholds_keep_absolute_alerts_for_high_soft_limits() -> None:
     assert main._fd_pressure_thresholds(4096) == (150, 200)
 

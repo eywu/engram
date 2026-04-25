@@ -21,6 +21,13 @@ from rich.console import Console
 from rich.table import Table
 
 from engram.config import EngramConfig
+from engram.launchd import (
+    bridge_template_commit,
+    doctor_bridge_plist_issues,
+    find_repo_root,
+    installed_bridge_plist_path,
+    load_plist,
+)
 from engram.runtime import fd_usage_snapshot, read_latest_fd_snapshot
 
 SLACK_AUTH_TEST_URL = "https://slack.com/api/auth.test"
@@ -142,6 +149,7 @@ def run_doctor(config_path: Path | None = None) -> DoctorReport:
             "launchd bridge job",
             "com.engram.bridge",
         ),
+        check_launchd_bridge_plist_drift(),
         check_launchd_job(
             "launchd_nightly",
             "launchd nightly job",
@@ -748,6 +756,71 @@ def check_launchd_job(
     )
 
 
+def check_launchd_bridge_plist_drift(
+    *,
+    repo_root: Path | None = None,
+    home: Path | None = None,
+    commit_resolver: Callable[[Path], str | None] | None = None,
+) -> DoctorCheck:
+    installed_path = installed_bridge_plist_path(home)
+    details = {"installed_path": str(installed_path)}
+    if not installed_path.exists():
+        return DoctorCheck(
+            id="launchd_bridge_plist",
+            name="launchd bridge plist",
+            status=CheckStatus.WARN,
+            message=f"{installed_path} is missing; run `engram setup` to install the current plist.",
+            details=details,
+        )
+
+    root = repo_root or find_repo_root()
+    if root is None:
+        return DoctorCheck(
+            id="launchd_bridge_plist",
+            name="launchd bridge plist",
+            status=CheckStatus.WARN,
+            message="Repo launchd template not found from the current directory; cannot compare plist drift.",
+            details=details,
+        )
+    details["repo_root"] = str(root)
+
+    try:
+        installed = load_plist(installed_path)
+    except Exception as exc:
+        return DoctorCheck(
+            id="launchd_bridge_plist",
+            name="launchd bridge plist",
+            status=CheckStatus.WARN,
+            message=f"Installed plist could not be parsed: {type(exc).__name__}: {exc}",
+            details=details | {"error_class": type(exc).__name__},
+        )
+
+    issues = doctor_bridge_plist_issues(installed)
+    if not issues:
+        commit = (commit_resolver or bridge_template_commit)(root)
+        if commit:
+            details["template_commit"] = commit
+        return DoctorCheck(
+            id="launchd_bridge_plist",
+            name="launchd bridge plist",
+            status=CheckStatus.PASS,
+            message=f"{installed_path} matches the canonical launchd bridge template.",
+            details=details,
+        )
+
+    commit = (commit_resolver or bridge_template_commit)(root)
+    if commit:
+        details["template_commit"] = commit
+    details["issues"] = [issue.path for issue in issues]
+    return DoctorCheck(
+        id="launchd_bridge_plist",
+        name="launchd bridge plist",
+        status=CheckStatus.WARN,
+        message=_launchd_bridge_plist_drift_message(issues, template_commit=commit),
+        details=details,
+    )
+
+
 def check_disk_space(
     engram_dir: Path | None = None,
     *,
@@ -896,6 +969,38 @@ def check_fd_pressure(
         status=status,
         message=_fd_pressure_message(summary, top_patterns, other_count),
         details=details,
+    )
+
+
+def _launchd_bridge_plist_drift_message(
+    issues: list[Any],
+    *,
+    template_commit: str | None,
+) -> str:
+    soft_limit_issue = next(
+        (issue for issue in issues if issue.path == "SoftResourceLimits.NumberOfFiles"),
+        None,
+    )
+    if soft_limit_issue is not None:
+        suffix = (
+            f" (introduced in GRO-481; canonical template {template_commit})."
+            if template_commit
+            else " (introduced in GRO-481)."
+        )
+        return (
+            "installed plist missing or outdated SoftResourceLimits.NumberOfFiles; "
+            "restart bridge with corrected plist to apply"
+            f"{suffix}"
+        )
+
+    summarized = ", ".join(issue.path for issue in issues[:3])
+    if len(issues) > 3:
+        summarized = f"{summarized}, +{len(issues) - 3} more"
+    suffix = f" Canonical template {template_commit}." if template_commit else ""
+    return (
+        f"installed plist drift detected ({summarized}); "
+        "restart bridge with corrected plist to apply."
+        f"{suffix}"
     )
 
 

@@ -161,3 +161,44 @@ def test_status_surfaces_stale_nightly_heartbeat(
     assert payload["nightly"]["state"] == "stale"
     assert payload["nightly"]["stale"] is True
     assert payload["nightly"]["age_hours"] == 72.0
+
+
+def test_status_surfaces_bridge_fd_high_water(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("engram.cli._bridge_pid", lambda: 123)
+    monkeypatch.setattr("engram.cli.process_exists", lambda pid: pid == 123)
+    state_dir = isolated_home / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "bridge": {
+                    "pid": 123,
+                    "fds": {
+                        "in_use": 38,
+                        "soft_limit": 4096,
+                        "hard_limit": 8192,
+                        "high_water": {
+                            "in_use": 121,
+                            "soft_limit": 4096,
+                            "hard_limit": 8192,
+                            "window_started_at": "2026-04-24T23:59:45+00:00",
+                            "observed_at": "2026-04-24T23:59:59+00:00",
+                        },
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["status"])
+
+    assert result.exit_code == 0
+    assert "fds: 38 / 4096 current, high-water 121" in result.output
+
+    json_result = CliRunner().invoke(app, ["status", "--json"])
+    payload = json.loads(json_result.output)
+    assert payload["bridge"]["fds"]["high_water"]["in_use"] == 121
