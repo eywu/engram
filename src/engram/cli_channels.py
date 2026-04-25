@@ -24,6 +24,7 @@ from rich.console import Console
 from rich.table import Table
 
 from engram import paths
+from engram.agent import archive_session_transcript
 from engram.manifest import (
     ChannelStatus,
     ManifestError,
@@ -36,6 +37,7 @@ from engram.manifest import (
     set_channel_status,
     validate_upgrade_duration,
 )
+from engram.router import derive_session_id
 
 app = typer.Typer(
     name="channels",
@@ -484,6 +486,58 @@ def include(
 ) -> None:
     """Include a channel in the nightly cross-channel summary."""
     _set_nightly_state(channel_id, nightly_included=True)
+
+
+@app.command("new")
+def new(
+    channel_id: str = typer.Argument(..., help="Slack channel ID."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip confirmation prompt.",
+    ),
+) -> None:
+    """Start a fresh conversation for a channel.
+
+    Archives the Claude CLI JSONL transcript so the next message spawns a new
+    subprocess with a clean context.  Memory is preserved.  MCP servers and
+    project config are reloaded on next connect.
+
+    If the Engram bridge is running the in-memory session will also be reset the
+    next time the channel reconnects (i.e. after the current turn finishes).
+    """
+    manifest_path = paths.channel_manifest_path(channel_id)
+    if not manifest_path.exists():
+        rprint(f"[red]No manifest found for channel '{channel_id}'.[/red]")
+        rprint(f"  Expected at: {manifest_path}")
+        raise typer.Exit(code=1)
+
+    if not yes:
+        confirmed = typer.confirm(
+            f"Start a fresh conversation for '{channel_id}'? "
+            "Memory is preserved; the JSONL transcript will be archived."
+        )
+        if not confirmed:
+            rprint("[dim]Cancelled.[/dim]")
+            raise typer.Exit(code=0)
+
+    session_id = derive_session_id(channel_id)
+    # cwd defaults to None → uses Path.cwd() inside archive_session_transcript
+    archived = archive_session_transcript(session_id, cwd=None)
+    if archived is not None:
+        rprint(f"[green]✓[/] Transcript archived → {archived.name}")
+    else:
+        rprint("[dim]No active transcript found (nothing to archive).[/dim]")
+
+    rprint(
+        f"[green]✓[/] Fresh session ready for [bold]{channel_id}[/bold]. "
+        "Next message will start a new Claude CLI subprocess."
+    )
+    rprint(
+        "[dim]Note: if the bridge is running, the in-memory session is not "
+        "affected until the bridge creates a new client for this channel.[/dim]"
+    )
 
 
 if __name__ == "__main__":
