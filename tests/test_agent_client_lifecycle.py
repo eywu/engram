@@ -10,9 +10,11 @@ from pathlib import Path
 
 import pytest
 from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ProcessError, ResultMessage
+from claude_agent_sdk.types import ToolResultBlock, ToolUseBlock, UserMessage
 
 from engram.agent import Agent, _claude_cli_jsonl_for
 from engram.config import AnthropicConfig, EngramConfig, SlackConfig
+from engram.egress import post_reply
 from engram.router import Router, SessionState, derive_session_id
 
 
@@ -150,6 +152,99 @@ class _TranscriptFakeClient:
             session_id=self._session_id,
             total_cost_usd=0.01,
         )
+
+
+@dataclass
+class _MultiTurnToolClient:
+    options: ClaudeAgentOptions
+    _prompt: str = ""
+    _session_id: str = ""
+    receive_messages_calls: int = 0
+    receive_response_calls: int = 0
+
+    async def connect(self) -> None:
+        return None
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def query(self, prompt: str, session_id: str = "default") -> None:
+        self._prompt = prompt
+        self._session_id = session_id
+
+    async def receive_messages(self):
+        self.receive_messages_calls += 1
+        yield AssistantMessage(
+            content=[_TextBlock("Both files written successfully. ")],
+            model="fake",
+        )
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="tool-todo-write",
+                    name="TodoWrite",
+                    input={"todos": [{"content": "mark done"}]},
+                )
+            ],
+            model="fake",
+            stop_reason="tool_use",
+        )
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id=self._session_id,
+            stop_reason="tool_use",
+            total_cost_usd=0.01,
+        )
+        yield UserMessage(
+            content=[
+                ToolResultBlock(
+                    tool_use_id="tool-todo-write",
+                    content="TodoWrite OK",
+                    is_error=False,
+                )
+            ],
+            parent_tool_use_id="tool-todo-write",
+            tool_use_result={"ok": True},
+        )
+        yield AssistantMessage(
+            content=[_TextBlock("Done. Here's what was set up.")],
+            model="fake",
+            stop_reason="end_turn",
+        )
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=2,
+            duration_api_ms=2,
+            is_error=False,
+            num_turns=2,
+            session_id=self._session_id,
+            stop_reason="end_turn",
+            total_cost_usd=0.02,
+        )
+
+    async def receive_response(self):
+        self.receive_response_calls += 1
+        async for message in self.receive_messages():
+            yield message
+            if isinstance(message, ResultMessage):
+                return
+
+    async def tag_session(self, *, session_id: str, tags: dict[str, str]) -> None:
+        return None
+
+
+class _SlackRecorder:
+    def __init__(self) -> None:
+        self.post_calls: list[dict[str, object]] = []
+        self.chat_postMessage = self._chat_post_message
+
+    async def _chat_post_message(self, **kwargs):
+        self.post_calls.append(kwargs)
+        return {"ts": "1713800000.000100"}
 
 
 def test_session_id_is_deterministic():
@@ -326,3 +421,51 @@ async def test_shutdown_closes_all_active_clients():
     assert closed == 3
     assert all(client.disconnected for client in clients)
     assert all(session.agent_client is None for session in router.list_sessions())
+
+
+@pytest.mark.asyncio
+async def test_run_turn_collects_text_after_tool_result_before_terminal_result():
+    client: _MultiTurnToolClient | None = None
+
+    def factory(options: ClaudeAgentOptions) -> _MultiTurnToolClient:
+        nonlocal client
+        client = _MultiTurnToolClient(options)
+        return client
+
+    agent = Agent(_cfg(), client_factory=factory)
+    session = SessionState(channel_id="C07TEST123")
+
+    turn = await agent.run_turn(session, "hook up camoufox")
+
+    assert turn.text == (
+        "Both files written successfully. Done. Here's what was set up."
+    )
+    assert turn.cost_usd == pytest.approx(0.02)
+    assert turn.num_turns == 2
+    assert client is not None
+    assert client.receive_messages_calls == 1
+    assert client.receive_response_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_post_reply_egresses_full_summary_after_tool_result():
+    def factory(options: ClaudeAgentOptions) -> _MultiTurnToolClient:
+        return _MultiTurnToolClient(options)
+
+    agent = Agent(_cfg(), client_factory=factory)
+    session = SessionState(channel_id="C07TEST123")
+    slack = _SlackRecorder()
+
+    turn = await agent.run_turn(session, "hook up camoufox")
+    result = await post_reply(
+        slack,
+        session.channel_id,
+        turn,
+        session_label=session.label(),
+    )
+
+    assert result.chunks_posted == 1
+    assert len(slack.post_calls) == 1
+    body = slack.post_calls[0]["blocks"][0]["text"]
+    assert "Both files written successfully." in body
+    assert "Done. Here's what was set up." in body

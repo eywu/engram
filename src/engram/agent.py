@@ -37,6 +37,7 @@ from claude_agent_sdk import (
     RateLimitEvent,
     RateLimitStatus,
     ResultMessage,
+    UserMessage,
     tag_session,
 )
 
@@ -258,20 +259,55 @@ class Agent:
         """Run one SDK attempt. Caller must hold session.agent_lock."""
         text_chunks: list[str] = []
         result: ResultMessage | None = None
+        pending_tool_use_ids: set[str] = set()
         client = await self._ensure_client(session)
+        uses_raw_stream = callable(getattr(client, "receive_messages", None))
 
         await client.query(user_text, session_id=session.session_id)
-        async for message in client.receive_response():
+        # receive_response() stops at the first ResultMessage, but tool-driven
+        # turns can continue with tool_result + assistant text after an
+        # intermediate result. Consume the raw message stream instead.
+        async for message in self._iter_turn_messages(client):
             if isinstance(message, AssistantMessage):
                 for block in getattr(message, "content", []) or []:
                     text = getattr(block, "text", None)
                     if text:
                         text_chunks.append(text)
+                    tool_use_id = getattr(block, "id", None)
+                    tool_use_input = getattr(block, "input", None)
+                    if tool_use_id and isinstance(tool_use_input, dict):
+                        pending_tool_use_ids.add(tool_use_id)
+            elif isinstance(message, UserMessage):
+                for block in getattr(message, "content", []) or []:
+                    tool_use_id = getattr(block, "tool_use_id", None)
+                    if tool_use_id:
+                        pending_tool_use_ids.discard(tool_use_id)
             elif isinstance(message, ResultMessage):
                 result = message
+                if uses_raw_stream and self._is_terminal_turn_result(
+                    message,
+                    pending_tool_use_ids=pending_tool_use_ids,
+                ):
+                    break
             elif isinstance(message, RateLimitEvent):
                 await self._handle_rate_limit_event(session, message)
         return text_chunks, result
+
+    def _iter_turn_messages(self, client: ClaudeSDKClient):
+        receive_messages = getattr(client, "receive_messages", None)
+        if callable(receive_messages):
+            return receive_messages()
+        return client.receive_response()
+
+    @staticmethod
+    def _is_terminal_turn_result(
+        result: ResultMessage,
+        *,
+        pending_tool_use_ids: set[str],
+    ) -> bool:
+        if result.stop_reason == "tool_use":
+            return False
+        return not pending_tool_use_ids
 
     # ──────────────────────────────────────────────────────────────
     # Option construction
