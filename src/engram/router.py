@@ -64,6 +64,7 @@ class SessionState:
     agent_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     agent_session_initialized: bool = False
     agent_session_tagged: bool = False
+    session_just_started: bool = False
     agent_last_active_at: float = field(default_factory=time.monotonic)
     turn_count: int = 0
     current_user_id: str | None = None

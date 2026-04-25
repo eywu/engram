@@ -854,3 +854,27 @@ def _claude_simple_hash(value: str) -> str:
         encoded.append(digits[hash_value % 36])
         hash_value //= 36
     return "".join(reversed(encoded))
+
+
+def archive_session_transcript(
+    session_id: str,
+    cwd: "Path | str | None" = None,
+) -> "Path | None":
+    """Rename the Claude CLI JSONL transcript for *session_id* to an archived copy.
+
+    The archive path is ``<original>.archived-<UTC-ISO-timestamp>`` so the file
+    is retained for forensic recovery.  Returns the new path, or ``None`` when
+    no transcript file exists (first-run / already archived).
+    """
+    jsonl_path = _claude_cli_jsonl_for(session_id, cwd)
+    if not jsonl_path.exists():
+        return None
+    ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
+    archived = jsonl_path.with_name(f"{jsonl_path.name}.archived-{ts}")
+    jsonl_path.rename(archived)
+    log.info(
+        "agent.transcript_archived session=%s archived_path=%s",
+        session_id,
+        archived,
+    )
+    return archived
