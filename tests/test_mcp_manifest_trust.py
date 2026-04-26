@@ -18,6 +18,7 @@ from engram.manifest import (
     ChannelManifest,
     ChannelStatus,
     IdentityTemplate,
+    ManifestError,
     PermissionTier,
     ScopeList,
     dump_manifest,
@@ -95,6 +96,26 @@ def _block_action_payload(value: str, *, user_id: str = "U07OWNER") -> dict:
     return {
         "type": "block_actions",
         "actions": [{"action_id": action_id, "block_id": "hitl_actions", "value": value}],
+        "user": {"id": user_id},
+    }
+
+
+def _tampered_block_action_payload(
+    permission_request_id: str,
+    choice_key: str,
+    *,
+    action_id: str = "hitl_choice_0",
+    user_id: str = "U07OWNER",
+) -> dict:
+    return {
+        "type": "block_actions",
+        "actions": [
+            {
+                "action_id": action_id,
+                "block_id": "hitl_actions",
+                "value": f"{permission_request_id}|{choice_key}",
+            }
+        ],
         "user": {"id": user_id},
     }
 
@@ -214,6 +235,9 @@ async def test_resolve_mcp_server_trust_fetch_failure_is_unknown(tmp_path: Path)
     )
 
     assert decision.tier == MCPTrustTier.UNKNOWN
+    assert decision.registry == "pypi"
+    assert decision.package_name == "broken-mcp"
+    assert decision.version == "0.1.0"
     assert decision.reason == "metadata lookup failed"
 
 
@@ -243,6 +267,23 @@ def test_load_manifest_grandfathers_existing_allow_list_once(
     ]
     assert len(records) == 1
     assert (state_dir(home) / "mcp_manifest_audit.json").exists()
+
+
+def test_dump_manifest_blocks_ungated_mcp_allow_list_addition(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    manifest_path = channel_manifest_path("C07TEAM", home)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_manifest(_manifest(), manifest_path)
+
+    with pytest.raises(
+        ManifestError,
+        match="persist_approved_mcp_manifest_change",
+    ):
+        dump_manifest(_manifest(allowed=["camoufox"]), manifest_path)
+
+    assert load_manifest(manifest_path).mcp_servers.allowed is None
 
 
 @pytest.mark.asyncio
@@ -329,6 +370,7 @@ async def test_community_trusted_manifest_mcp_addition_notifies_owner_and_allows
 async def test_unknown_manifest_mcp_addition_requires_owner_dm_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     home = tmp_path / ".engram"
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -400,11 +442,12 @@ async def test_unknown_manifest_mcp_addition_requires_owner_dm_approval(
     pending = router.hitl.pending_for_channel("C07TEAM")
     assert len(pending) == 1
     q = pending[0]
-    ack = await handle_block_action(
-        _block_action_payload(f"{q.permission_request_id}|1"),
-        router,
-        slack,
-    )
+    with caplog.at_level("INFO", logger="engram.manifest"):
+        ack = await handle_block_action(
+            _block_action_payload(f"{q.permission_request_id}|1"),
+            router,
+            slack,
+        )
 
     assert ack == {"ok": True}
     await _wait_until(
@@ -416,6 +459,185 @@ async def test_unknown_manifest_mcp_addition_requires_owner_dm_approval(
     assert trusted_overlay.exists()
     assert "camoufox-labs" in trusted_overlay.read_text(encoding="utf-8")
     assert slack.update_calls[-1]["channel"] == "D07OWNER"
+    audit_payload = json.loads(
+        (state_dir(home) / "mcp_manifest_audit.json").read_text(encoding="utf-8")
+    )
+    assert audit_payload["audited_channels"]["C07TEAM"]["source"] == "approved_addition"
+    assert not [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("manifest.mcp_allow_list_grandfathered")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice_key", ["99", "garbage"])
+async def test_unknown_manifest_mcp_addition_malformed_choice_key_denies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    choice_key: str,
+) -> None:
+    home = tmp_path / ".engram"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    mcp_dir = Path.home() / ".claude"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "camoufox": {
+                        "command": "uvx",
+                        "args": ["camoufox-browser[mcp]==0.1.1"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = channel_manifest_path("C07TEAM", home)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_manifest(_manifest(), manifest_path)
+
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    session = await router.get("C07TEAM")
+    slack = FakeSlackClient()
+    agent = Agent(_cfg(), router=router)
+
+    async def on_new_question(q) -> None:
+        channel_ts, thread_ts = await post_question(q, slack)
+        q.slack_channel_ts = channel_ts
+        q.slack_thread_ts = thread_ts
+
+    agent._on_new_question = on_new_question
+    opts = agent._build_options(session)
+    staged = session.manifest.model_copy(update={"mcp_servers": ScopeList(allowed=["camoufox"])})
+
+    monkeypatch.setattr(
+        "engram.agent.resolve_mcp_server_trust",
+        _constant_trust_decision(
+            MCPTrustTier.UNKNOWN,
+            server_name="camoufox",
+            package_name="camoufox-browser",
+            version="0.1.1",
+            publisher="camoufox-labs",
+            summary="age=14d, downloads=25/week, contributors=1, repo_active=no",
+        ),
+    )
+
+    result = await opts.can_use_tool(
+        "Write",
+        {"file_path": str(manifest_path), "content": _render_manifest(staged)},
+        ToolPermissionContext(tool_use_id="tool-1"),
+    )
+    assert isinstance(result, PermissionResultDeny)
+
+    pending = router.hitl.pending_for_channel("C07TEAM")
+    assert len(pending) == 1
+    q = pending[0]
+
+    with caplog.at_level("WARNING", logger="engram.ingress"):
+        ack = await handle_block_action(
+            _tampered_block_action_payload(q.permission_request_id, choice_key),
+            router,
+            slack,
+        )
+
+    assert ack == {"ok": True}
+    await _wait_until(lambda: q.future.done() and bool(slack.update_calls))
+    resolution = q.future.result()
+    assert isinstance(resolution, PermissionResultDeny)
+    assert load_manifest(manifest_path).mcp_servers.allowed is None
+    assert "invalid payload" in slack.update_calls[-1]["text"]
+    assert any(
+        record.getMessage().startswith("hitl.invalid_choice_payload")
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_manifest_mcp_addition_apply_failure_updates_dm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / ".engram"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    mcp_dir = Path.home() / ".claude"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "camoufox": {
+                        "command": "uvx",
+                        "args": ["camoufox-browser[mcp]==0.1.1"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest_path = channel_manifest_path("C07TEAM", home)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_manifest(_manifest(), manifest_path)
+
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    session = await router.get("C07TEAM")
+    slack = FakeSlackClient()
+    agent = Agent(_cfg(), router=router)
+
+    async def on_new_question(q) -> None:
+        channel_ts, thread_ts = await post_question(q, slack)
+        q.slack_channel_ts = channel_ts
+        q.slack_thread_ts = thread_ts
+
+    agent._on_new_question = on_new_question
+    opts = agent._build_options(session)
+    staged = session.manifest.model_copy(update={"mcp_servers": ScopeList(allowed=["camoufox"])})
+
+    monkeypatch.setattr(
+        "engram.agent.resolve_mcp_server_trust",
+        _constant_trust_decision(
+            MCPTrustTier.UNKNOWN,
+            server_name="camoufox",
+            package_name="camoufox-browser",
+            version="0.1.1",
+            publisher="camoufox-labs",
+            summary="age=14d, downloads=25/week, contributors=1, repo_active=no",
+        ),
+    )
+
+    result = await opts.can_use_tool(
+        "Write",
+        {"file_path": str(manifest_path), "content": _render_manifest(staged)},
+        ToolPermissionContext(tool_use_id="tool-1"),
+    )
+    assert isinstance(result, PermissionResultDeny)
+
+    pending = router.hitl.pending_for_channel("C07TEAM")
+    assert len(pending) == 1
+    q = pending[0]
+
+    manifest_dir = manifest_path.parent
+    original_mode = manifest_dir.stat().st_mode
+    manifest_dir.chmod(0o500)
+    try:
+        ack = await handle_block_action(
+            _block_action_payload(f"{q.permission_request_id}|0"),
+            router,
+            slack,
+        )
+        assert ack == {"ok": True}
+        await _wait_until(lambda: q.future.done() and bool(slack.update_calls))
+    finally:
+        manifest_dir.chmod(original_mode)
+
+    assert load_manifest(manifest_path).mcp_servers.allowed is None
+    assert "Approval failed to apply:" in slack.update_calls[-1]["text"]
+    assert slack.update_calls[-1]["blocks"][0]["text"]["text"].startswith(
+        "❌ Answered: Approval failed to apply:"
+    )
 
 
 def _constant_trust_decision(

@@ -6,12 +6,20 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from engram import paths
 from engram.bootstrap import provision_channel
 from engram.cli import app
-from engram.manifest import IdentityTemplate, ScopeList, dump_manifest, load_manifest
+from engram.manifest import (
+    IdentityTemplate,
+    ScopeList,
+    detect_mcp_allow_list_additions,
+    dump_manifest,
+    load_manifest,
+    persist_approved_mcp_manifest_change,
+)
 
 
 @pytest.fixture
@@ -54,12 +62,22 @@ def test_status_json_includes_channel_mcp_policy(isolated_home: Path):
     )
     manifest_path = paths.channel_manifest_path("C07TEAM", isolated_home)
     manifest = load_manifest(manifest_path)
-    dump_manifest(
-        manifest.model_copy(
-            update={"mcp_servers": ScopeList(allowed=["linear"])}
-        ),
-        manifest_path,
+    staged = manifest.model_copy(update={"mcp_servers": ScopeList(allowed=["linear"])})
+    plan = detect_mcp_allow_list_additions(
+        "Write",
+        {
+            "file_path": str(manifest_path),
+            "content": yaml.safe_dump(
+                staged.model_dump(mode="json", exclude_none=False),
+                sort_keys=False,
+                default_flow_style=False,
+                indent=2,
+            ),
+        },
+        manifest_path=manifest_path,
     )
+    assert plan is not None
+    persist_approved_mcp_manifest_change(plan)
 
     result = CliRunner().invoke(app, ["status", "--json"])
 

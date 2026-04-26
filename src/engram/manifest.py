@@ -1002,9 +1002,7 @@ def detect_mcp_allow_list_additions(
 
     current_manifest = load_manifest(manifest_path)
     staged_manifest = _manifest_from_text(staged_text, manifest_path)
-    current_allowed = set(current_manifest.mcp_servers.allowed or [])
-    staged_allowed = list(staged_manifest.mcp_servers.allowed or [])
-    additions = [name for name in staged_allowed if name not in current_allowed]
+    additions = _mcp_allow_list_additions(current_manifest, staged_manifest)
     if not additions:
         return None
 
@@ -1050,10 +1048,15 @@ def persist_approved_mcp_manifest_change(
             "manifest.mcp_allow_merge_after_stale_approval channel_id=%s path=%s additions=%s",
             current_manifest.channel_id,
             plan.manifest_path,
-            merged_allowed,
+            plan.additions,
         )
-    _write_manifest_atomic(updated_manifest, plan.manifest_path)
-    return current_manifest, updated_manifest, plan.manifest_path
+    previous_manifest, persisted_manifest, persisted_path = _persist_manifest_update(
+        updated_manifest,
+        plan.manifest_path,
+        approved_mcp_additions=plan.additions,
+        audit_source="approved_addition",
+    )
+    return previous_manifest or current_manifest, persisted_manifest, persisted_path
 
 
 def load_manifest(path: Path) -> ChannelManifest:
@@ -1113,8 +1116,13 @@ def load_manifest(path: Path) -> ChannelManifest:
 
 
 def dump_manifest(manifest: ChannelManifest, path: Path) -> None:
-    """Write a manifest to YAML. Parent dir must exist."""
-    path.write_text(_manifest_yaml(manifest))
+    """Write a manifest to YAML, enforcing MCP allow-list approval.
+
+    New entries in ``mcp_servers.allowed`` on an existing manifest must flow
+    through ``persist_approved_mcp_manifest_change`` so the trust gate has
+    already resolved and approved the additions before they reach disk.
+    """
+    _persist_manifest_update(manifest, path)
 
 
 def persist_yolo_demotion(
@@ -1266,6 +1274,57 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _mcp_allow_list_additions(
+    current_manifest: ChannelManifest | None,
+    staged_manifest: ChannelManifest,
+) -> list[str]:
+    current_allowed = (
+        set(current_manifest.mcp_servers.allowed or [])
+        if current_manifest is not None
+        else set()
+    )
+    staged_allowed = list(staged_manifest.mcp_servers.allowed or [])
+    return [name for name in staged_allowed if name not in current_allowed]
+
+
+def _persist_manifest_update(
+    manifest: ChannelManifest,
+    path: Path,
+    *,
+    approved_mcp_additions: list[str] | None = None,
+    audit_source: str | None = None,
+) -> tuple[ChannelManifest | None, ChannelManifest, Path]:
+    """Persist a manifest while enforcing the MCP allow-list trust gate.
+
+    All public manifest writers should funnel through this helper. If an
+    existing manifest gains new names in ``mcp_servers.allowed``, callers must
+    provide the approved additions from the trust-gated flow; otherwise the
+    write is rejected before it reaches disk.
+    """
+    previous_manifest = load_manifest(path) if path.exists() else None
+    additions: list[str] = []
+    if previous_manifest is not None:
+        additions = _mcp_allow_list_additions(previous_manifest, manifest)
+        approved = list(dict.fromkeys(approved_mcp_additions or []))
+        unexpected = [name for name in additions if name not in approved]
+        if unexpected:
+            raise ManifestError(
+                "Blocked manifest write: new MCP allow-list entries require "
+                "trust-gated approval via persist_approved_mcp_manifest_change "
+                f"(attempted additions: {unexpected})."
+            )
+    _write_manifest_atomic(manifest, path)
+    if additions:
+        _record_mcp_allow_list_audit(
+            manifest,
+            path,
+            source=audit_source or "approved_addition",
+            event_name="manifest.mcp_allow_list_addition_approved",
+            additions=additions,
+        )
+    return previous_manifest, manifest, path
+
+
 def _audit_existing_mcp_allow_list_once(
     manifest: ChannelManifest,
     path: Path,
@@ -1273,6 +1332,25 @@ def _audit_existing_mcp_allow_list_once(
     allowed = list(manifest.mcp_servers.allowed or [])
     if not allowed:
         return
+    _record_mcp_allow_list_audit(
+        manifest,
+        path,
+        source="legacy_grandfathered",
+        event_name="manifest.mcp_allow_list_grandfathered",
+        additions=allowed,
+        only_if_absent=True,
+    )
+
+
+def _record_mcp_allow_list_audit(
+    manifest: ChannelManifest,
+    path: Path,
+    *,
+    source: str,
+    event_name: str,
+    additions: list[str],
+    only_if_absent: bool = False,
+) -> None:
     audit_path = _mcp_allow_audit_path(path)
     if audit_path is None:
         return
@@ -1290,11 +1368,14 @@ def _audit_existing_mcp_allow_list_once(
         audited_channels = {}
         payload["audited_channels"] = audited_channels
     channel_key = manifest.channel_id
-    if channel_key in audited_channels:
+    if only_if_absent and channel_key in audited_channels:
         return
+    allowed = list(manifest.mcp_servers.allowed or [])
     audited_channels[channel_key] = {
         "path": str(path),
         "allowed": allowed,
+        "additions": additions,
+        "source": source,
         "audited_at": datetime.now(UTC).isoformat(),
     }
     audit_path.write_text(
@@ -1302,10 +1383,13 @@ def _audit_existing_mcp_allow_list_once(
         encoding="utf-8",
     )
     log.info(
-        "manifest.mcp_allow_list_grandfathered channel_id=%s path=%s allowed=%s",
+        "%s channel_id=%s path=%s allowed=%s additions=%s source=%s",
+        event_name,
         manifest.channel_id,
         path,
         allowed,
+        additions,
+        source,
     )
 
 
@@ -1399,7 +1483,7 @@ def add_allow_rule(
             )
         }
     )
-    _write_manifest_atomic(updated, manifest_path)
+    dump_manifest(updated, manifest_path)
     return manifest, updated, manifest_path
 
 
@@ -1513,7 +1597,7 @@ def set_channel_permission_tier(
             updated.yolo_until.isoformat() if updated.yolo_until is not None else None,
         )
 
-    _write_manifest_atomic(updated, manifest_path)
+    dump_manifest(updated, manifest_path)
     return manifest, updated, manifest_path, normalized_duration
 
 
@@ -1535,5 +1619,5 @@ def set_channel_nightly_included(
         return manifest, manifest, manifest_path
 
     updated = manifest.model_copy(update={"nightly_included": nightly_included})
-    _write_manifest_atomic(updated, manifest_path)
+    dump_manifest(updated, manifest_path)
     return manifest, updated, manifest_path

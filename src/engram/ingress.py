@@ -3320,6 +3320,7 @@ async def _resolve_block_action(
                 "(will not ask again in this channel)"
             )
         elif choice_key == "deny":
+            q.resolution_choice = "deny"
             result = _resolve_question(q, choice="deny")
             answer_text = q.deny_button_label
         else:
@@ -3336,10 +3337,18 @@ async def _resolve_block_action(
                     tool_name=q.tool_name,
                 )
             except (ValueError, IndexError):
-                result = _resolve_question(q, choice="allow")
-                answer_text = _suggestion_label(None, tool_name=q.tool_name)
+                q.resolution_choice = "deny"
+                log.warning(
+                    "hitl.invalid_choice_payload permission_request_id=%s choice=%r suggestions=%d",
+                    q.permission_request_id,
+                    choice_key,
+                    len(q.suggestions),
+                )
+                result = _resolve_question(q, choice="deny")
+                answer_text = f"{q.deny_button_label} (invalid payload)"
 
         resolved = router.hitl.resolve(q.permission_request_id, result)
+        applied_successfully = True
         if resolved:
             hitl_log.info(
                 "hitl.answer_received",
@@ -3350,12 +3359,23 @@ async def _resolve_block_action(
                 },
             )
             if q.on_resolve is not None:
-                await q.on_resolve(result)
+                try:
+                    await q.on_resolve(result)
+                except Exception as exc:
+                    applied_successfully = False
+                    log.exception(
+                        "hitl.resolution_apply_failed permission_request_id=%s choice=%s",
+                        q.permission_request_id,
+                        choice_key,
+                    )
+                    answer_text = f"Approval failed to apply: {exc}"
         await update_question_resolved(
             q,
             answer_text,
             slack_client,
-            allowed=isinstance(result, PermissionResultAllow),
+            allowed=(
+                isinstance(result, PermissionResultAllow) and applied_successfully
+            ),
         )
     except Exception:
         log.exception("resolve_block_action failed")

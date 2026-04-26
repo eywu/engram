@@ -247,24 +247,17 @@ class Agent:
         async def _apply_approved_manifest(_result) -> None:
             if q.resolution_choice == "deny":
                 return
-            try:
-                if q.resolution_choice == "1":
-                    trusted_publishers = [
-                        (decision.registry, decision.publisher or "")
-                        for decision in decisions
-                        if decision.publisher
-                    ]
-                    add_trusted_publishers(
-                        trusted_publishers,
-                        home=self._router.home,
-                    )
-                _previous, updated, _path = persist_approved_mcp_manifest_change(plan)
-                self._router.replace_cached_manifest(updated)
-            except Exception:
-                log.exception(
-                    "agent.mcp_trust_approval_apply_failed channel=%s additions=%s",
-                    session.channel_id,
-                    plan.additions,
+            _previous, updated, _path = persist_approved_mcp_manifest_change(plan)
+            self._router.replace_cached_manifest(updated)
+            if q.resolution_choice == "1":
+                trusted_publishers = [
+                    (decision.registry, decision.publisher or "")
+                    for decision in decisions
+                    if decision.publisher
+                ]
+                add_trusted_publishers(
+                    trusted_publishers,
+                    home=self._router.home,
                 )
 
         q.on_resolve = _apply_approved_manifest
