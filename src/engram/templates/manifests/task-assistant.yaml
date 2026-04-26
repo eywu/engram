@@ -28,7 +28,7 @@ tools:
 # search is a base capability; remove it here and add it to `disallowed` only
 # when a channel should not recall stored conversation history.
 # To grant one, add the server name here and define its config in
-# ~/.claude/mcp.json.
+# ~/.claude.json under `mcpServers`.
 mcp_servers:
   allowed:
     - engram-memory

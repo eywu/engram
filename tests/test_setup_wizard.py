@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
 import plistlib
 import re
 from pathlib import Path
 
 import pytest
 
-from engram.setup_wizard import SLACK_APP_MANIFEST, _step_launchd_sync, run_wizard
+from engram.setup_wizard import (
+    SLACK_APP_MANIFEST,
+    _step_launchd_sync,
+    _step_mcp_inventory,
+    run_wizard,
+)
 
 
 def _docs_manifest_block() -> str:
@@ -46,6 +52,35 @@ def test_run_wizard_prints_slash_command_verification_hint(monkeypatch) -> None:
     rendered = "\n".join(output)
     assert "Verify slash commands: type `/engram` in any channel" in rendered
     assert "api.slack.com/apps and reinstall the app." in rendered
+
+
+def test_step_mcp_inventory_reads_claude_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "linear": {"type": "http", "url": "https://linear.example/mcp"}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    output: list[str] = []
+    monkeypatch.setattr(
+        "engram.setup_wizard.rprint",
+        lambda *args, **_kwargs: output.append(" ".join(map(str, args))),
+    )
+
+    _step_mcp_inventory()
+
+    rendered = "\n".join(output)
+    assert "~/.claude.json" in rendered
+    assert "linear" in rendered
+    assert "gate which MCPs are allowed in each team channel" in rendered
 
 
 def test_step_launchd_sync_refreshes_drifted_plist(

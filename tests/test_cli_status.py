@@ -39,9 +39,7 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def test_status_json_includes_channel_mcp_policy(isolated_home: Path):
-    mcp_dir = Path.home() / ".claude"
-    mcp_dir.mkdir()
-    (mcp_dir / "mcp.json").write_text(
+    (Path.home() / ".claude.json").write_text(
         json.dumps(
             {
                 "mcpServers": {

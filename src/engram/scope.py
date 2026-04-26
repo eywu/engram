@@ -59,8 +59,7 @@ class ScopeDecision:
     disallowed_tools: list[str] = field(default_factory=list)
     skills: list[str] | str | None = None  # list, "all", or None
     # mcp_servers is a *filter instruction*, not a config — the agent.py
-    # layer applies it against whatever mcp map the SDK would otherwise
-    # use (inherited from project-level .claude/mcp.json).
+    # layer applies it against the user inventory from ~/.claude.json.
     mcp_allowed: list[str] | None = None
     mcp_disallowed: list[str] = field(default_factory=list)
 

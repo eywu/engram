@@ -155,8 +155,9 @@ The wizard walks you through six steps:
 2. **Slack tokens** — paste the two tokens from Step 2
 3. **Anthropic API key** — paste or confirm the env var
 4. **Gemini API key** (optional) — paste or skip
-5. **MCP inventory** — discovers any MCP servers your `claude` CLI already
-   knows about (zero is fine)
+5. **MCP inventory** — discovers any MCP servers in `~/.claude.json`
+   (`mcpServers`), the single user inventory `claude mcp add` updates. If
+   a legacy `~/.claude/mcp.json` exists, Engram migrates it with a backup.
 6. **Write config** — saves to `~/.engram/config.yaml` with mode `600`
 
 If anything was wrong, re-run `engram setup` to overwrite.

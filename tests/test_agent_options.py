@@ -49,9 +49,7 @@ def _session(manifest: ChannelManifest | None, cwd: Path | None = None) -> Sessi
 
 
 def _write_mcp_config(tmp_path: Path, servers: dict) -> None:
-    mcp_dir = tmp_path / ".claude"
-    mcp_dir.mkdir()
-    (mcp_dir / "mcp.json").write_text(
+    (tmp_path / ".claude.json").write_text(
         json.dumps({"mcpServers": servers}),
         encoding="utf-8",
     )

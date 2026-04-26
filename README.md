@@ -58,8 +58,9 @@ See [permission tiers](docs/permission-tiers.md), [HITL](docs/hitl.md), and [foo
 - **Per-channel isolation.** Each Slack channel/DM gets its own context
   directory, identity, memory bank, and capability manifest. Team-channel
   scope leaks are prevented at the manifest layer, not via convention.
-- **MCP-agnostic.** Engram discovers MCP servers at setup time. Zero MCPs,
-  one MCP, or many MCPs are all supported setups.
+- **MCP-agnostic.** Engram uses `~/.claude.json` as the single user MCP
+  inventory, matching what `claude mcp add` updates. Zero MCPs, one MCP,
+  or many MCPs are all supported setups.
 - **Soft budget guardrails.** Monthly spend is tracked and warnings fire as
   you approach the cap — but the agent keeps serving. No surprise
   "your agent is paused" moments.

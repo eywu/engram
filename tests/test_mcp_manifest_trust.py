@@ -292,6 +292,15 @@ async def test_official_manifest_mcp_addition_allows_silently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / ".engram"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    github_config = {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-github@1.2.3"],
+    }
+    (tmp_path / ".claude.json").write_text(
+        json.dumps({"mcpServers": {"github": github_config}}),
+        encoding="utf-8",
+    )
     manifest_path = channel_manifest_path("C07TEAM", home)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     dump_manifest(_manifest(hitl_enabled=False), manifest_path)
@@ -307,9 +316,26 @@ async def test_official_manifest_mcp_addition_allows_silently(
     opts = agent._build_options(session)
 
     staged = session.manifest.model_copy(update={"mcp_servers": ScopeList(allowed=["github"])})
+    captured_config: dict[str, object] = {}
+
+    async def fake_resolve_mcp_server_trust(server_name, server_config, *, home):
+        captured_config["server_name"] = server_name
+        captured_config["server_config"] = server_config
+        return MCPTrustDecision(
+            server_name="github",
+            tier=MCPTrustTier.OFFICIAL,
+            registry="npm",
+            package_name="@modelcontextprotocol/server-github",
+            version="1.2.3",
+            publisher="modelcontextprotocol",
+            publishers=["modelcontextprotocol"],
+            trust_summary="official server",
+            reason="test fixture",
+        )
+
     monkeypatch.setattr(
         "engram.agent.resolve_mcp_server_trust",
-        _constant_trust_decision(MCPTrustTier.OFFICIAL, server_name="github"),
+        fake_resolve_mcp_server_trust,
     )
 
     result = await opts.can_use_tool(
@@ -319,6 +345,10 @@ async def test_official_manifest_mcp_addition_allows_silently(
     )
 
     assert isinstance(result, PermissionResultAllow)
+    assert captured_config == {
+        "server_name": "github",
+        "server_config": github_config,
+    }
     assert alerts == []
     assert router.hitl.pending_for_channel("C07TEAM") == []
 
@@ -374,9 +404,7 @@ async def test_unknown_manifest_mcp_addition_requires_owner_dm_approval(
 ) -> None:
     home = tmp_path / ".engram"
     monkeypatch.setenv("HOME", str(tmp_path))
-    mcp_dir = Path.home() / ".claude"
-    mcp_dir.mkdir(parents=True)
-    (mcp_dir / "mcp.json").write_text(
+    (Path.home() / ".claude.json").write_text(
         json.dumps(
             {
                 "mcpServers": {
@@ -480,9 +508,7 @@ async def test_unknown_manifest_mcp_addition_malformed_choice_key_denies(
 ) -> None:
     home = tmp_path / ".engram"
     monkeypatch.setenv("HOME", str(tmp_path))
-    mcp_dir = Path.home() / ".claude"
-    mcp_dir.mkdir(parents=True)
-    (mcp_dir / "mcp.json").write_text(
+    (Path.home() / ".claude.json").write_text(
         json.dumps(
             {
                 "mcpServers": {
@@ -562,9 +588,7 @@ async def test_unknown_manifest_mcp_addition_apply_failure_updates_dm(
 ) -> None:
     home = tmp_path / ".engram"
     monkeypatch.setenv("HOME", str(tmp_path))
-    mcp_dir = Path.home() / ".claude"
-    mcp_dir.mkdir(parents=True)
-    (mcp_dir / "mcp.json").write_text(
+    (Path.home() / ".claude.json").write_text(
         json.dumps(
             {
                 "mcpServers": {

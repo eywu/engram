@@ -199,7 +199,7 @@ async def test_isolation_setting_sources_differ(
     cfg: EngramConfig, home: Path
 ):
     """Owner-DM uses user-level settings; team channel uses project-level
-    only, so personal MCPs in ~/.claude/mcp.json don't leak into team
+    only, so personal MCPs in ~/.claude.json don't leak into team
     channels. §07 test #4, mechanism check."""
     owner_dm_id = "D07OWNER"
     team_id = "C07TEAM"

@@ -368,9 +368,7 @@ async def test_manifest_mcp_exclusion_logs_once_per_client_spawn(
     caplog: pytest.LogCaptureFixture,
 ):
     monkeypatch.setenv("HOME", str(tmp_path))
-    mcp_dir = tmp_path / ".claude"
-    mcp_dir.mkdir()
-    (mcp_dir / "mcp.json").write_text(
+    (tmp_path / ".claude.json").write_text(
         json.dumps(
             {
                 "mcpServers": {

@@ -11,7 +11,6 @@ Walks the user through first-time configuration:
 """
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import sys
@@ -34,6 +33,7 @@ from engram.launchd import (
     write_bridge_env_file,
     write_plist,
 )
+from engram.mcp import load_claude_mcp_servers
 
 console = Console()
 
@@ -231,33 +231,17 @@ def _step_gemini() -> str | None:
 
 def _step_mcp_inventory() -> None:
     rprint("[bold]Step 5 — MCP Inventory[/bold]")
-    rprint("Engram is MCP-agnostic. Whatever [italic]claude[/italic] sees, Engram can use.")
-    found: dict[str, str] = {}
-    mcp_json = Path.home() / ".claude" / "mcp.json"
-    if mcp_json.exists():
-        try:
-            data = json.loads(mcp_json.read_text())
-            for n in data.get("mcpServers") or {}:
-                found[n] = "~/.claude/mcp.json"
-        except json.JSONDecodeError:
-            pass
-    claude_json = Path.home() / ".claude.json"
-    if claude_json.exists():
-        try:
-            data = json.loads(claude_json.read_text())
-            for n in data.get("mcpServers") or {}:
-                found.setdefault(n, "~/.claude.json")
-        except json.JSONDecodeError:
-            pass
+    rprint("Engram is MCP-agnostic. It reads the same [italic]~/.claude.json[/italic] inventory that Claude Code uses.")
+    found = load_claude_mcp_servers()
 
     if not found:
         rprint("  [dim]no MCP servers configured (zero-MCP is a supported setup)[/dim]")
     else:
-        for name, src in found.items():
-            rprint(f"  [green]•[/green] {name}  [dim]({src})[/dim]")
+        for name in found:
+            rprint(f"  [green]•[/green] {name}  [dim](~/.claude.json)[/dim]")
     rprint()
-    rprint("  Note: per-MCP scoping per channel is an M2 feature. For now, Engram")
-    rprint("  sees everything claude sees.")
+    rprint("  Note: this is the shared user inventory. Channel manifests still")
+    rprint("  gate which MCPs are allowed in each team channel.")
 
 
 def _write_config(

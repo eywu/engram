@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -17,25 +18,36 @@ log = logging.getLogger(__name__)
 
 def claude_mcp_config_path() -> Path:
     """Return Claude Code's documented user MCP config path."""
+    return Path.home() / ".claude.json"
+
+
+def legacy_claude_mcp_config_path() -> Path:
+    """Return Engram's deprecated legacy MCP inventory path."""
     return Path.home() / ".claude" / "mcp.json"
 
 
-def load_claude_mcp_servers(
-    config_path: Path | None = None,
-) -> dict[str, dict[str, Any]]:
-    """Load MCP server configs from ~/.claude/mcp.json.
-
-    Malformed or absent config is treated as an empty inventory. The caller
-    decides whether missing manifest references should warn or fail.
-    """
-    path = config_path or claude_mcp_config_path()
+def _load_mcp_config_root(path: Path) -> dict[str, Any] | None:
     if not path.exists():
-        return {}
+        return None
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         log.warning("mcp.config_invalid_json path=%s", path)
+        return None
+
+    if not isinstance(data, dict):
+        log.warning("mcp.config_invalid_root path=%s", path)
+        return None
+    return data
+
+
+def _extract_mcp_servers(
+    data: dict[str, Any] | None,
+    *,
+    path: Path,
+) -> dict[str, dict[str, Any]]:
+    if data is None:
         return {}
 
     servers = data.get("mcpServers") or {}
@@ -43,6 +55,100 @@ def load_claude_mcp_servers(
         log.warning("mcp.config_invalid_servers path=%s", path)
         return {}
     return dict(servers)
+
+
+def _next_backup_path(path: Path) -> Path:
+    backup = path.with_name(f"{path.name}.bak")
+    if not backup.exists():
+        return backup
+
+    suffix = 1
+    while True:
+        candidate = path.with_name(f"{path.name}.bak.{suffix}")
+        if not candidate.exists():
+            return candidate
+        suffix += 1
+
+
+def _migrate_legacy_claude_mcp_config() -> None:
+    """One-time merge from deprecated ~/.claude/mcp.json into ~/.claude.json."""
+    target_path = claude_mcp_config_path()
+    legacy_path = legacy_claude_mcp_config_path()
+    if not legacy_path.exists():
+        return
+
+    legacy_root = _load_mcp_config_root(legacy_path)
+    if legacy_root is None:
+        return
+    raw_legacy_servers = legacy_root.get("mcpServers")
+    if raw_legacy_servers is not None and not isinstance(raw_legacy_servers, dict):
+        log.warning("mcp.config_invalid_servers path=%s", legacy_path)
+        return
+    legacy_servers = _extract_mcp_servers(legacy_root, path=legacy_path)
+
+    target_root = _load_mcp_config_root(target_path)
+    target_servers = _extract_mcp_servers(target_root, path=target_path)
+
+    merged_servers = dict(target_servers)
+    added_names: list[str] = []
+    skipped_names: list[str] = []
+    for name, config in legacy_servers.items():
+        if name in merged_servers:
+            skipped_names.append(name)
+            continue
+        merged_servers[name] = config
+        added_names.append(name)
+
+    needs_target_write = not target_path.exists() or target_root is None
+    if target_root is not None:
+        raw_target_servers = target_root.get("mcpServers")
+        if raw_target_servers is None or not isinstance(raw_target_servers, dict):
+            needs_target_write = True
+    if added_names:
+        needs_target_write = True
+
+    target_backup: Path | None = None
+    if needs_target_write:
+        target_root = dict(target_root or {})
+        target_root["mcpServers"] = merged_servers
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.exists():
+            target_backup = _next_backup_path(target_path)
+            shutil.copy2(target_path, target_backup)
+        target_path.write_text(
+            json.dumps(target_root, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    legacy_backup = _next_backup_path(legacy_path)
+    legacy_path.replace(legacy_backup)
+    log.warning(
+        "mcp.legacy_config_migrated legacy=%s target=%s legacy_backup=%s "
+        "target_backup=%s added=%s skipped=%s",
+        legacy_path,
+        target_path,
+        legacy_backup,
+        target_backup,
+        added_names,
+        skipped_names,
+    )
+
+
+def load_claude_mcp_servers(
+    config_path: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Load MCP server configs from ~/.claude.json.
+
+    Malformed or absent config is treated as an empty inventory. The caller
+    decides whether missing manifest references should warn or fail.
+    """
+    default_path = claude_mcp_config_path()
+    if config_path is None or config_path == default_path:
+        _migrate_legacy_claude_mcp_config()
+
+    path = config_path or claude_mcp_config_path()
+    data = _load_mcp_config_root(path)
+    return _extract_mcp_servers(data, path=path)
 
 
 def resolve_team_mcp_servers(
