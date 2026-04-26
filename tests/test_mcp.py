@@ -10,9 +10,11 @@ from engram.manifest import ChannelManifest, IdentityTemplate, ScopeList
 from engram.mcp import (
     audit_mcp_channel_coverage,
     claude_mcp_config_path,
+    detect_new_user_mcp_servers,
     legacy_claude_mcp_config_path,
     load_claude_mcp_servers,
     resolve_team_mcp_servers,
+    write_mcp_inventory_state,
 )
 
 
@@ -150,3 +152,27 @@ def test_audit_mcp_channel_coverage_finds_uncovered_user_servers(
     assert coverage.allowed_by_channel == {"C07TEAM": ["engram-memory"]}
     assert coverage.uncovered_servers == ["linear", "camoufox"]
     assert coverage.invalid_manifest_paths == []
+
+
+def test_detect_new_user_mcp_servers_compares_against_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    home = tmp_path / ".engram"
+    write_mcp_inventory_state(["linear"], home=home)
+    _write_json(
+        claude_mcp_config_path(),
+        {
+            "mcpServers": {
+                "linear": {"type": "http", "url": "https://linear.example/mcp"},
+                "camoufox": {"command": "camoufox-mcp"},
+            }
+        },
+    )
+
+    delta = detect_new_user_mcp_servers(home=home)
+
+    assert delta.known_servers == ["linear"]
+    assert delta.current_servers == ["camoufox", "linear"]
+    assert delta.new_servers == ["camoufox"]

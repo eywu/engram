@@ -92,3 +92,6 @@ engram channels show C07TEAM123
 - `engram setup` shows the shared user inventory, warns when registered
   MCPs are not yet allowed in any existing team channel manifest, and can
   add them to existing team manifests interactively.
+- After setup, the next Engram start notices newly added user MCPs from
+  `~/.claude.json` and either prompts to wire them into existing team
+  manifests or sends an owner-facing warning with the exact fix path.

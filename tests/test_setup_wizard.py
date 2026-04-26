@@ -9,6 +9,7 @@ import pytest
 
 from engram.bootstrap import provision_channel
 from engram.manifest import IdentityTemplate, load_manifest
+from engram.mcp import detect_new_user_mcp_servers
 from engram.mcp_trust import MCPTrustDecision, MCPTrustTier
 from engram.paths import channel_manifest_path
 from engram.setup_wizard import (
@@ -90,6 +91,7 @@ def test_step_mcp_inventory_reads_claude_json(
     assert "~/.claude/mcp.json" in rendered
     assert "linear" in rendered
     assert "Team channels still gate MCPs per manifest with strict allow-lists" in rendered
+    assert detect_new_user_mcp_servers(home=tmp_path / ".engram").new_servers == []
 
 
 def test_step_mcp_inventory_warns_when_existing_team_manifests_exclude_user_mcp(

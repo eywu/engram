@@ -1,6 +1,7 @@
 """MCP configuration helpers for channel isolation."""
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import shutil
@@ -16,6 +17,7 @@ from engram.mcp_tools import (
 )
 
 log = logging.getLogger(__name__)
+MCP_INVENTORY_STATE_FILE = "mcp_inventory_state.json"
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,16 @@ class MCPChannelCoverage:
     invalid_manifest_paths: list[Path]
 
 
+@dataclass(frozen=True)
+class MCPInventoryDelta:
+    """Diff between the current Claude MCP inventory and Engram's snapshot."""
+
+    state_path: Path
+    known_servers: list[str]
+    current_servers: list[str]
+    new_servers: list[str]
+
+
 def claude_mcp_config_path() -> Path:
     """Return Claude Code's documented user MCP config path."""
     return Path.home() / ".claude.json"
@@ -39,6 +51,10 @@ def claude_mcp_config_path() -> Path:
 def legacy_claude_mcp_config_path() -> Path:
     """Return Engram's deprecated legacy MCP inventory path."""
     return Path.home() / ".claude" / "mcp.json"
+
+
+def mcp_inventory_state_path(home: Path | None = None) -> Path:
+    return paths.state_dir(home) / MCP_INVENTORY_STATE_FILE
 
 
 def _load_mcp_config_root(path: Path) -> dict[str, Any] | None:
@@ -164,6 +180,83 @@ def load_claude_mcp_servers(
     path = config_path or claude_mcp_config_path()
     data = _load_mcp_config_root(path)
     return _extract_mcp_servers(data, path=path)
+
+
+def load_known_mcp_servers(
+    *,
+    home: Path | None = None,
+) -> list[str]:
+    """Load the last MCP inventory snapshot Engram recorded."""
+    path = mcp_inventory_state_path(home)
+    if not path.exists():
+        return []
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        log.warning("mcp.inventory_state_invalid_json path=%s", path)
+        return []
+
+    if not isinstance(payload, dict):
+        log.warning("mcp.inventory_state_invalid_root path=%s", path)
+        return []
+
+    names = payload.get("known_servers")
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        log.warning("mcp.inventory_state_invalid_servers path=%s", path)
+        return []
+    return list(dict.fromkeys(names))
+
+
+def write_mcp_inventory_state(
+    server_names: dict[str, dict[str, Any]] | list[str],
+    *,
+    home: Path | None = None,
+) -> Path:
+    """Persist the current Claude MCP inventory for later delta checks."""
+    names = list(server_names)
+
+    normalized = sorted(
+        name for name in dict.fromkeys(names) if isinstance(name, str)
+    )
+    path = mcp_inventory_state_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "known_servers": normalized,
+                "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def detect_new_user_mcp_servers(
+    configured_servers: dict[str, dict[str, Any]] | None = None,
+    *,
+    home: Path | None = None,
+) -> MCPInventoryDelta:
+    """Compare the current Claude MCP inventory to Engram's last snapshot."""
+    configured = (
+        load_claude_mcp_servers()
+        if configured_servers is None
+        else dict(configured_servers)
+    )
+    current_servers = sorted(configured)
+    known_servers = load_known_mcp_servers(home=home)
+    known = set(known_servers)
+    new_servers = [name for name in current_servers if name not in known]
+    return MCPInventoryDelta(
+        state_path=mcp_inventory_state_path(home),
+        known_servers=known_servers,
+        current_servers=current_servers,
+        new_servers=new_servers,
+    )
 
 
 def audit_mcp_channel_coverage(

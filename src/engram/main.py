@@ -28,6 +28,7 @@ from engram.egress import post_question, update_question_timeout
 from engram.embeddings import EmbeddingQueue, GeminiEmbedder
 from engram.hitl import PendingQuestion
 from engram.ingress import register_listeners
+from engram.mcp_onboarding import maybe_prompt_for_new_mcp_servers
 from engram.router import Router
 from engram.runtime import (
     fd_usage_snapshot,
@@ -219,6 +220,12 @@ async def run() -> int:
             )
         except Exception:
             log.warning("engram.owner_alert_failed", exc_info=True)
+
+    await maybe_prompt_for_new_mcp_servers(
+        home=engram_home,
+        interactive=sys.stdin.isatty() and sys.stdout.isatty(),
+        owner_alert=_owner_alert,
+    )
 
     agent = Agent(
         config,
