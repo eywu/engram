@@ -380,6 +380,32 @@ def test_mcp_allow_updates_allow_list(cli, tmp_path: Path):
     assert "Effective: engram-memory, camoufox" in result.output
 
 
+def test_mcp_allow_in_inherit_mode_is_noop(cli, tmp_path: Path):
+    from engram.bootstrap import provision_channel as pc
+
+    home = tmp_path / ".engram"
+    _write_mcp_inventory(
+        tmp_path,
+        {
+            "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+        },
+    )
+    pc(
+        "D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        label="Owner DM",
+        home=home,
+    )
+
+    result = cli.invoke(app, ["mcp", "allow", "D07OWNER", "camoufox"])
+    manifest = load_manifest(channel_manifest_path("D07OWNER", home))
+
+    assert result.exit_code == 0
+    assert "already inherits into 'D07OWNER'. No change." in result.output
+    assert manifest.mcp_servers.allowed is None
+    assert manifest.mcp_servers.disallowed == []
+
+
 def test_mcp_deny_adds_disallowed_and_updates_effective_list(cli, tmp_path: Path):
     from engram.bootstrap import provision_channel as pc
 

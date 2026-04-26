@@ -139,6 +139,21 @@ def test_owner_can_grant_mcp_access() -> None:
     assert decision.reason == "Owner granting MCP access to `camoufox`."
 
 
+def test_allow_mcp_access_in_inherit_mode_is_noop() -> None:
+    decision = can_change_mcp_access(
+        action="allow",
+        server_name="camoufox",
+        has_allow_list=False,
+        is_allowed=False,
+        is_disallowed=False,
+        invoker_user_id="U07OTHER",
+        channel_owner_user_id="U07OWNER",
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "MCP server `camoufox` already inherits here."
+
+
 def test_non_owner_cannot_grant_mcp_access() -> None:
     decision = can_change_mcp_access(
         action="allow",

@@ -92,6 +92,11 @@ def can_change_mcp_access(
         is_disallowed=is_disallowed,
     )
     if kind == "no-op":
+        if action == "allow" and not has_allow_list and not is_disallowed:
+            return TransitionDecision(
+                allowed=True,
+                reason=f"MCP server `{server_name}` already inherits here.",
+            )
         state = "allowed" if action == "allow" else "denied"
         return TransitionDecision(
             allowed=True,

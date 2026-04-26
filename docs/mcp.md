@@ -63,6 +63,9 @@ Use the slash command in the target channel:
 - These commands update `mcp_servers.allowed` and `mcp_servers.disallowed`
   in the channel manifest. They do not change the channel tier.
 - Safe channels can remain `safe` while gaining one specific MCP server.
+- In owner DMs and other `inherit-all` scopes, `allow` is usually a no-op:
+  the channel already inherits the user-level MCP inventory unless that
+  server was explicitly denied.
 - If a server is missing from `~/.claude.json`, allowing it updates the
   manifest but it will not become effective until the shared Claude inventory
   contains that server.

@@ -288,6 +288,59 @@ async def test_mcp_list_command_renders_effective_servers(
 
 
 @pytest.mark.asyncio
+async def test_mcp_allow_in_inherit_mode_is_noop_via_slash_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / ".engram"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    write_mcp_inventory(
+        tmp_path,
+        {
+            "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+        },
+    )
+    write_active_manifest(
+        home,
+        "D07OWNER",
+        label="Owner DM",
+        tier=PermissionTier.OWNER_SCOPED,
+    )
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="D07OWNER",
+        source_channel_name=None,
+        user_id="U07OTHER",
+        command_text="mcp allow camoufox",
+    )
+
+    manifest = load_manifest(channel_manifest_path("D07OWNER", home))
+    assert result["ok"] is True
+    assert manifest.mcp_servers.allowed is None
+    assert manifest.mcp_servers.disallowed == []
+    assert slack.ephemeral_calls == [
+        {
+            "channel": "D07OWNER",
+            "user": "U07OTHER",
+            "text": (
+                "MCP server `camoufox` already inherits here.\n\n"
+                "MCP access for Owner DM (D07OWNER)\n"
+                "Tier: trusted\n"
+                "Mode: inherit-all\n"
+                "Allowed: inherit-all\n"
+                "Denied: (none)\n"
+                "Effective: camoufox, engram-memory"
+            ),
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_non_owner_cannot_grant_mcp_access_via_slash_command(
     tmp_path: Path,
 ) -> None:
