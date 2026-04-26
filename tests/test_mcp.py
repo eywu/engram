@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from engram.bootstrap import provision_channel
 from engram.manifest import ChannelManifest, IdentityTemplate, ScopeList
 from engram.mcp import (
+    audit_mcp_channel_coverage,
     claude_mcp_config_path,
     legacy_claude_mcp_config_path,
     load_claude_mcp_servers,
@@ -110,3 +112,41 @@ def test_resolve_team_mcp_servers_filters_claude_code_inventory_by_allow_list(
     }
     assert allowed == ["linear"]
     assert missing == []
+
+
+def test_audit_mcp_channel_coverage_finds_uncovered_user_servers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_json(
+        claude_mcp_config_path(),
+        {
+            "mcpServers": {
+                "linear": {"type": "http", "url": "https://linear.example/mcp"},
+                "camoufox": {"command": "camoufox-mcp"},
+            }
+        },
+    )
+    home = tmp_path / ".engram"
+    provision_channel(
+        "D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        home=home,
+    )
+    provision_channel(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#growth",
+        home=home,
+    )
+
+    coverage = audit_mcp_channel_coverage(
+        contexts_path=home / "contexts",
+    )
+
+    assert coverage.configured_servers == ["linear", "camoufox"]
+    assert coverage.team_channels == ["C07TEAM"]
+    assert coverage.allowed_by_channel == {"C07TEAM": ["engram-memory"]}
+    assert coverage.uncovered_servers == ["linear", "camoufox"]
+    assert coverage.invalid_manifest_paths == []

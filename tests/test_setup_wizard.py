@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from engram.bootstrap import provision_channel
+from engram.manifest import IdentityTemplate
 from engram.setup_wizard import (
     SLACK_APP_MANIFEST,
     _step_launchd_sync,
@@ -79,8 +81,44 @@ def test_step_mcp_inventory_reads_claude_json(
 
     rendered = "\n".join(output)
     assert "~/.claude.json" in rendered
+    assert "~/.claude/mcp.json" in rendered
     assert "linear" in rendered
-    assert "gate which MCPs are allowed in each team channel" in rendered
+    assert "Team channels still gate MCPs per manifest with strict allow-lists" in rendered
+
+
+def test_step_mcp_inventory_warns_when_existing_team_manifests_exclude_user_mcp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "camoufox": {"command": "camoufox-mcp"}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    provision_channel(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#growth",
+        home=tmp_path / ".engram",
+    )
+    output: list[str] = []
+    monkeypatch.setattr(
+        "engram.setup_wizard.rprint",
+        lambda *args, **_kwargs: output.append(" ".join(map(str, args))),
+    )
+
+    _step_mcp_inventory()
+
+    rendered = "\n".join(output)
+    assert "Registered but not yet allowed in any team channel manifest" in rendered
+    assert "camoufox" in rendered
+    assert "~/.engram/contexts/<channel-id>/.claude/channel-manifest.yaml" in rendered
 
 
 def test_step_launchd_sync_refreshes_drifted_plist(

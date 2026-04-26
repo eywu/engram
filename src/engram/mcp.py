@@ -4,16 +4,31 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from engram.manifest import ChannelManifest
+from engram import paths
+from engram.manifest import ChannelManifest, ManifestError, load_manifest
 from engram.mcp_tools import (
     MEMORY_SEARCH_SERVER_NAME,
     make_memory_search_server,
 )
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class MCPChannelCoverage:
+    """Audit of user MCP inventory coverage across strict team manifests."""
+
+    inventory_path: Path
+    configured_servers: list[str]
+    team_channels: list[str]
+    team_manifest_paths: dict[str, Path]
+    allowed_by_channel: dict[str, list[str]]
+    uncovered_servers: list[str]
+    invalid_manifest_paths: list[Path]
 
 
 def claude_mcp_config_path() -> Path:
@@ -149,6 +164,61 @@ def load_claude_mcp_servers(
     path = config_path or claude_mcp_config_path()
     data = _load_mcp_config_root(path)
     return _extract_mcp_servers(data, path=path)
+
+
+def audit_mcp_channel_coverage(
+    *,
+    contexts_path: Path | None = None,
+    configured_servers: dict[str, dict[str, Any]] | None = None,
+) -> MCPChannelCoverage:
+    """Compare Claude Code's user MCP inventory to strict team manifests.
+
+    Owner DMs use ``setting_sources=["user"]`` and are intentionally
+    ignored here. The question this audit answers is narrower: which user
+    MCPs are registered in ``~/.claude.json`` but not allowed anywhere in
+    Engram's strict team-channel manifest layer?
+    """
+
+    configured = (
+        load_claude_mcp_servers()
+        if configured_servers is None
+        else dict(configured_servers)
+    )
+    context_root = contexts_path or paths.contexts_dir()
+    team_channels: list[str] = []
+    team_manifest_paths: dict[str, Path] = {}
+    allowed_by_channel: dict[str, list[str]] = {}
+    invalid_manifest_paths: list[Path] = []
+    allowed_anywhere: set[str] = set()
+
+    if context_root.exists():
+        for manifest_path in sorted(context_root.glob("*/.claude/channel-manifest.yaml")):
+            try:
+                manifest = load_manifest(manifest_path)
+            except ManifestError:
+                invalid_manifest_paths.append(manifest_path)
+                continue
+            if manifest.is_owner_dm():
+                continue
+
+            allowed = list(manifest.mcp_servers.allowed or [])
+            team_channels.append(manifest.channel_id)
+            team_manifest_paths[manifest.channel_id] = manifest_path
+            allowed_by_channel[manifest.channel_id] = allowed
+            allowed_anywhere.update(allowed)
+
+    uncovered_servers = [
+        name for name in configured if name not in allowed_anywhere
+    ]
+    return MCPChannelCoverage(
+        inventory_path=claude_mcp_config_path(),
+        configured_servers=list(configured),
+        team_channels=team_channels,
+        team_manifest_paths=team_manifest_paths,
+        allowed_by_channel=allowed_by_channel,
+        uncovered_servers=uncovered_servers,
+        invalid_manifest_paths=invalid_manifest_paths,
+    )
 
 
 def resolve_team_mcp_servers(

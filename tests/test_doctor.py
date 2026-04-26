@@ -9,6 +9,7 @@ import pytest
 import yaml  # type: ignore[import-untyped]
 from typer.testing import CliRunner
 
+from engram.bootstrap import provision_channel
 from engram.cli import app
 from engram.config import AnthropicConfig, EmbeddingsConfig, EngramConfig, PathsConfig, SlackConfig
 from engram.doctor import (
@@ -25,6 +26,7 @@ from engram.doctor import (
     check_launchd_bridge_plist_drift,
     check_launchd_job,
     check_log_dir_writable,
+    check_mcp_channel_coverage,
     check_owner_dm_channel_id,
     check_owner_user_id,
     check_python_version,
@@ -34,6 +36,7 @@ from engram.doctor import (
     check_uv_on_path,
 )
 from engram.launchd import render_bridge_plist, write_bridge_env_file
+from engram.manifest import IdentityTemplate
 
 
 @pytest.fixture
@@ -152,6 +155,63 @@ def test_owner_approval_checks_warn_when_missing(tmp_path: Path) -> None:
 
     assert owner_dm.status == CheckStatus.WARN
     assert owner_user.status == CheckStatus.WARN
+
+
+def test_check_mcp_channel_coverage_warns_on_uncovered_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "camoufox": {"command": "camoufox-mcp"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    home = tmp_path / ".engram"
+    provision_channel(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#growth",
+        home=home,
+    )
+    _write_bridge_log(
+        home / "logs",
+        log_date=datetime.date(2026, 4, 25),
+        rows=[
+            {
+                "timestamp": "2026-04-25T12:00:00Z",
+                "event": "mcp.excluded_by_manifest",
+                "channel_id": "C07TEAM",
+                "mcp_name": "camoufox",
+                "reason": "not_in_allowed",
+            }
+        ],
+    )
+
+    check = check_mcp_channel_coverage(
+        contexts_path=home / "contexts",
+        log_dir=home / "logs",
+        now=lambda: datetime.datetime(2026, 4, 25, 12, 30, tzinfo=datetime.UTC),
+    )
+
+    assert check.status == CheckStatus.WARN
+    assert "camoufox" in check.message
+    assert "mcp_servers.allowed" in check.message
+    assert "mcp.excluded_by_manifest" in check.message
+    assert check.details["uncovered_servers"] == ["camoufox"]
+    assert check.details["recent_exclusions"] == [
+        {
+            "channel_id": "C07TEAM",
+            "mcp_name": "camoufox",
+            "reason": "not_in_allowed",
+            "timestamp": "2026-04-25T12:00:00+00:00",
+        }
+    ]
 
 
 def test_check_slack_app_token_requires_xapp_prefix(tmp_path: Path) -> None:
@@ -549,8 +609,8 @@ def test_doctor_cli_json_against_tmp_config(
     payload = json.loads(result.output)
     assert payload["schema_version"] == 1
     assert payload["summary"] == {
-        "total": 18,
-        "passed": 18,
+        "total": 19,
+        "passed": 19,
         "warnings": 0,
         "failed": 0,
         "exit_code": 0,
@@ -561,6 +621,7 @@ def test_doctor_cli_json_against_tmp_config(
         "python_version",
         "config_file",
         "config_load",
+        "mcp_channel_coverage",
         "owner_dm_channel_id",
         "owner_user_id",
         "slack_bot_token",

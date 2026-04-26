@@ -33,7 +33,7 @@ from engram.launchd import (
     write_bridge_env_file,
     write_plist,
 )
-from engram.mcp import load_claude_mcp_servers
+from engram.mcp import audit_mcp_channel_coverage, load_claude_mcp_servers
 
 console = Console()
 
@@ -231,8 +231,12 @@ def _step_gemini() -> str | None:
 
 def _step_mcp_inventory() -> None:
     rprint("[bold]Step 5 — MCP Inventory[/bold]")
-    rprint("Engram is MCP-agnostic. It reads the same [italic]~/.claude.json[/italic] inventory that Claude Code uses.")
+    rprint(
+        "Engram is MCP-agnostic. It reads the same [italic]~/.claude.json[/italic] "
+        "inventory that Claude Code uses, not [italic]~/.claude/mcp.json[/italic]."
+    )
     found = load_claude_mcp_servers()
+    coverage = audit_mcp_channel_coverage()
 
     if not found:
         rprint("  [dim]no MCP servers configured (zero-MCP is a supported setup)[/dim]")
@@ -240,8 +244,19 @@ def _step_mcp_inventory() -> None:
         for name in found:
             rprint(f"  [green]•[/green] {name}  [dim](~/.claude.json)[/dim]")
     rprint()
-    rprint("  Note: this is the shared user inventory. Channel manifests still")
-    rprint("  gate which MCPs are allowed in each team channel.")
+    rprint("  Owner DMs auto-discover from this shared user inventory.")
+    rprint("  Team channels still gate MCPs per manifest with strict allow-lists.")
+    if coverage.uncovered_servers and coverage.team_channels:
+        servers = ", ".join(coverage.uncovered_servers)
+        rprint()
+        rprint(
+            "  [yellow]⚠[/yellow] Registered but not yet allowed in any team channel "
+            f"manifest: {servers}"
+        )
+        rprint(
+            "    Fix: add each server under [italic]mcp_servers.allowed[/italic] in "
+            "[cyan]~/.engram/contexts/<channel-id>/.claude/channel-manifest.yaml[/cyan]"
+        )
 
 
 def _write_config(
