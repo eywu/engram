@@ -11,6 +11,7 @@ Walks the user through first-time configuration:
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import sys
@@ -22,6 +23,7 @@ from rich import print as rprint
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
+from engram import paths
 from engram.config import DEFAULT_CONFIG_PATH
 from engram.launchd import (
     find_repo_root,
@@ -33,7 +35,9 @@ from engram.launchd import (
     write_bridge_env_file,
     write_plist,
 )
-from engram.mcp import audit_mcp_channel_coverage, load_claude_mcp_servers
+from engram.manifest import ManifestError, _persist_manifest_update, load_manifest
+from engram.mcp import MCPChannelCoverage, audit_mcp_channel_coverage, load_claude_mcp_servers
+from engram.mcp_trust import MCPTrustTier, resolve_mcp_server_trust
 
 console = Console()
 
@@ -257,6 +261,97 @@ def _step_mcp_inventory() -> None:
             "    Fix: add each server under [italic]mcp_servers.allowed[/italic] in "
             "[cyan]~/.engram/contexts/<channel-id>/.claude/channel-manifest.yaml[/cyan]"
         )
+        _maybe_sync_team_channel_mcp_allow_lists(found, coverage)
+
+
+def _maybe_sync_team_channel_mcp_allow_lists(
+    configured_servers: dict[str, dict[str, object]],
+    coverage: MCPChannelCoverage,
+) -> None:
+    manifests: list[tuple[object, Path]] = []
+    for channel_id in coverage.team_channels:
+        manifest_path = coverage.team_manifest_paths.get(channel_id)
+        if manifest_path is None:
+            continue
+        try:
+            manifests.append((load_manifest(manifest_path), manifest_path))
+        except ManifestError:
+            continue
+
+    if not manifests:
+        return
+
+    if not Confirm.ask(
+        "  Enable these MCPs in existing team channel manifests now?",
+        default=True,
+    ):
+        return
+
+    home = paths.engram_home()
+    changed_any = False
+    for server_name in coverage.uncovered_servers:
+        decision = asyncio.run(
+            resolve_mcp_server_trust(
+                server_name,
+                configured_servers.get(server_name),
+                home=home,
+            )
+        )
+        if decision.tier == MCPTrustTier.UNKNOWN:
+            summary = decision.trust_summary or decision.reason or "metadata unavailable"
+            rprint(
+                f"  [yellow]⚠[/yellow] {server_name} is [italic]{decision.tier.value}[/italic] "
+                f"({summary}). Explicit confirmation required per channel."
+            )
+
+        for idx, (manifest, manifest_path) in enumerate(manifests):
+            allowed = list(manifest.mcp_servers.allowed or [])
+            if server_name in allowed:
+                continue
+
+            channel_label = manifest.label or manifest.channel_id
+            should_allow = Confirm.ask(
+                f"  Allow [cyan]{server_name}[/cyan] in {channel_label} ({manifest.channel_id})?",
+                default=decision.tier != MCPTrustTier.UNKNOWN,
+            )
+            if not should_allow:
+                continue
+
+            merged_allowed = list(dict.fromkeys([*allowed, server_name]))
+            updated_manifest = manifest.model_copy(
+                update={
+                    "mcp_servers": manifest.mcp_servers.model_copy(
+                        update={"allowed": merged_allowed}
+                    )
+                }
+            )
+            try:
+                _persist_manifest_update(
+                    updated_manifest,
+                    manifest_path,
+                    approved_mcp_additions=[server_name],
+                    audit_source="setup_wizard",
+                )
+            except ManifestError as exc:
+                rprint(
+                    f"    [yellow]⚠[/yellow] could not update {manifest.channel_id}: {exc}"
+                )
+                continue
+
+            manifests[idx] = (updated_manifest, manifest_path)
+            changed_any = True
+            suffix = ""
+            if decision.tier == MCPTrustTier.COMMUNITY_TRUSTED:
+                summary = decision.trust_summary or decision.reason or "community-trusted"
+                suffix = f"  [dim](community-trusted: {summary})[/dim]"
+            elif decision.tier == MCPTrustTier.UNKNOWN:
+                suffix = "  [dim](unknown tier; operator confirmed)[/dim]"
+            rprint(
+                f"    [green]✓[/green] allowed {server_name} in {channel_label} ({manifest.channel_id}){suffix}"
+            )
+
+    if not changed_any:
+        rprint("  [dim]no team manifest changes applied[/dim]")
 
 
 def _write_config(

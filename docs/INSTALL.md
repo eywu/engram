@@ -158,7 +158,8 @@ The wizard walks you through six steps:
 5. **MCP inventory** — discovers any MCP servers in `~/.claude.json`
    (`mcpServers`), the single user inventory `claude mcp add` updates. If
    a legacy `~/.claude/mcp.json` exists, Engram migrates it with a backup.
-   Team channels still need per-channel allow-list entries; see
+   For existing team channels, the wizard can also add discovered MCPs to
+   per-channel allow-lists interactively. See
    [mcp.md](mcp.md).
 6. **Write config** — saves to `~/.engram/config.yaml` with mode `600`
 

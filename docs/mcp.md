@@ -89,5 +89,6 @@ engram channels show C07TEAM123
 
 - Owner DMs auto-discover user MCPs from `~/.claude.json`.
 - Team channels require explicit allow-list entries.
-- `engram setup` shows the shared user inventory and warns when registered
-  MCPs are not yet allowed in any existing team channel manifest.
+- `engram setup` shows the shared user inventory, warns when registered
+  MCPs are not yet allowed in any existing team channel manifest, and can
+  add them to existing team manifests interactively.

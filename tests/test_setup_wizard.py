@@ -8,7 +8,9 @@ from pathlib import Path
 import pytest
 
 from engram.bootstrap import provision_channel
-from engram.manifest import IdentityTemplate
+from engram.manifest import IdentityTemplate, load_manifest
+from engram.mcp_trust import MCPTrustDecision, MCPTrustTier
+from engram.paths import channel_manifest_path
 from engram.setup_wizard import (
     SLACK_APP_MANIFEST,
     _step_launchd_sync,
@@ -76,6 +78,10 @@ def test_step_mcp_inventory_reads_claude_json(
         "engram.setup_wizard.rprint",
         lambda *args, **_kwargs: output.append(" ".join(map(str, args))),
     )
+    monkeypatch.setattr(
+        "engram.setup_wizard.Confirm.ask",
+        lambda *_args, **_kwargs: False,
+    )
 
     _step_mcp_inventory()
 
@@ -112,6 +118,10 @@ def test_step_mcp_inventory_warns_when_existing_team_manifests_exclude_user_mcp(
         "engram.setup_wizard.rprint",
         lambda *args, **_kwargs: output.append(" ".join(map(str, args))),
     )
+    monkeypatch.setattr(
+        "engram.setup_wizard.Confirm.ask",
+        lambda *_args, **_kwargs: False,
+    )
 
     _step_mcp_inventory()
 
@@ -119,6 +129,128 @@ def test_step_mcp_inventory_warns_when_existing_team_manifests_exclude_user_mcp(
     assert "Registered but not yet allowed in any team channel manifest" in rendered
     assert "camoufox" in rendered
     assert "~/.engram/contexts/<channel-id>/.claude/channel-manifest.yaml" in rendered
+
+
+def test_step_mcp_inventory_can_allow_official_mcp_into_existing_team_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "github": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-github@1.2.3"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    home = tmp_path / ".engram"
+    provision_channel(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#growth",
+        home=home,
+    )
+
+    answers = iter([True, True])
+    monkeypatch.setattr(
+        "engram.setup_wizard.Confirm.ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+
+    async def fake_resolve(server_name, server_config, *, home=None):
+        assert server_name == "github"
+        assert server_config == {
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-github@1.2.3"],
+        }
+        assert home is not None
+        return MCPTrustDecision(
+            server_name="github",
+            tier=MCPTrustTier.OFFICIAL,
+            registry="npm",
+            package_name="@modelcontextprotocol/server-github",
+            version="1.2.3",
+            trust_summary="official server",
+            reason="official package",
+        )
+
+    monkeypatch.setattr("engram.setup_wizard.resolve_mcp_server_trust", fake_resolve)
+    output: list[str] = []
+    monkeypatch.setattr(
+        "engram.setup_wizard.rprint",
+        lambda *args, **_kwargs: output.append(" ".join(map(str, args))),
+    )
+
+    _step_mcp_inventory()
+
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert manifest.mcp_servers.allowed == ["engram-memory", "github"]
+    assert "allowed github in #growth (C07TEAM)" in "\n".join(output)
+
+
+def test_step_mcp_inventory_requires_explicit_confirmation_for_unknown_mcp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "camoufox": {"command": "camoufox-mcp"}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    home = tmp_path / ".engram"
+    provision_channel(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#growth",
+        home=home,
+    )
+
+    answers = iter([True, False])
+    monkeypatch.setattr(
+        "engram.setup_wizard.Confirm.ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+
+    async def fake_resolve(server_name, server_config, *, home=None):
+        assert server_name == "camoufox"
+        assert server_config == {"command": "camoufox-mcp"}
+        assert home is not None
+        return MCPTrustDecision(
+            server_name="camoufox",
+            tier=MCPTrustTier.UNKNOWN,
+            registry="custom",
+            package_name="camoufox-browser[mcp]",
+            version="0.1.1",
+            trust_summary="metadata lookup failed",
+            reason="metadata lookup failed",
+        )
+
+    monkeypatch.setattr("engram.setup_wizard.resolve_mcp_server_trust", fake_resolve)
+    output: list[str] = []
+    monkeypatch.setattr(
+        "engram.setup_wizard.rprint",
+        lambda *args, **_kwargs: output.append(" ".join(map(str, args))),
+    )
+
+    _step_mcp_inventory()
+
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert manifest.mcp_servers.allowed == ["engram-memory"]
+    rendered = "\n".join(output)
+    assert "camoufox is [italic]unknown[/italic]" in rendered
+    assert "no team manifest changes applied" in rendered
 
 
 def test_step_launchd_sync_refreshes_drifted_plist(
