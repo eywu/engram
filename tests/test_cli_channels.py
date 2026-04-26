@@ -77,7 +77,7 @@ def test_list_json_has_versioned_stable_schema(cli, tmp_path: Path):
     from engram.bootstrap import provision_channel as pc
 
     home = tmp_path / ".engram"
-    fixed_now = datetime(2026, 4, 24, 18, 0, tzinfo=UTC)
+    fixed_now = datetime.now(UTC).replace(microsecond=0)
     pc(
         "D07OWNER",
         identity=IdentityTemplate.OWNER_DM_FULL,

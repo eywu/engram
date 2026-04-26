@@ -50,6 +50,7 @@ def resolve_team_mcp_servers(
     *,
     configured_servers: dict[str, dict[str, Any]] | None = None,
     embedder: Any | None = None,
+    log_exclusions: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], list[str], list[str]]:
     """Resolve a team-channel manifest to an explicit MCP config map.
 
@@ -65,6 +66,27 @@ def resolve_team_mcp_servers(
     )
     allowed_names = list(manifest.mcp_servers.allowed or [])
     disallowed = set(manifest.mcp_servers.disallowed)
+
+    if log_exclusions:
+        allowed = set(allowed_names)
+        for name in configured:
+            reason: str | None = None
+            if name in disallowed:
+                reason = "in_disallowed"
+            elif name not in allowed:
+                reason = "not_in_allowed"
+            if reason is None:
+                continue
+            log.info(
+                "mcp.excluded_by_manifest",
+                extra={
+                    "channel_id": manifest.channel_id,
+                    "mcp_name": name,
+                    "reason": reason,
+                    "available_in_inventory": True,
+                },
+            )
+
     effective_names = [name for name in allowed_names if name not in disallowed]
 
     servers: dict[str, dict[str, Any]] = {}

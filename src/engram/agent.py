@@ -547,6 +547,7 @@ class Agent:
                 mcp_servers, _mcp_allowed, missing_mcp = resolve_team_mcp_servers(
                     manifest,
                     embedder=self._embedder,
+                    log_exclusions=True,
                 )
                 warn_missing_mcp_servers(
                     manifest.channel_id,

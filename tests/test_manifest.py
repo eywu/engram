@@ -1,6 +1,7 @@
 """Tests for the channel manifest schema."""
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 
@@ -28,6 +29,7 @@ from engram.manifest import (
     dump_manifest,
     load_manifest,
 )
+from engram.mcp import resolve_team_mcp_servers
 
 _UNSET = object()
 
@@ -109,6 +111,57 @@ def test_team_channel_typical_exclusions():
     assert "Bash" in m.tools.disallowed
     assert m.mcp_servers.is_unrestricted()  # MCPs still inherited
     assert not m.is_owner_dm()
+
+
+def test_resolve_team_mcp_servers_logs_not_in_allowed(caplog) -> None:
+    caplog.set_level(logging.INFO, logger="engram.mcp")
+    manifest = ChannelManifest(
+        channel_id="C07TEST123",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        mcp_servers=ScopeList(allowed=["linear"]),
+    )
+
+    resolve_team_mcp_servers(
+        manifest,
+        configured_servers={
+            "linear": {"type": "http", "url": "https://linear.example/mcp"},
+            "camoufox": {"command": "camoufox-mcp"},
+        },
+        log_exclusions=True,
+    )
+
+    record = _single_log(caplog.records, "mcp.excluded_by_manifest")
+    assert record.channel_id == "C07TEST123"
+    assert record.mcp_name == "camoufox"
+    assert record.reason == "not_in_allowed"
+    assert record.available_in_inventory is True
+
+
+def test_resolve_team_mcp_servers_logs_in_disallowed(caplog) -> None:
+    caplog.set_level(logging.INFO, logger="engram.mcp")
+    manifest = ChannelManifest(
+        channel_id="C07TEST123",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        mcp_servers=ScopeList(
+            allowed=["linear", "camoufox"],
+            disallowed=["camoufox"],
+        ),
+    )
+
+    resolve_team_mcp_servers(
+        manifest,
+        configured_servers={
+            "linear": {"type": "http", "url": "https://linear.example/mcp"},
+            "camoufox": {"command": "camoufox-mcp"},
+        },
+        log_exclusions=True,
+    )
+
+    record = _single_log(caplog.records, "mcp.excluded_by_manifest")
+    assert record.channel_id == "C07TEST123"
+    assert record.mcp_name == "camoufox"
+    assert record.reason == "in_disallowed"
+    assert record.available_in_inventory is True
 
 
 # ── Validation ──────────────────────────────────────────────────────────
@@ -257,6 +310,12 @@ def test_manifest_loads_hitl_section(tmp_path: Path):
         assert manifest.hitl.timeout_s == 300
         assert manifest.hitl.max_per_day == max_per_day
         assert manifest.nightly_included is nightly_included
+
+
+def _single_log(records, event: str):
+    matches = [record for record in records if record.getMessage() == event]
+    assert len(matches) == 1
+    return matches[0]
 
 
 def test_apply_tier_defaults_upgrades_hitl_when_value_matches_previous_tier_default():
