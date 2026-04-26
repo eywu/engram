@@ -1621,3 +1621,63 @@ def set_channel_nightly_included(
     updated = manifest.model_copy(update={"nightly_included": nightly_included})
     dump_manifest(updated, manifest_path)
     return manifest, updated, manifest_path
+
+
+def normalize_mcp_server_name(server_name: str) -> str:
+    """Normalize a manifest MCP server name."""
+    normalized = str(server_name or "").strip()
+    if not normalized:
+        raise ValueError("mcp server name cannot be empty")
+    return normalized
+
+
+def set_channel_mcp_server_access(
+    channel_id: str,
+    server_name: str,
+    *,
+    action: Literal["allow", "deny"],
+    home: Path | None = None,
+) -> tuple[ChannelManifest, ChannelManifest, Path, str]:
+    """Load a channel manifest, mutate MCP access, and persist it."""
+    normalized_name = normalize_mcp_server_name(server_name)
+    manifest_path = paths.channel_manifest_path(channel_id, home)
+    manifest = load_manifest(manifest_path)
+
+    allowed = (
+        list(manifest.mcp_servers.allowed)
+        if manifest.mcp_servers.allowed is not None
+        else None
+    )
+    disallowed = list(manifest.mcp_servers.disallowed)
+
+    if action == "allow":
+        updated_allowed = (
+            None
+            if allowed is None
+            else list(dict.fromkeys([*allowed, normalized_name]))
+        )
+        updated_disallowed = [
+            entry for entry in disallowed if entry != normalized_name
+        ]
+    else:
+        updated_allowed = allowed
+        updated_disallowed = list(dict.fromkeys([*disallowed, normalized_name]))
+
+    updated_scope = manifest.mcp_servers.model_copy(
+        update={
+            "allowed": updated_allowed,
+            "disallowed": updated_disallowed,
+        }
+    )
+    updated = manifest.model_copy(update={"mcp_servers": updated_scope})
+    if updated == manifest:
+        return manifest, manifest, manifest_path, normalized_name
+
+    additions = _mcp_allow_list_additions(manifest, updated)
+    _previous, persisted, persisted_path = _persist_manifest_update(
+        updated,
+        manifest_path,
+        approved_mcp_additions=additions,
+        audit_source=f"channel_mcp_{action}",
+    )
+    return manifest, persisted, persisted_path, normalized_name

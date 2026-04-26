@@ -47,20 +47,27 @@ from engram.manifest import (
     PermissionTier,
     dump_manifest,
     load_manifest,
+    normalize_mcp_server_name,
     parse_permission_tier,
     permission_tier_choices_text,
     persist_yolo_demotion,
+    set_channel_mcp_server_access,
     set_channel_nightly_included,
     set_channel_permission_tier,
     validate_upgrade_duration,
 )
+from engram.mcp import render_channel_mcp_access
 from engram.notifications import (
     PENDING_CHANNEL_ACTION_ID_PATTERN,
     handle_pending_channel_action,
     notify_pending_channel,
     post_pending_channel_ack,
 )
-from engram.permissions.authorization import can_change_tier, classify_transition
+from engram.permissions.authorization import (
+    can_change_mcp_access,
+    can_change_tier,
+    classify_transition,
+)
 from engram.router import Router
 
 log = logging.getLogger(__name__)
@@ -990,7 +997,7 @@ async def handle_engram_command(
             channel_id=source_channel_id,
             user_id=user_id,
             text=(
-                "Usage: /engram channels | /engram include | /engram exclude "
+                "Usage: /engram channels | /engram mcp | /engram include | /engram exclude "
                 "| /engram upgrade <tier> [reason...] "
                 "| /engram yolo <list|off|extend> ..."
             ),
@@ -1055,6 +1062,17 @@ async def handle_engram_command(
             user_id=user_id,
             requested_tier=tier,
             reason=reason,
+        )
+
+    if subcommand == "mcp":
+        return await handle_mcp_command(
+            router=router,
+            config=config,
+            slack_client=slack_client,
+            source_channel_id=source_channel_id,
+            source_channel_name=source_channel_name,
+            user_id=user_id,
+            args=parts[1:],
         )
 
     if subcommand == "yolo":
@@ -1456,6 +1474,146 @@ async def handle_yolo_command(
         text=f"Unknown /engram yolo subcommand: {action}",
     )
     return {"ok": False, "error": "unknown yolo subcommand"}
+
+
+async def handle_mcp_command(
+    *,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+    source_channel_id: str,
+    source_channel_name: str | None,
+    user_id: str | None,
+    args: list[str],
+) -> dict[str, object]:
+    if not source_channel_id:
+        return {"ok": False, "error": "missing source channel"}
+
+    if not args:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text="Usage: /engram mcp <list|allow|deny> [server]",
+        )
+        return {"ok": False, "error": "missing mcp subcommand"}
+
+    action = args[0].lower()
+    session = await router.get(
+        source_channel_id,
+        channel_name=_channel_label_from_name(source_channel_name),
+        is_dm=source_channel_id.startswith("D"),
+    )
+    manifest = session.manifest
+    if manifest is None:
+        return {"ok": False, "error": "missing manifest"}
+
+    if action == "list":
+        text = render_channel_mcp_access(manifest)
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=text,
+        )
+        return {"ok": True, "action": action, "text": text}
+
+    if action not in {"allow", "deny"}:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=f"Unknown /engram mcp subcommand: {action}",
+        )
+        return {"ok": False, "error": "unknown mcp subcommand"}
+
+    if len(args) < 2:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=f"Usage: /engram mcp {action} <server>",
+        )
+        return {"ok": False, "error": "missing mcp server"}
+
+    try:
+        server_name = normalize_mcp_server_name(" ".join(args[1:]))
+    except ValueError as exc:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=str(exc),
+        )
+        return {"ok": False, "error": "invalid mcp server"}
+
+    if action == "allow" and not config.owner_user_id:
+        message = (
+            "MCP access grants are not configured yet. "
+            "Ask the operator to set owner_user_id."
+        )
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=message,
+        )
+        return {"ok": False, "error": "owner user is not configured"}
+
+    decision = can_change_mcp_access(
+        action=action,
+        server_name=server_name,
+        has_allow_list=manifest.mcp_servers.allowed is not None,
+        is_allowed=server_name in (manifest.mcp_servers.allowed or []),
+        is_disallowed=server_name in manifest.mcp_servers.disallowed,
+        invoker_user_id=user_id or "",
+        channel_owner_user_id=config.owner_user_id or "",
+    )
+    if not decision.allowed:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=decision.reason,
+        )
+        return {"ok": False, "error": "not owner"}
+
+    previous, updated, _manifest_path, normalized_name = set_channel_mcp_server_access(
+        source_channel_id,
+        server_name,
+        action=action,
+        home=router.home,
+    )
+    if previous == updated:
+        text = f"{decision.reason}\n\n{render_channel_mcp_access(previous)}"
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=text,
+        )
+        return {"ok": True, "action": action, "changed": False, "text": text}
+
+    router.replace_cached_manifest(updated)
+    verb = "Allowed" if action == "allow" else "Denied"
+    text = (
+        f"{verb} MCP server `{normalized_name}`.\n\n"
+        f"{render_channel_mcp_access(updated)}"
+    )
+    await _post_ephemeral_reply(
+        slack_client,
+        channel_id=source_channel_id,
+        user_id=user_id,
+        text=text,
+    )
+    log.info(
+        "channel.mcp_access_updated channel_id=%s action=%s server=%s user_id=%s",
+        source_channel_id,
+        action,
+        normalized_name,
+        user_id,
+    )
+    return {"ok": True, "action": action, "changed": True, "text": text}
 
 
 async def handle_upgrade_command(

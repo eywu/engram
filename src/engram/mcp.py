@@ -4,8 +4,9 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from engram.manifest import ChannelManifest
 from engram.mcp_tools import (
@@ -14,6 +15,18 @@ from engram.mcp_tools import (
 )
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ChannelMCPAccessSummary:
+    """Resolved MCP access view for one channel manifest."""
+
+    mode: Literal["inherit-all", "allow-list"]
+    inventory: list[str]
+    allowed: list[str] | None
+    disallowed: list[str]
+    effective: list[str]
+    missing: list[str]
 
 
 def claude_mcp_config_path() -> Path:
@@ -211,6 +224,81 @@ def resolve_team_mcp_servers(
             continue
         servers[name] = config
     return servers, effective_names, missing
+
+
+def summarize_channel_mcp_access(
+    manifest: ChannelManifest,
+    *,
+    configured_servers: dict[str, dict[str, Any]] | None = None,
+) -> ChannelMCPAccessSummary:
+    """Return the effective MCP access picture for a channel manifest."""
+    configured = (
+        load_claude_mcp_servers()
+        if configured_servers is None
+        else configured_servers
+    )
+    inventory = sorted(configured)
+    available = list(dict.fromkeys([*inventory, MEMORY_SEARCH_SERVER_NAME]))
+    allowed = (
+        list(manifest.mcp_servers.allowed)
+        if manifest.mcp_servers.allowed is not None
+        else None
+    )
+    disallowed = list(manifest.mcp_servers.disallowed)
+    disallowed_set = set(disallowed)
+
+    if allowed is None:
+        effective = [name for name in available if name not in disallowed_set]
+        missing: list[str] = []
+        mode: Literal["inherit-all", "allow-list"] = "inherit-all"
+    else:
+        effective = [
+            name for name in allowed if name in available and name not in disallowed_set
+        ]
+        missing = [
+            name for name in allowed if name not in available and name not in disallowed_set
+        ]
+        mode = "allow-list"
+
+    return ChannelMCPAccessSummary(
+        mode=mode,
+        inventory=inventory,
+        allowed=allowed,
+        disallowed=disallowed,
+        effective=effective,
+        missing=missing,
+    )
+
+
+def render_channel_mcp_access(
+    manifest: ChannelManifest,
+    *,
+    configured_servers: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    """Render a human-readable MCP access summary for CLI and Slack."""
+    summary = summarize_channel_mcp_access(
+        manifest,
+        configured_servers=configured_servers,
+    )
+
+    def _fmt(values: list[str] | None, *, empty: str) -> str:
+        if values is None:
+            return "inherit-all"
+        if not values:
+            return empty
+        return ", ".join(values)
+
+    lines = [
+        f"MCP access for {manifest.label or manifest.channel_id} ({manifest.channel_id})",
+        f"Tier: {manifest.tier_effective().value}",
+        f"Mode: {summary.mode}",
+        f"Allowed: {_fmt(summary.allowed, empty='(none)')}",
+        f"Denied: {_fmt(summary.disallowed, empty='(none)')}",
+        f"Effective: {_fmt(summary.effective, empty='(none)')}",
+    ]
+    if summary.missing:
+        lines.append(f"Missing from ~/.claude.json: {', '.join(summary.missing)}")
+    return "\n".join(lines)
 
 
 def warn_missing_mcp_servers(

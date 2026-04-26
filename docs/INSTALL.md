@@ -247,11 +247,14 @@ that a week's worth of transcripts is worth summarizing.
 If you can't register slash commands in your Slack workspace, all Engram
 management works via CLI on the host running the bridge. The CLI is fully
 equivalent to the Slack slash-command surface, so an admin-less user can
-manage tiers, YOLO mode, nightly-summary inclusion, and the channel dashboard
-without needing Slack app-manifest changes.
+manage per-channel MCP access, tiers, YOLO mode, nightly-summary inclusion,
+and the channel dashboard without needing Slack app-manifest changes.
 
 | Slack surface | CLI equivalent | Notes |
 | --- | --- | --- |
+| `/engram mcp list` | `engram channels mcp list <channel-id>` | Shows the effective MCPs for one channel plus declared allow/deny state. |
+| `/engram mcp allow <server>` | `engram channels mcp allow <channel-id> <server>` | First-class replacement for hand-editing `mcp_servers.allowed`. |
+| `/engram mcp deny <server>` | `engram channels mcp deny <channel-id> <server>` | Adds to `mcp_servers.disallowed`; safe for immediate lock-downs. |
 | `/engram upgrade <safe\|trusted\|yolo>` | `engram channels upgrade <channel-id> <tier> [--until 24h\|30d\|permanent]` | Upgrade or downgrade a channel tier directly from the bridge host. |
 | `/engram yolo extend <channel> <duration>` | `engram yolo extend --channel <channel-id> <6h\|24h\|72h>` | Omitting `--channel` auto-targets the only active YOLO grant. |
 | `/engram yolo list` | `engram yolo list` | Lists every active YOLO grant with remaining time and restore tier. |
@@ -264,6 +267,9 @@ without needing Slack app-manifest changes.
 Examples:
 
 ```bash
+engram channels mcp list C07TEAM123
+engram channels mcp allow C07TEAM123 camoufox
+engram channels mcp deny C07TEAM123 camoufox
 engram channels upgrade C07TEAM123 trusted
 engram channels exclude C07TEAM123
 engram channels include C07TEAM123
@@ -274,6 +280,7 @@ engram channels list --json | jq '.channels[] | {channel_id, tier, nightly}'
 
 For tier behavior, defaults, and alias migration details, see
 [permission-tiers.md](permission-tiers.md).
+For per-channel MCP policy and troubleshooting, see [mcp.md](mcp.md).
 
 ---
 
@@ -446,12 +453,37 @@ channel has its own identity template and permission manifest — tool-heavy
 templates (e.g. `owner-dm-full`) cost more per turn than restricted ones
 (e.g. `safe`).
 
+### MCP works in owner DM but not in a team channel
+
+That is the expected default. Team channels stay restrictive even after you
+register an MCP globally in `~/.claude.json`; new channels only start with
+`engram-memory`.
+
+Allow the server explicitly for that channel:
+
+```bash
+engram channels mcp allow C07TEAM123 camoufox
+engram channels mcp list C07TEAM123
+```
+
+Or in Slack, from the target channel:
+
+```text
+/engram mcp allow camoufox
+/engram mcp list
+```
+
+If `list` shows `Missing from ~/.claude.json`, the channel manifest is ready
+but the server is not registered in the shared Claude inventory yet.
+
 ---
 
 ## Next steps
 
 - Read [slack-app-setup.md](slack-app-setup.md) for the full Slack app
   manifest and token guide.
+- Read [mcp.md](mcp.md) for the per-channel MCP policy, CLI, and Slack
+  command reference.
 - Read [memory-search-scoping.md](memory-search-scoping.md) to understand
   how per-channel memory isolation works.
 - Read [m4-report.md](m4-report.md) for the HITL (human-in-the-loop)

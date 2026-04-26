@@ -5,7 +5,12 @@ from itertools import product
 
 import pytest
 
-from engram.permissions.authorization import can_change_tier, classify_transition
+from engram.permissions.authorization import (
+    can_change_mcp_access,
+    can_change_tier,
+    classify_mcp_access_change,
+    classify_transition,
+)
 
 TIERS = ("safe", "trusted", "yolo")
 CHANNEL_KINDS = ("owner-dm", "private", "public")
@@ -85,3 +90,83 @@ def test_tier_authorization_matrix(
         f"Only the channel owner can upgrade to `{to_tier}`. "
         "Ask owner to run `/engram upgrade`."
     )
+
+
+@pytest.mark.parametrize(
+    ("action", "has_allow_list", "is_allowed", "is_disallowed", "expected"),
+    [
+        ("allow", False, False, False, "no-op"),
+        ("allow", False, False, True, "grant"),
+        ("allow", True, False, False, "grant"),
+        ("allow", True, True, False, "no-op"),
+        ("allow", True, True, True, "grant"),
+        ("deny", False, False, False, "revoke"),
+        ("deny", True, False, False, "revoke"),
+        ("deny", True, True, False, "revoke"),
+        ("deny", True, True, True, "no-op"),
+    ],
+)
+def test_classify_mcp_access_change(
+    action: str,
+    has_allow_list: bool,
+    is_allowed: bool,
+    is_disallowed: bool,
+    expected: str,
+) -> None:
+    assert (
+        classify_mcp_access_change(
+            action=action,
+            has_allow_list=has_allow_list,
+            is_allowed=is_allowed,
+            is_disallowed=is_disallowed,
+        )
+        == expected
+    )
+
+
+def test_owner_can_grant_mcp_access() -> None:
+    decision = can_change_mcp_access(
+        action="allow",
+        server_name="camoufox",
+        has_allow_list=True,
+        is_allowed=False,
+        is_disallowed=False,
+        invoker_user_id="U07OWNER",
+        channel_owner_user_id="U07OWNER",
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "Owner granting MCP access to `camoufox`."
+
+
+def test_non_owner_cannot_grant_mcp_access() -> None:
+    decision = can_change_mcp_access(
+        action="allow",
+        server_name="camoufox",
+        has_allow_list=True,
+        is_allowed=False,
+        is_disallowed=False,
+        invoker_user_id="U07OTHER",
+        channel_owner_user_id="U07OWNER",
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == (
+        "Only the channel owner can grant MCP access to `camoufox`. "
+        "Ask owner to run `/engram mcp allow camoufox`."
+    )
+
+
+def test_anyone_can_deny_mcp_access() -> None:
+    decision = can_change_mcp_access(
+        action="deny",
+        server_name="camoufox",
+        has_allow_list=True,
+        is_allowed=True,
+        is_disallowed=False,
+        invoker_user_id="U07OTHER",
+        channel_owner_user_id="U07OWNER",
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "Denying MCP server `camoufox` (anyone can reduce access)."
