@@ -18,6 +18,7 @@ import os
 import re
 import time
 import unicodedata
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -41,19 +42,33 @@ from claude_agent_sdk import (
     tag_session,
 )
 
+from engram import paths
 from engram.budget import BUDGET_PAUSE_MESSAGE, Budget, CheckResult
 from engram.config import EngramConfig
 from engram.costs import CostDatabase, RateLimitRecord
 from engram.embeddings import EmbeddingQueue
 from engram.footguns import match_footgun
-from engram.hitl import build_hitl_tool_guard
+from engram.hitl import PendingQuestion, build_hitl_tool_guard, watch_pending_question
 from engram.hooks import build_hooks
-from engram.manifest import PermissionTier
+from engram.manifest import (
+    ManifestError,
+    PermissionTier,
+    detect_mcp_allow_list_additions,
+    persist_approved_mcp_manifest_change,
+)
 from engram.mcp import resolve_team_mcp_servers, warn_missing_mcp_servers
 from engram.mcp_tools import (
     MEMORY_SEARCH_FULL_TOOL_NAMES,
     MEMORY_SEARCH_SERVER_NAME,
     make_memory_search_server,
+)
+from engram.mcp_trust import (
+    MCPTrustDecision,
+    MCPTrustTier,
+    add_trusted_publishers,
+    render_community_notification,
+    render_owner_approval_markdown,
+    resolve_mcp_server_trust,
 )
 from engram.memory_hooks import make_memory_hooks_with_embeddings
 from engram.router import Router, SessionState
@@ -115,6 +130,174 @@ class Agent:
         self._embedder = embedder
         self._embedding_queue = embedding_queue
         self._retry_base_delay_seconds = retry_base_delay_seconds
+
+    async def _maybe_gate_manifest_mcp_additions(
+        self,
+        *,
+        session: SessionState,
+        manifest,
+        tool_name: str,
+        tool_input: dict[str, object],
+        on_new_question: Callable[[PendingQuestion], Awaitable[None]],
+        timeout_s: int,
+        max_per_day: int,
+    ) -> PermissionResultAllow | PermissionResultDeny | None:
+        if self._router is None or self._router.home is None:
+            return None
+        if tool_name not in {"Write", "Edit", "MultiEdit"}:
+            return None
+
+        manifest_path = paths.channel_manifest_path(
+            session.channel_id,
+            self._router.home,
+        )
+        try:
+            plan = detect_mcp_allow_list_additions(
+                tool_name,
+                tool_input,
+                manifest_path=manifest_path,
+                cwd=session.cwd,
+            )
+        except ManifestError as exc:
+            return PermissionResultDeny(
+                message=f"Blocked manifest edit: unable to inspect MCP allow-list change ({exc}).",
+            )
+        if plan is None:
+            return None
+
+        inventory = self._load_manifest_inventory()
+        decisions: list[MCPTrustDecision] = []
+        for server_name in plan.additions:
+            server_config = inventory.get(server_name)
+            decisions.append(
+                await resolve_mcp_server_trust(
+                    server_name,
+                    server_config,
+                    home=self._router.home,
+                )
+            )
+
+        unknown = [decision for decision in decisions if decision.tier == MCPTrustTier.UNKNOWN]
+        community = [
+            decision
+            for decision in decisions
+            if decision.tier == MCPTrustTier.COMMUNITY_TRUSTED
+        ]
+        if not unknown:
+            if community and self._owner_alert is not None:
+                message = render_community_notification(
+                    channel_id=session.channel_id,
+                    channel_label=manifest.label,
+                    decisions=community,
+                )
+                maybe_awaitable = self._owner_alert(message)
+                if inspect.isawaitable(maybe_awaitable):
+                    await maybe_awaitable
+            return PermissionResultAllow()
+
+        owner_dm_channel_id = self._config.owner_dm_channel_id or self._router.owner_dm_channel_id
+        owner_user_id = self._config.owner_user_id
+        if not owner_dm_channel_id or not owner_user_id:
+            return PermissionResultDeny(
+                message=(
+                    "Blocked MCP manifest update: owner approval is required for "
+                    "untrusted MCPs, but owner_dm_channel_id or owner_user_id is unset."
+                ),
+            )
+
+        allowed, reason = self._router.hitl_limiter.check(
+            session.channel_id,
+            max_per_day=max_per_day,
+        )
+        if not allowed:
+            if reason.startswith("another question already pending"):
+                return PermissionResultDeny(
+                    message=(
+                        "MCP trust approval is already pending in the owner DM. "
+                        "Wait for approval, then retry the manifest update."
+                    ),
+                )
+            return PermissionResultDeny(message=f"MCP trust approval unavailable: {reason}")
+
+        q = PendingQuestion(
+            permission_request_id=str(uuid.uuid4()),
+            channel_id=session.channel_id,
+            session_id=session.session_id,
+            turn_id=str(uuid.uuid4()),
+            tool_name=tool_name,
+            tool_input=tool_input,
+            suggestions=[
+                {"name": "Approve once"},
+                {"name": "Approve + add publisher to trust list"},
+            ],
+            who_can_answer=owner_user_id,
+            posted_at=datetime.datetime.now(datetime.UTC),
+            timeout_s=timeout_s,
+            channel_manifest=manifest,
+            approval_channel_id=owner_dm_channel_id,
+            prompt_title="🔐 Owner approval required for MCP addition",
+            prompt_body_markdown=render_owner_approval_markdown(
+                channel_id=session.channel_id,
+                channel_label=manifest.label,
+                decisions=decisions,
+            ),
+            deny_button_label="Reject",
+        )
+
+        async def _apply_approved_manifest(_result) -> None:
+            if q.resolution_choice == "deny":
+                return
+            try:
+                if q.resolution_choice == "1":
+                    trusted_publishers = [
+                        (decision.registry, decision.publisher or "")
+                        for decision in decisions
+                        if decision.publisher
+                    ]
+                    add_trusted_publishers(
+                        trusted_publishers,
+                        home=self._router.home,
+                    )
+                _previous, updated, _path = persist_approved_mcp_manifest_change(plan)
+                self._router.replace_cached_manifest(updated)
+            except Exception:
+                log.exception(
+                    "agent.mcp_trust_approval_apply_failed channel=%s additions=%s",
+                    session.channel_id,
+                    plan.additions,
+                )
+
+        q.on_resolve = _apply_approved_manifest
+        self._router.hitl.register(q)
+        self._router.hitl_limiter.reserve(session.channel_id)
+        try:
+            await on_new_question(q)
+        except Exception:
+            self._router.hitl.resolve(
+                q.permission_request_id,
+                PermissionResultDeny(message="failed to post question"),
+            )
+            self._router.hitl.cleanup_resolved()
+            return PermissionResultDeny(
+                message="Blocked MCP manifest update: failed to post owner approval request.",
+            )
+        watch_pending_question(self._router, q)
+        return PermissionResultDeny(
+            message=(
+                "MCP trust approval requested in the owner DM. "
+                "The manifest was not updated; retry after approval."
+            ),
+        )
+
+    def _load_manifest_inventory(self) -> dict[str, dict[str, object]]:
+        from engram.mcp import load_claude_mcp_servers
+
+        raw_inventory = load_claude_mcp_servers()
+        return {
+            name: dict(config)
+            for name, config in raw_inventory.items()
+            if isinstance(config, dict)
+        }
 
     async def run_turn(
         self,
@@ -580,15 +763,69 @@ class Agent:
             if self._router is not None
             else None
         )
+        async def _noop_on_new_question(q) -> None:
+            log.warning(
+                "HITL question fired but no egress wired: pid=%s tool=%s",
+                q.permission_request_id,
+                q.tool_name,
+            )
+
+        on_new_question = getattr(
+            self,
+            "_on_new_question",
+            _noop_on_new_question,
+        )
+
+        scope_can_use_tool = can_use_tool
+
+        async def _scope_and_manifest_precheck(tool_name, tool_input, context):
+            effective_input = tool_input
+            if scope_can_use_tool is not None:
+                scope_result = await scope_can_use_tool(
+                    tool_name,
+                    tool_input,
+                    context,
+                )
+                if isinstance(scope_result, PermissionResultDeny):
+                    return scope_result
+                if scope_result.updated_input is not None:
+                    effective_input = scope_result.updated_input
+
+            if (
+                manifest is not None
+                and hitl_config is not None
+                and self._router is not None
+            ):
+                trust_result = await self._maybe_gate_manifest_mcp_additions(
+                    session=session,
+                    manifest=manifest,
+                    tool_name=tool_name,
+                    tool_input=effective_input,
+                    on_new_question=on_new_question,
+                    timeout_s=hitl_config.timeout_s,
+                    max_per_day=hitl_config.max_per_day,
+                )
+                if trust_result is not None:
+                    if (
+                        isinstance(trust_result, PermissionResultAllow)
+                        and effective_input is not tool_input
+                    ):
+                        return PermissionResultAllow(updated_input=effective_input)
+                    return trust_result
+
+            if effective_input is tool_input:
+                return PermissionResultAllow()
+            return PermissionResultAllow(updated_input=effective_input)
+
+        if self._router is not None and hitl_config is not None:
+            can_use_tool = _scope_and_manifest_precheck
+
         if (
             self._router is not None
             and hitl_config is not None
             and hitl_config.enabled
         ):
-            scope_can_use_tool = can_use_tool
-
             async def _scope_and_footgun_precheck(tool_name, tool_input, context):
-                effective_input = tool_input
                 effective_tier = (
                     manifest.tier_effective() if manifest is not None else None
                 )
@@ -628,30 +865,24 @@ class Agent:
                             ),
                         )
 
-                if scope_can_use_tool is not None:
-                    scope_result = await scope_can_use_tool(
-                        tool_name,
-                        tool_input,
-                        context,
-                    )
-                    if isinstance(scope_result, PermissionResultDeny):
-                        return scope_result
-                    if scope_result.updated_input is not None:
-                        effective_input = scope_result.updated_input
+                scope_result = await _scope_and_manifest_precheck(
+                    tool_name,
+                    tool_input,
+                    context,
+                )
+                if isinstance(scope_result, PermissionResultDeny):
+                    return scope_result
+                effective_input = scope_result.updated_input or tool_input
 
                 if manifest is None:
-                    if effective_input is tool_input:
-                        return PermissionResultAllow()
-                    return PermissionResultAllow(updated_input=effective_input)
+                    return scope_result
 
                 footgun_match = initial_footgun_match or match_footgun(
                     tool_name,
                     effective_input,
                 )
                 if footgun_match is None:
-                    if effective_input is tool_input:
-                        return PermissionResultAllow()
-                    return PermissionResultAllow(updated_input=effective_input)
+                    return scope_result
 
                 if initial_footgun_match is None:
                     _log_footgun_match(footgun_match)
@@ -694,23 +925,12 @@ class Agent:
                     metadata["who_can_answer"] = session.current_user_id
                 return metadata
 
-            async def _noop_on_new_question(q) -> None:
-                log.warning(
-                    "HITL question fired but no egress wired: pid=%s tool=%s",
-                    q.permission_request_id,
-                    q.tool_name,
-                )
-
             can_use_tool = build_hitl_tool_guard(
                 router=self._router,
                 channel_id=session.channel_id,
                 session_id=session.session_id,
                 client_provider=lambda: session.agent_client,
-                on_new_question=getattr(
-                    self,
-                    "_on_new_question",
-                    _noop_on_new_question,
-                ),
+                on_new_question=on_new_question,
                 default_timeout_s=hitl_config.timeout_s,
                 max_per_day=hitl_config.max_per_day,
                 precheck=_scope_and_footgun_precheck,

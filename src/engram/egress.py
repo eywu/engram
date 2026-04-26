@@ -139,8 +139,12 @@ async def post_question(q: PendingQuestion, slack_client) -> tuple[str, str]:
     if _ensure_footgun_match(q) is not None:
         return await post_footgun_confirmation_card(q, slack_client)
 
-    header = f"🤔 Can I proceed with `{q.tool_name}`?"
-    input_summary = json.dumps(q.tool_input, indent=2)[:800]
+    header = q.prompt_title or f"🤔 Can I proceed with `{q.tool_name}`?"
+    input_summary = (
+        q.prompt_body_markdown
+        if q.prompt_body_markdown is not None
+        else f"```{json.dumps(q.tool_input, indent=2)[:800]}```"
+    )
     action_elements = []
     sticky_eligible = _is_sticky_eligible(
         q.tool_name,
@@ -182,7 +186,7 @@ async def post_question(q: PendingQuestion, slack_client) -> tuple[str, str]:
     action_elements.append(
         {
             "type": "button",
-            "text": {"type": "plain_text", "text": "Deny"},
+            "text": {"type": "plain_text", "text": q.deny_button_label},
             "value": f"{q.permission_request_id}|deny",
             "action_id": "hitl_choice_deny",
             "style": "danger",
@@ -193,7 +197,7 @@ async def post_question(q: PendingQuestion, slack_client) -> tuple[str, str]:
         {"type": "section", "text": {"type": "mrkdwn", "text": header}},
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"```{input_summary}```"},
+            "text": {"type": "mrkdwn", "text": input_summary},
         },
         {"type": "actions", "block_id": "hitl_actions", "elements": action_elements},
         {
@@ -211,7 +215,7 @@ async def post_question(q: PendingQuestion, slack_client) -> tuple[str, str]:
     ]
 
     response = await slack_client.chat_postMessage(
-        channel=q.channel_id,
+        channel=_question_channel(q),
         blocks=blocks,
         text=header,
     )
@@ -640,7 +644,7 @@ async def update_question_resolved(
         },
     ]
     await slack_client.chat_update(
-        channel=q.channel_id,
+        channel=_question_channel(q),
         ts=q.slack_channel_ts,
         blocks=blocks,
         text=f"Answered: {answer_text}",
@@ -660,7 +664,7 @@ async def update_question_timeout(q: PendingQuestion, slack_client) -> None:
             },
         ]
         await slack_client.chat_update(
-            channel=q.channel_id,
+            channel=_question_channel(q),
             ts=q.slack_channel_ts,
             blocks=blocks,
             text="Timed out",
@@ -677,11 +681,15 @@ async def update_question_timeout(q: PendingQuestion, slack_client) -> None:
         },
     ]
     await slack_client.chat_update(
-        channel=q.channel_id,
+        channel=_question_channel(q),
         ts=q.slack_channel_ts,
         blocks=blocks,
         text="Timed out",
     )
+
+
+def _question_channel(q: PendingQuestion) -> str:
+    return q.approval_channel_id or q.channel_id
 
 
 # Map from Claude tool names to human-friendly verb fragments. We surface the

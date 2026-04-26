@@ -3307,6 +3307,7 @@ async def _resolve_block_action(
     tool_name: str | None = None,
 ) -> None:
     try:
+        q.resolution_choice = choice_key
         if choice_key == "always":
             result = _resolve_question(
                 q,
@@ -3320,7 +3321,7 @@ async def _resolve_block_action(
             )
         elif choice_key == "deny":
             result = _resolve_question(q, choice="deny")
-            answer_text = "Deny"
+            answer_text = q.deny_button_label
         else:
             try:
                 idx = int(choice_key)

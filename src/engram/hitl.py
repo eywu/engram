@@ -62,6 +62,11 @@ class PendingQuestion:
     slack_thread_ts: str | None = None
     channel_manifest: Any | None = None
     footgun_match: FootgunMatch | None = None
+    approval_channel_id: str | None = None
+    prompt_title: str | None = None
+    prompt_body_markdown: str | None = None
+    deny_button_label: str = "Deny"
+    resolution_choice: str | None = None
 
 
 class HITLRegistry:
@@ -145,6 +150,9 @@ class HITLRateLimiter:
         if day != today:
             count = 0
         self._daily_counts[channel_id] = (today, count + 1)
+
+
+_BACKGROUND_QUESTION_TASKS: set[asyncio.Task[None]] = set()
 
 
 def _daily_hitl_cap_message(
@@ -459,3 +467,25 @@ def _always_allow_permission_update(tool_name: str) -> PermissionUpdate:
         rules=[PermissionRuleValue(tool_name=tool_name)],
         destination="session",
     )
+
+
+def watch_pending_question(router: Any, q: PendingQuestion) -> None:
+    """Watch a queued question until approval or timeout, then clean it up."""
+
+    async def _watch() -> None:
+        try:
+            await asyncio.wait_for(q.future, timeout=q.timeout_s)
+        except TimeoutError:
+            log.info(
+                "hitl.background_question_timed_out",
+                extra={
+                    "permission_request_id": q.permission_request_id,
+                    "timeout_s": q.timeout_s,
+                },
+            )
+        finally:
+            router.hitl.cleanup_resolved()
+
+    task = asyncio.create_task(_watch())
+    _BACKGROUND_QUESTION_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_QUESTION_TASKS.discard)

@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
+import json
 import logging
 import os
 import re
@@ -186,6 +188,18 @@ class YoloDemotion:
     duration_used: timedelta | None
     trigger: Literal["lazy", "sweep"]
     manifest: ChannelManifest
+
+
+@dataclass(frozen=True)
+class MCPManifestChangePlan:
+    """Staged manifest edit that adds new entries to ``mcp_servers.allowed``."""
+
+    manifest_path: Path
+    current_manifest: ChannelManifest
+    staged_manifest: ChannelManifest
+    staged_text: str
+    baseline_sha256: str
+    additions: list[str]
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -969,6 +983,79 @@ class ManifestError(Exception):
     """Raised when a manifest file is missing, malformed, or invalid."""
 
 
+def detect_mcp_allow_list_additions(
+    tool_name: str,
+    tool_input: dict[str, object],
+    *,
+    manifest_path: Path,
+    cwd: Path | None = None,
+) -> MCPManifestChangePlan | None:
+    """Return a staged manifest diff when a tool adds new allowed MCP servers."""
+    target_path = _tool_target_path(tool_input, cwd)
+    if target_path is None or target_path != manifest_path.resolve():
+        return None
+
+    current_text = manifest_path.read_text(encoding="utf-8")
+    staged_text = _apply_manifest_tool_edit(tool_name, tool_input, current_text)
+    if staged_text is None:
+        return None
+
+    current_manifest = load_manifest(manifest_path)
+    staged_manifest = _manifest_from_text(staged_text, manifest_path)
+    current_allowed = set(current_manifest.mcp_servers.allowed or [])
+    staged_allowed = list(staged_manifest.mcp_servers.allowed or [])
+    additions = [name for name in staged_allowed if name not in current_allowed]
+    if not additions:
+        return None
+
+    return MCPManifestChangePlan(
+        manifest_path=manifest_path,
+        current_manifest=current_manifest,
+        staged_manifest=staged_manifest,
+        staged_text=staged_text,
+        baseline_sha256=_sha256_text(current_text),
+        additions=additions,
+    )
+
+
+def persist_approved_mcp_manifest_change(
+    plan: MCPManifestChangePlan,
+) -> tuple[ChannelManifest, ChannelManifest, Path]:
+    """Persist an approved staged MCP allow-list change.
+
+    If the manifest changed since the approval request was generated, merge the
+    newly approved MCP names into the latest manifest instead of overwriting.
+    """
+    current_text = plan.manifest_path.read_text(encoding="utf-8")
+    current_manifest = load_manifest(plan.manifest_path)
+    if _sha256_text(current_text) == plan.baseline_sha256:
+        updated_manifest = plan.staged_manifest
+    else:
+        merged_allowed = list(
+            dict.fromkeys(
+                [
+                    *(current_manifest.mcp_servers.allowed or []),
+                    *plan.additions,
+                ]
+            )
+        )
+        updated_manifest = current_manifest.model_copy(
+            update={
+                "mcp_servers": current_manifest.mcp_servers.model_copy(
+                    update={"allowed": merged_allowed}
+                )
+            }
+        )
+        log.info(
+            "manifest.mcp_allow_merge_after_stale_approval channel_id=%s path=%s additions=%s",
+            current_manifest.channel_id,
+            plan.manifest_path,
+            merged_allowed,
+        )
+    _write_manifest_atomic(updated_manifest, plan.manifest_path)
+    return current_manifest, updated_manifest, plan.manifest_path
+
+
 def load_manifest(path: Path) -> ChannelManifest:
     """Load and validate a channel manifest from YAML.
 
@@ -1021,6 +1108,7 @@ def load_manifest(path: Path) -> ChannelManifest:
 
     if alias_changed or changed or yolo_changed:
         _write_manifest_atomic(manifest, path)
+    _audit_existing_mcp_allow_list_once(manifest, path)
     return manifest
 
 
@@ -1059,6 +1147,30 @@ def _manifest_yaml(manifest: ChannelManifest) -> str:
     )
 
 
+def _manifest_from_text(text: str, path: Path) -> ChannelManifest:
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ManifestError(f"YAML parse error in staged manifest {path}: {exc}") from exc
+    if raw is None:
+        raise ManifestError(f"Staged manifest is empty: {path}")
+    if not isinstance(raw, dict):
+        raise ManifestError(
+            f"Staged manifest must be a YAML mapping, got {type(raw).__name__}: {path}"
+        )
+    normalized_raw, _migrations, _alias_changed = _normalize_manifest_tier_aliases(raw)
+    hydrated_raw, _changed = _apply_tier_defaults(
+        normalized_raw,
+        infer_legacy_tier=True,
+    )
+    try:
+        manifest = ChannelManifest.model_validate(hydrated_raw)
+    except ValidationError as exc:
+        raise ManifestError(f"Staged manifest validation failed for {path}:\n{exc}") from exc
+    manifest, _ = _demote_expired_temporary_tier(manifest, path=path)
+    return manifest
+
+
 def set_channel_status(
     channel_id: str,
     new_status: ChannelStatus,
@@ -1094,6 +1206,121 @@ def _write_manifest_atomic(manifest: ChannelManifest, path: Path) -> None:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp_name)
         raise
+
+
+def _tool_target_path(
+    tool_input: dict[str, object],
+    cwd: Path | None,
+) -> Path | None:
+    raw_path = tool_input.get("file_path") or tool_input.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        base = cwd or Path.cwd()
+        candidate = (base / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    return candidate
+
+
+def _apply_manifest_tool_edit(
+    tool_name: str,
+    tool_input: dict[str, object],
+    current_text: str,
+) -> str | None:
+    if tool_name == "Write":
+        content = tool_input.get("content")
+        if not isinstance(content, str):
+            raise ManifestError("Write to channel manifest is missing string content")
+        return content
+    if tool_name == "Edit":
+        return _apply_single_text_edit(current_text, tool_input)
+    if tool_name == "MultiEdit":
+        edits = tool_input.get("edits")
+        if not isinstance(edits, list):
+            raise ManifestError("MultiEdit for channel manifest is missing edits list")
+        updated = current_text
+        for edit in edits:
+            if not isinstance(edit, dict):
+                raise ManifestError("MultiEdit for channel manifest has non-mapping edit")
+            updated = _apply_single_text_edit(updated, edit)
+        return updated
+    return None
+
+
+def _apply_single_text_edit(current_text: str, edit: dict[str, object]) -> str:
+    old_string = edit.get("old_string")
+    new_string = edit.get("new_string")
+    replace_all = bool(edit.get("replace_all"))
+    if not isinstance(old_string, str) or not isinstance(new_string, str):
+        raise ManifestError("manifest edit requires string old_string and new_string")
+    if old_string not in current_text:
+        raise ManifestError("manifest edit old_string was not found in current manifest")
+    if replace_all:
+        return current_text.replace(old_string, new_string)
+    return current_text.replace(old_string, new_string, 1)
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _audit_existing_mcp_allow_list_once(
+    manifest: ChannelManifest,
+    path: Path,
+) -> None:
+    allowed = list(manifest.mcp_servers.allowed or [])
+    if not allowed:
+        return
+    audit_path = _mcp_allow_audit_path(path)
+    if audit_path is None:
+        return
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object]
+    if audit_path.exists():
+        try:
+            payload = json.loads(audit_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            payload = {}
+    else:
+        payload = {}
+    audited_channels = payload.setdefault("audited_channels", {})
+    if not isinstance(audited_channels, dict):
+        audited_channels = {}
+        payload["audited_channels"] = audited_channels
+    channel_key = manifest.channel_id
+    if channel_key in audited_channels:
+        return
+    audited_channels[channel_key] = {
+        "path": str(path),
+        "allowed": allowed,
+        "audited_at": datetime.now(UTC).isoformat(),
+    }
+    audit_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    log.info(
+        "manifest.mcp_allow_list_grandfathered channel_id=%s path=%s allowed=%s",
+        manifest.channel_id,
+        path,
+        allowed,
+    )
+
+
+def _mcp_allow_audit_path(path: Path) -> Path | None:
+    try:
+        if path.name != "channel-manifest.yaml" or path.parent.name != ".claude":
+            return None
+        channel_dir = path.parent.parent
+        contexts_dir = channel_dir.parent
+        if contexts_dir.name != "contexts":
+            return None
+        engram_home = contexts_dir.parent
+    except IndexError:
+        return None
+    return paths.state_dir(engram_home) / "mcp_manifest_audit.json"
 
 
 # Tools that must NEVER receive sticky channel-scoped allow rules, even if
