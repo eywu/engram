@@ -15,6 +15,12 @@ from claude_agent_sdk.types import ToolResultBlock, ToolUseBlock, UserMessage
 from engram.agent import Agent, _claude_cli_jsonl_for
 from engram.config import AnthropicConfig, EngramConfig, SlackConfig
 from engram.egress import post_reply
+from engram.manifest import (
+    ChannelManifest,
+    ChannelStatus,
+    IdentityTemplate,
+    ScopeList,
+)
 from engram.router import Router, SessionState, derive_session_id
 
 
@@ -353,6 +359,61 @@ async def test_first_turn_uses_session_id_subsequent_turns_use_resume():
     assert options_seen[0].resume is None
     assert options_seen[1].session_id is None
     assert options_seen[1].resume == session.session_id
+
+
+@pytest.mark.asyncio
+async def test_manifest_mcp_exclusion_logs_once_per_client_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    mcp_dir = tmp_path / ".claude"
+    mcp_dir.mkdir()
+    (mcp_dir / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "linear": {
+                        "type": "http",
+                        "url": "https://linear.example/mcp",
+                    },
+                    "camoufox": {"command": "camoufox-mcp"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = ChannelManifest(
+        channel_id="C07TEST123",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        status=ChannelStatus.ACTIVE,
+        mcp_servers=ScopeList(allowed=["linear"]),
+    )
+    session = SessionState(channel_id="C07TEST123", manifest=manifest)
+    clients: list[_FakeClient] = []
+
+    def factory(options: ClaudeAgentOptions) -> _FakeClient:
+        client = _FakeClient(options)
+        clients.append(client)
+        return client
+
+    agent = Agent(_cfg(), client_factory=factory)
+    caplog.set_level(logging.INFO, logger="engram.mcp")
+
+    await agent.run_turn(session, "first")
+    await agent.run_turn(session, "second")
+
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "mcp.excluded_by_manifest"
+    ]
+    assert len(clients) == 1
+    assert len(records) == 1
+    assert records[0].channel_id == "C07TEST123"
+    assert records[0].mcp_name == "camoufox"
+    assert records[0].reason == "not_in_allowed"
 
 
 @pytest.mark.asyncio
