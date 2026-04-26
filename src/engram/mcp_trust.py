@@ -98,6 +98,7 @@ async def resolve_mcp_server_trust(
     current_time = now or datetime.now(UTC)
     fetcher = fetch_json or _fetch_json
     trusted_publishers = _load_trusted_publishers(home)
+    package_ref = _extract_package_ref(server_config)
     cache_key = _cache_key(server_name, server_config, trusted_publishers)
     cached = _load_cached_decision(cache_key, home=home, now=current_time)
     if cached is not None:
@@ -119,8 +120,12 @@ async def resolve_mcp_server_trust(
         )
         decision = _unknown_decision(
             server_name,
-            registry=PackageRegistry.CUSTOM,
+            registry=(
+                package_ref.registry if package_ref is not None else PackageRegistry.CUSTOM
+            ),
             reason="metadata lookup failed",
+            package_name=package_ref.display_name if package_ref is not None else None,
+            version=package_ref.version if package_ref is not None else None,
         )
 
     _store_cached_decision(cache_key, decision, home=home, now=current_time)
