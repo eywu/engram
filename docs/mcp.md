@@ -1,7 +1,11 @@
-# MCP Onboarding
+# MCP Access in Engram
 
 Engram reuses Claude Code's MCP inventory, but there are multiple layers
 between "I ran `claude mcp add ...`" and "this MCP is available in Slack."
+This doc covers both **how MCP discovery and onboarding work** (so you can
+diagnose missing MCPs) and **how to manage per-channel MCP access** (the
+first-class CLI and slash-command surface for granting or revoking access
+in shared channels).
 
 ## The Three Layers
 
@@ -61,67 +65,26 @@ Tier and trust policy answer "is Engram allowed to make that change?"
 
 This applies when Engram itself is asked to modify a channel manifest.
 
-## Why Didn’t My MCP Show Up?
-
-Work through these in order:
-
-1. Check `~/.claude.json`. If the server is not under `mcpServers`, Engram
-   cannot discover it.
-2. Run `engram doctor`. The MCP coverage check warns when a registered user
-   MCP is allowed in no team channel manifests and points at the manifest
-   path to edit.
-3. If the missing MCP is only failing in a team channel, inspect that
-   channel's manifest and confirm the server name appears under
-   `mcp_servers.allowed`.
-4. If Engram already started once, check the structured logs for
-   `mcp.excluded_by_manifest`. That means the MCP was present in the user
-   inventory but filtered out by the strict channel manifest.
-
-Helpful commands:
-
-```bash
-engram doctor
-engram channels list
-engram channels show C07TEAM123
-```
-
-## Current Behavior
-
-- Owner DMs auto-discover user MCPs from `~/.claude.json`.
-- Team channels require explicit allow-list entries.
-- `engram setup` shows the shared user inventory, warns when registered
-  MCPs are not yet allowed in any existing team channel manifest, and can
-  add them to existing team manifests interactively.
-- After setup, the next Engram start notices newly added user MCPs from
-  `~/.claude.json` and either prompts to wire them into existing team
-  manifests or sends an owner-facing warning with the exact fix path.
-# Per-Channel MCP Access
-
-Engram uses a hybrid policy for MCP access:
-
-- Owner DMs inherit the operator's user-level MCP inventory from `~/.claude.json`.
-- New team channels stay restrictive by default.
-- The shared-channel baseline still starts with `engram-memory` only.
-- Per-channel exceptions are managed through first-class CLI and Slack commands, not hand-edited YAML.
-
-This records the `GRO-531` decision: option **C**.
-
-## Why the default stays restrictive
+## Why the Default for Team Channels Stays Restrictive
 
 Team channels use `setting_sources: [project]` plus strict MCP config on
 purpose. Registering a new MCP globally should not silently expand tool reach
 in shared Slack rooms.
 
-The escape hatch is explicit per-channel allow/deny management:
+This records the `GRO-531` decision: option **C** — hybrid policy.
 
-- `engram channels mcp allow <channel-id> <server>`
-- `engram channels mcp deny <channel-id> <server>`
-- `engram channels mcp list <channel-id>`
-- `/engram mcp allow <server>`
-- `/engram mcp deny <server>`
-- `/engram mcp list`
+- Owner DMs inherit the operator's user-level MCP inventory from `~/.claude.json`.
+- New team channels stay restrictive by default.
+- The shared-channel baseline still starts with `engram-memory` only.
+- Per-channel exceptions are managed through first-class CLI and Slack
+  commands (below), not hand-edited YAML.
 
-## CLI
+## Per-Channel MCP Access (CLI and Slash Commands)
+
+The escape hatch from the restrictive team-channel default is explicit
+per-channel allow/deny management.
+
+### CLI
 
 Use the CLI on the host running the bridge:
 
@@ -139,7 +102,7 @@ engram channels mcp deny C07TEAM123 camoufox
 - the effective MCP servers after both lists are applied
 - any allow-listed servers that are still missing from `~/.claude.json`
 
-## Slack
+### Slack
 
 Use the slash command in the target channel:
 
@@ -155,7 +118,7 @@ Use the slash command in the target channel:
 - denying MCP access is allowed for anyone, because it only reduces access
 - `list` is read-only and available to anyone in the channel
 
-## Notes
+### Notes
 
 - These commands update `mcp_servers.allowed` and `mcp_servers.disallowed`
   in the channel manifest. They do not change the channel tier.
@@ -164,5 +127,44 @@ Use the slash command in the target channel:
   the channel already inherits the user-level MCP inventory unless that
   server was explicitly denied.
 - If a server is missing from `~/.claude.json`, allowing it updates the
-  manifest but it will not become effective until the shared Claude inventory
-  contains that server.
+  manifest but it will not become effective until the shared Claude
+  inventory contains that server.
+
+## Why Didn't My MCP Show Up?
+
+Work through these in order:
+
+1. Check `~/.claude.json`. If the server is not under `mcpServers`, Engram
+   cannot discover it.
+2. Run `engram doctor`. The MCP coverage check warns when a registered user
+   MCP is allowed in no team channel manifests and points at the manifest
+   path to edit.
+3. If the missing MCP is only failing in a team channel, inspect that
+   channel's manifest and confirm the server name appears under
+   `mcp_servers.allowed`. The CLI is the right tool:
+   `engram channels mcp list <channel-id>`.
+4. If Engram already started once, check the structured logs for
+   `mcp.excluded_by_manifest`. That means the MCP was present in the user
+   inventory but filtered out by the strict channel manifest.
+
+Helpful commands:
+
+```bash
+engram doctor
+engram channels list
+engram channels show C07TEAM123
+engram channels mcp list C07TEAM123
+```
+
+## Current Behavior Summary
+
+- Owner DMs auto-discover user MCPs from `~/.claude.json`.
+- Team channels require explicit allow-list entries.
+- `engram setup` shows the shared user inventory, warns when registered
+  MCPs are not yet allowed in any existing team channel manifest, and can
+  add them to existing team manifests interactively.
+- After setup, the next Engram start notices newly added user MCPs from
+  `~/.claude.json` and either prompts to wire them into existing team
+  manifests or sends an owner-facing warning with the exact fix path.
+- Per-channel exceptions are managed via `engram channels mcp ...` (CLI)
+  or `/engram mcp ...` (slash command).
