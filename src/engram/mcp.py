@@ -1,6 +1,7 @@
 """MCP configuration helpers for channel isolation."""
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import shutil
@@ -8,13 +9,38 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from engram.manifest import ChannelManifest
+from engram import paths
+from engram.manifest import ChannelManifest, ManifestError, load_manifest
 from engram.mcp_tools import (
     MEMORY_SEARCH_SERVER_NAME,
     make_memory_search_server,
 )
 
 log = logging.getLogger(__name__)
+MCP_INVENTORY_STATE_FILE = "mcp_inventory_state.json"
+
+
+@dataclass(frozen=True)
+class MCPChannelCoverage:
+    """Audit of user MCP inventory coverage across strict team manifests."""
+
+    inventory_path: Path
+    configured_servers: list[str]
+    team_channels: list[str]
+    team_manifest_paths: dict[str, Path]
+    allowed_by_channel: dict[str, list[str]]
+    uncovered_servers: list[str]
+    invalid_manifest_paths: list[Path]
+
+
+@dataclass(frozen=True)
+class MCPInventoryDelta:
+    """Diff between the current Claude MCP inventory and Engram's snapshot."""
+
+    state_path: Path
+    known_servers: list[str]
+    current_servers: list[str]
+    new_servers: list[str]
 
 
 @dataclass(frozen=True)
@@ -37,6 +63,10 @@ def claude_mcp_config_path() -> Path:
 def legacy_claude_mcp_config_path() -> Path:
     """Return Engram's deprecated legacy MCP inventory path."""
     return Path.home() / ".claude" / "mcp.json"
+
+
+def mcp_inventory_state_path(home: Path | None = None) -> Path:
+    return paths.state_dir(home) / MCP_INVENTORY_STATE_FILE
 
 
 def _load_mcp_config_root(path: Path) -> dict[str, Any] | None:
@@ -162,6 +192,149 @@ def load_claude_mcp_servers(
     path = config_path or claude_mcp_config_path()
     data = _load_mcp_config_root(path)
     return _extract_mcp_servers(data, path=path)
+
+
+def load_known_mcp_servers(
+    *,
+    home: Path | None = None,
+) -> list[str]:
+    """Load the last MCP inventory snapshot Engram recorded."""
+    path = mcp_inventory_state_path(home)
+    if not path.exists():
+        return []
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        log.warning("mcp.inventory_state_invalid_json path=%s", path)
+        return []
+
+    if not isinstance(payload, dict):
+        log.warning("mcp.inventory_state_invalid_root path=%s", path)
+        return []
+
+    names = payload.get("known_servers")
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        log.warning("mcp.inventory_state_invalid_servers path=%s", path)
+        return []
+    return list(dict.fromkeys(names))
+
+
+def write_mcp_inventory_state(
+    server_names: dict[str, dict[str, Any]] | list[str],
+    *,
+    home: Path | None = None,
+) -> Path:
+    """Persist the current Claude MCP inventory for later delta checks."""
+    names = list(server_names)
+
+    normalized = sorted(
+        name for name in dict.fromkeys(names) if isinstance(name, str)
+    )
+    path = mcp_inventory_state_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "known_servers": normalized,
+                "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def detect_new_user_mcp_servers(
+    configured_servers: dict[str, dict[str, Any]] | None = None,
+    *,
+    home: Path | None = None,
+) -> MCPInventoryDelta:
+    """Compare the current Claude MCP inventory to Engram's last snapshot."""
+    configured = (
+        load_claude_mcp_servers()
+        if configured_servers is None
+        else dict(configured_servers)
+    )
+    current_servers = sorted(configured)
+    known_servers = load_known_mcp_servers(home=home)
+    known = set(known_servers)
+    new_servers = [name for name in current_servers if name not in known]
+    return MCPInventoryDelta(
+        state_path=mcp_inventory_state_path(home),
+        known_servers=known_servers,
+        current_servers=current_servers,
+        new_servers=new_servers,
+    )
+
+
+def audit_mcp_channel_coverage(
+    *,
+    contexts_path: Path | None = None,
+    configured_servers: dict[str, dict[str, Any]] | None = None,
+) -> MCPChannelCoverage:
+    """Compare Claude Code's user MCP inventory to strict team manifests.
+
+    Owner DMs use ``setting_sources=["user"]`` and are intentionally
+    ignored here. The question this audit answers is narrower: which user
+    MCPs are registered in ``~/.claude.json`` but not allowed anywhere in
+    Engram's strict team-channel manifest layer?
+    """
+
+    configured = (
+        load_claude_mcp_servers()
+        if configured_servers is None
+        else dict(configured_servers)
+    )
+    context_root = contexts_path or paths.contexts_dir()
+    team_channels: list[str] = []
+    team_manifest_paths: dict[str, Path] = {}
+    allowed_by_channel: dict[str, list[str]] = {}
+    invalid_manifest_paths: list[Path] = []
+    allowed_anywhere: set[str] = set()
+
+    if context_root.exists():
+        for manifest_path in sorted(context_root.glob("*/.claude/channel-manifest.yaml")):
+            try:
+                manifest = load_manifest(manifest_path)
+            except ManifestError:
+                invalid_manifest_paths.append(manifest_path)
+                continue
+            if manifest.is_owner_dm():
+                continue
+
+            # GRO-532 fix: subtract disallowed BEFORE recording channel
+            # coverage. A channel with `allowed: [foo]` AND `disallowed: [foo]`
+            # has zero effective access to foo (see resolve_team_mcp_servers
+            # below which applies the same filter). Without this subtraction,
+            # the audit reports false-positive PASS when an MCP is allowed in
+            # one team channel but disallowed in another, or even when allowed
+            # and disallowed in the same channel.
+            allowed_raw = list(manifest.mcp_servers.allowed or [])
+            disallowed = list(manifest.mcp_servers.disallowed or [])
+            effective_allowed = [
+                name for name in allowed_raw if name not in disallowed
+            ]
+            team_channels.append(manifest.channel_id)
+            team_manifest_paths[manifest.channel_id] = manifest_path
+            allowed_by_channel[manifest.channel_id] = effective_allowed
+            allowed_anywhere.update(effective_allowed)
+
+    uncovered_servers = [
+        name for name in configured if name not in allowed_anywhere
+    ]
+    return MCPChannelCoverage(
+        inventory_path=claude_mcp_config_path(),
+        configured_servers=list(configured),
+        team_channels=team_channels,
+        team_manifest_paths=team_manifest_paths,
+        allowed_by_channel=allowed_by_channel,
+        uncovered_servers=uncovered_servers,
+        invalid_manifest_paths=invalid_manifest_paths,
+    )
 
 
 def resolve_team_mcp_servers(

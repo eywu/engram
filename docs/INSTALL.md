@@ -158,6 +158,9 @@ The wizard walks you through six steps:
 5. **MCP inventory** — discovers any MCP servers in `~/.claude.json`
    (`mcpServers`), the single user inventory `claude mcp add` updates. If
    a legacy `~/.claude/mcp.json` exists, Engram migrates it with a backup.
+   For existing team channels, the wizard can also add discovered MCPs to
+   per-channel allow-lists interactively. See
+   [mcp.md](mcp.md).
 6. **Write config** — saves to `~/.engram/config.yaml` with mode `600`
 
 If anything was wrong, re-run `engram setup` to overwrite.
@@ -398,12 +401,12 @@ Before manual debugging, run:
 engram doctor
 ```
 
-It runs 17 pre-flight checks — `uv`, `claude` CLI, Python version, config
+It runs 19 pre-flight checks — `uv`, `claude` CLI, Python version, config
 file + permissions, Slack tokens (live `auth.test`), slash-command coverage
 (recent bridge-log probe), Anthropic + Gemini API keys (live validation),
-launchd jobs, disk space, log directory — and prints a Rich table with
-actionable hints for every `❌`. Exits `0` on a healthy setup or
-only-warnings, `1` on any failure.
+launchd jobs, MCP channel coverage, disk space, log directory — and prints
+a Rich table with actionable hints for every `❌`. Exits `0` on a healthy
+setup or only-warnings, `1` on any failure.
 
 ```bash
 engram doctor --json       # machine-readable output for scripts / issue reports
@@ -413,6 +416,10 @@ If Engram is running but pauses on a Slack permission card, see
 [`hitl.md`](hitl.md) — that page explains when human-in-the-loop prompts
 fire, how timeouts and daily caps behave, and what to grep for in logs when
 a card does not behave as expected.
+
+If a newly added MCP is visible in Claude Code but not in Slack, see
+[mcp.md](mcp.md) for the registration vs. channel-manifest model and the
+`mcp.excluded_by_manifest` troubleshooting path.
 
 ### `engram setup` reports tokens with the wrong prefix
 

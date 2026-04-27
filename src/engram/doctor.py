@@ -28,6 +28,7 @@ from engram.launchd import (
     installed_bridge_plist_path,
     load_plist,
 )
+from engram.mcp import audit_mcp_channel_coverage
 from engram.runtime import fd_usage_snapshot, read_latest_fd_snapshot
 
 SLACK_AUTH_TEST_URL = "https://slack.com/api/auth.test"
@@ -47,6 +48,7 @@ SLACK_SLASH_COMMAND_MISSING_PATTERNS = (
     "unknown slash command",
 )
 SLACK_SLASH_COMMAND_LOG_WINDOW = datetime.timedelta(hours=24)
+MCP_EXCLUSION_LOG_WINDOW = datetime.timedelta(hours=24)
 
 
 class CheckStatus(StrEnum):
@@ -126,6 +128,9 @@ def default_config_path() -> Path:
 def run_doctor(config_path: Path | None = None) -> DoctorReport:
     path = (config_path or default_config_path()).expanduser()
     config_check, config = check_config_loads(path)
+    contexts_path = (
+        config.paths.contexts_dir if config is not None else path.parent / "contexts"
+    )
     log_dir = config.paths.log_dir if config is not None else path.parent / "logs"
 
     checks = [
@@ -134,6 +139,10 @@ def run_doctor(config_path: Path | None = None) -> DoctorReport:
         check_python_version(),
         check_config_file(path),
         config_check,
+        check_mcp_channel_coverage(
+            contexts_path=contexts_path,
+            log_dir=log_dir,
+        ),
         check_owner_dm_channel_id(config),
         check_owner_user_id(config),
         check_slack_bot_token(
@@ -533,6 +542,132 @@ def check_slack_slash_commands(
         message=(
             "No recent bridge evidence confirmed all slash commands. "
             "Type `/engram` in Slack; it should autocomplete."
+        ),
+        details=details,
+    )
+
+
+def check_mcp_channel_coverage(
+    *,
+    contexts_path: Path | None = None,
+    log_dir: Path | None = None,
+    configured_servers: dict[str, dict[str, Any]] | None = None,
+    now: Callable[[], datetime.datetime] | None = None,
+) -> DoctorCheck:
+    coverage = audit_mcp_channel_coverage(
+        contexts_path=contexts_path,
+        configured_servers=configured_servers,
+    )
+    details: dict[str, Any] = {
+        "inventory_path": str(coverage.inventory_path),
+        "contexts_path": str(contexts_path or (Path.home() / ".engram" / "contexts")),
+        "configured_servers": coverage.configured_servers,
+        "team_channels": coverage.team_channels,
+        "team_manifest_paths": {
+            channel_id: str(path)
+            for channel_id, path in coverage.team_manifest_paths.items()
+        },
+        "allowed_by_channel": coverage.allowed_by_channel,
+        "uncovered_servers": coverage.uncovered_servers,
+        "invalid_manifest_paths": [
+            str(path) for path in coverage.invalid_manifest_paths
+        ],
+    }
+
+    clock = now or (lambda: datetime.datetime.now(datetime.UTC))
+    window_end = clock()
+    if window_end.tzinfo is None:
+        window_end = window_end.replace(tzinfo=datetime.UTC)
+    cutoff = window_end - MCP_EXCLUSION_LOG_WINDOW
+    recent_exclusions = _collect_recent_mcp_exclusion_evidence(
+        (log_dir or (Path.home() / ".engram" / "logs")).expanduser(),
+        cutoff=cutoff,
+        window_end=window_end,
+    )
+    if recent_exclusions:
+        details["recent_exclusions"] = recent_exclusions
+
+    # GRO-532 fix: invalid manifests must surface as WARN, not silent PASS.
+    # Previously check_mcp_channel_coverage collected
+    # `coverage.invalid_manifest_paths` into details but never branched on it,
+    # so a corrupted team manifest would fall through to one of the PASS
+    # branches below and the operator would be told everything is fine.
+    if coverage.invalid_manifest_paths:
+        bad = ", ".join(str(p) for p in coverage.invalid_manifest_paths)
+        return DoctorCheck(
+            id="mcp_channel_coverage",
+            name="MCP channel coverage",
+            status=CheckStatus.WARN,
+            message=(
+                f"Could not parse {len(coverage.invalid_manifest_paths)} "
+                f"team channel manifest(s): {bad}. "
+                "Coverage analysis is incomplete until they are repaired "
+                "or removed."
+            ),
+            details=details,
+        )
+
+    if not coverage.configured_servers:
+        return DoctorCheck(
+            id="mcp_channel_coverage",
+            name="MCP channel coverage",
+            status=CheckStatus.PASS,
+            message="No user MCP servers are registered in ~/.claude.json.",
+            details=details,
+        )
+
+    if not coverage.team_channels:
+        return DoctorCheck(
+            id="mcp_channel_coverage",
+            name="MCP channel coverage",
+            status=CheckStatus.PASS,
+            message=(
+                "No team channel manifests exist yet. Owner DMs auto-discover "
+                "user MCPs from ~/.claude.json."
+            ),
+            details=details,
+        )
+
+    # GRO-532 fix: surface recent_exclusions independently of uncovered_servers.
+    # If the audit thinks coverage is globally fine but a real per-channel
+    # exclusion was recently logged, the operator needs to see it. Without
+    # this branch, exclusions only surfaced when global coverage already
+    # failed, hiding per-channel issues behind global PASS.
+    if not coverage.uncovered_servers:
+        if recent_exclusions:
+            return DoctorCheck(
+                id="mcp_channel_coverage",
+                name="MCP channel coverage",
+                status=CheckStatus.WARN,
+                message=(
+                    "Coverage looks complete globally, but recent bridge "
+                    "logs recorded mcp.excluded_by_manifest events. Some "
+                    "team channels may still be filtering MCPs you expect "
+                    "to be available; check `recent_exclusions` in details."
+                ),
+                details=details,
+            )
+        return DoctorCheck(
+            id="mcp_channel_coverage",
+            name="MCP channel coverage",
+            status=CheckStatus.PASS,
+            message="Every user MCP is allowed in at least one strict team channel manifest.",
+            details=details,
+        )
+
+    servers = ", ".join(coverage.uncovered_servers)
+    suffix = ""
+    if recent_exclusions:
+        suffix = " Recent bridge logs already recorded mcp.excluded_by_manifest."
+    return DoctorCheck(
+        id="mcp_channel_coverage",
+        name="MCP channel coverage",
+        status=CheckStatus.WARN,
+        message=(
+            f"Registered in ~/.claude.json but allowed in no team channel manifests: {servers}. "
+            "Fix: add each server under mcp_servers.allowed in "
+            "~/.engram/contexts/<channel-id>/.claude/channel-manifest.yaml."
+            f"{suffix}"
         ),
         details=details,
     )
@@ -1178,6 +1313,47 @@ def _collect_slack_slash_command_evidence(
         "observed_commands": sorted(observed_commands),
         "missing_signals": missing_signals,
     }
+
+
+def _collect_recent_mcp_exclusion_evidence(
+    log_dir: Path,
+    *,
+    cutoff: datetime.datetime,
+    window_end: datetime.datetime,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for path in _recent_engram_log_paths(log_dir, cutoff=cutoff, window_end=window_end):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            payload = _parse_json_payload(line)
+            if payload.get("event") != "mcp.excluded_by_manifest":
+                continue
+            timestamp = _parse_doctor_log_timestamp(payload.get("timestamp"))
+            if timestamp is None or timestamp < cutoff or timestamp > window_end:
+                continue
+            channel_id = _optional_str(payload.get("channel_id"))
+            mcp_name = _optional_str(payload.get("mcp_name"))
+            reason = _optional_str(payload.get("reason"))
+            if channel_id is None or mcp_name is None or reason is None:
+                continue
+            key = (channel_id, mcp_name, reason)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "channel_id": channel_id,
+                    "mcp_name": mcp_name,
+                    "reason": reason,
+                    "timestamp": timestamp.isoformat(),
+                }
+            )
+    rows.sort(key=lambda item: (item["channel_id"], item["mcp_name"], item["reason"]))
+    return rows
 
 
 def _recent_engram_log_paths(

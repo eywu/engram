@@ -11,6 +11,7 @@ Walks the user through first-time configuration:
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import sys
@@ -22,6 +23,7 @@ from rich import print as rprint
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
+from engram import paths
 from engram.config import DEFAULT_CONFIG_PATH
 from engram.launchd import (
     find_repo_root,
@@ -33,7 +35,14 @@ from engram.launchd import (
     write_bridge_env_file,
     write_plist,
 )
-from engram.mcp import load_claude_mcp_servers
+from engram.mcp import (
+    MCPChannelCoverage,
+    audit_mcp_channel_coverage,
+    load_claude_mcp_servers,
+    write_mcp_inventory_state,
+)
+from engram.mcp_onboarding import sync_team_channel_mcp_allow_lists
+from engram.mcp_trust import resolve_mcp_server_trust
 
 console = Console()
 
@@ -231,8 +240,12 @@ def _step_gemini() -> str | None:
 
 def _step_mcp_inventory() -> None:
     rprint("[bold]Step 5 — MCP Inventory[/bold]")
-    rprint("Engram is MCP-agnostic. It reads the same [italic]~/.claude.json[/italic] inventory that Claude Code uses.")
+    rprint(
+        "Engram is MCP-agnostic. It reads the same [italic]~/.claude.json[/italic] "
+        "inventory that Claude Code uses, not [italic]~/.claude/mcp.json[/italic]."
+    )
     found = load_claude_mcp_servers()
+    coverage = audit_mcp_channel_coverage()
 
     if not found:
         rprint("  [dim]no MCP servers configured (zero-MCP is a supported setup)[/dim]")
@@ -240,8 +253,37 @@ def _step_mcp_inventory() -> None:
         for name in found:
             rprint(f"  [green]•[/green] {name}  [dim](~/.claude.json)[/dim]")
     rprint()
-    rprint("  Note: this is the shared user inventory. Channel manifests still")
-    rprint("  gate which MCPs are allowed in each team channel.")
+    rprint("  Owner DMs auto-discover from this shared user inventory.")
+    rprint("  Team channels still gate MCPs per manifest with strict allow-lists.")
+    if coverage.uncovered_servers and coverage.team_channels:
+        servers = ", ".join(coverage.uncovered_servers)
+        rprint()
+        rprint(
+            "  [yellow]⚠[/yellow] Registered but not yet allowed in any team channel "
+            f"manifest: {servers}"
+        )
+        rprint(
+            "    Fix: add each server under [italic]mcp_servers.allowed[/italic] in "
+            "[cyan]~/.engram/contexts/<channel-id>/.claude/channel-manifest.yaml[/cyan]"
+        )
+        _maybe_sync_team_channel_mcp_allow_lists(found, coverage)
+    write_mcp_inventory_state(found, home=paths.engram_home())
+
+
+def _maybe_sync_team_channel_mcp_allow_lists(
+    configured_servers: dict[str, dict[str, object]],
+    coverage: MCPChannelCoverage,
+) -> None:
+    asyncio.run(
+        sync_team_channel_mcp_allow_lists(
+            configured_servers,
+            coverage,
+            home=paths.engram_home(),
+            confirm=lambda message, default: Confirm.ask(message, default=default),
+            printer=rprint,
+            trust_resolver=resolve_mcp_server_trust,
+        )
+    )
 
 
 def _write_config(
