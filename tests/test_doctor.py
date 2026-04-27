@@ -214,6 +214,110 @@ def test_check_mcp_channel_coverage_warns_on_uncovered_inventory(
     ]
 
 
+def test_check_mcp_channel_coverage_warns_on_invalid_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GRO-532 regression: invalid team manifests must produce WARN, not
+    silent PASS. Previously `coverage.invalid_manifest_paths` was
+    collected into details but never branched on, so a corrupted manifest
+    fell through to the global PASS branches below.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude.json").write_text(
+        json.dumps({"mcpServers": {"camoufox": {"command": "camoufox-mcp"}}}),
+        encoding="utf-8",
+    )
+    home = tmp_path / ".engram"
+    provision_channel(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#growth",
+        home=home,
+    )
+    # Corrupt the team manifest on disk.
+    from engram.paths import channel_manifest_path
+
+    bad_path = channel_manifest_path("C07TEAM", home)
+    bad_path.write_text("this is: not: valid: yaml: : :\n\t- broken\n", encoding="utf-8")
+
+    check = check_mcp_channel_coverage(
+        contexts_path=home / "contexts",
+        log_dir=home / "logs",
+        now=lambda: datetime.datetime(2026, 4, 25, 12, 30, tzinfo=datetime.UTC),
+    )
+
+    assert check.status == CheckStatus.WARN
+    assert "Could not parse" in check.message
+    assert "C07TEAM" in check.message or str(bad_path) in check.message
+
+
+def test_check_mcp_channel_coverage_warns_on_recent_exclusions_when_globally_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GRO-532 regression: if global coverage looks fine but per-channel
+    exclusions were recently logged, escalate to WARN. Without this branch,
+    a per-channel exclusion would be hidden behind global PASS.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude.json").write_text(
+        json.dumps({"mcpServers": {"camoufox": {"command": "camoufox-mcp"}}}),
+        encoding="utf-8",
+    )
+    home = tmp_path / ".engram"
+    # Two team channels: A allows camoufox (so global coverage passes),
+    # B silently filtered it (recent exclusion logged).
+    for cid in ("C07A", "C07B"):
+        provision_channel(
+            cid,
+            identity=IdentityTemplate.TASK_ASSISTANT,
+            label="#x",
+            home=home,
+        )
+    # Hand-write to bypass the trust gate (the gate exists for a reason
+    # in production; tests need adversarial setup states).
+    import yaml
+
+    from engram.paths import channel_manifest_path
+
+    pa = channel_manifest_path("C07A", home)
+    payload_a = yaml.safe_load(pa.read_text())
+    payload_a["mcp_servers"] = {
+        "allowed": ["engram-memory", "camoufox"],
+        "disallowed": [],
+    }
+    pa.write_text(yaml.safe_dump(payload_a, sort_keys=False), encoding="utf-8")
+    _write_bridge_log(
+        home / "logs",
+        log_date=datetime.date(2026, 4, 25),
+        rows=[
+            {
+                "timestamp": "2026-04-25T12:00:00Z",
+                "event": "mcp.excluded_by_manifest",
+                "channel_id": "C07B",
+                "mcp_name": "camoufox",
+                "reason": "not_in_allowed",
+            }
+        ],
+    )
+
+    check = check_mcp_channel_coverage(
+        contexts_path=home / "contexts",
+        log_dir=home / "logs",
+        now=lambda: datetime.datetime(2026, 4, 25, 12, 30, tzinfo=datetime.UTC),
+    )
+
+    # Global coverage shows camoufox covered (by C07A), but recent
+    # exclusions show C07B filtering it. The check must escalate to WARN.
+    assert check.status == CheckStatus.WARN
+    assert "recent" in check.message.lower() or "excluded" in check.message.lower()
+    assert check.details["uncovered_servers"] == []
+    assert any(
+        ev["channel_id"] == "C07B" for ev in check.details["recent_exclusions"]
+    )
+
+
 def test_check_slack_app_token_requires_xapp_prefix(tmp_path: Path) -> None:
     cfg = EngramConfig(
         slack=SlackConfig(bot_token="xoxb-test", app_token="bad-token"),

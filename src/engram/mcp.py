@@ -294,11 +294,22 @@ def audit_mcp_channel_coverage(
             if manifest.is_owner_dm():
                 continue
 
-            allowed = list(manifest.mcp_servers.allowed or [])
+            # GRO-532 fix: subtract disallowed BEFORE recording channel
+            # coverage. A channel with `allowed: [foo]` AND `disallowed: [foo]`
+            # has zero effective access to foo (see resolve_team_mcp_servers
+            # below which applies the same filter). Without this subtraction,
+            # the audit reports false-positive PASS when an MCP is allowed in
+            # one team channel but disallowed in another, or even when allowed
+            # and disallowed in the same channel.
+            allowed_raw = list(manifest.mcp_servers.allowed or [])
+            disallowed = list(manifest.mcp_servers.disallowed or [])
+            effective_allowed = [
+                name for name in allowed_raw if name not in disallowed
+            ]
             team_channels.append(manifest.channel_id)
             team_manifest_paths[manifest.channel_id] = manifest_path
-            allowed_by_channel[manifest.channel_id] = allowed
-            allowed_anywhere.update(allowed)
+            allowed_by_channel[manifest.channel_id] = effective_allowed
+            allowed_anywhere.update(effective_allowed)
 
     uncovered_servers = [
         name for name in configured if name not in allowed_anywhere

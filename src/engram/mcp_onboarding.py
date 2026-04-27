@@ -55,6 +55,10 @@ async def sync_team_channel_mcp_allow_lists(
     if not servers_to_sync:
         return False
 
+    # GRO-532 fix: surface broken manifests to the operator instead of
+    # silently skipping them. A wizard run that says "no team manifest
+    # changes applied" with two corrupted manifests is silently failing.
+    # The operator needs to know which manifests need repair.
     manifests: list[tuple[object, Path]] = []
     for channel_id in coverage.team_channels:
         manifest_path = coverage.team_manifest_paths.get(channel_id)
@@ -62,7 +66,11 @@ async def sync_team_channel_mcp_allow_lists(
             continue
         try:
             manifests.append((load_manifest(manifest_path), manifest_path))
-        except ManifestError:
+        except ManifestError as exc:
+            printer(
+                f"  [yellow]⚠[/yellow] could not parse {manifest_path}: "
+                f"{exc}. Skipping this channel."
+            )
             continue
 
     if not manifests:
@@ -171,6 +179,15 @@ async def maybe_prompt_for_new_mcp_servers(
         write_mcp_inventory_state(configured, home=home_path)
         return []
 
+    # GRO-532 fix: only mark these MCPs as "acknowledged" in the
+    # inventory state file after a successful sync OR after the
+    # operator explicitly dismissed the prompt. Previously the state
+    # file was always written at the end of this function, which meant
+    # that if all manifests were malformed (silently skipped) or the
+    # interactive sync failed for any reason, the next Engram startup
+    # would not re-prompt and the new MCP would have no team-channel
+    # coverage forever.
+    sync_succeeded = False
     if interactive:
         servers = ", ".join(new_uncovered)
         printer("")
@@ -182,7 +199,7 @@ async def maybe_prompt_for_new_mcp_servers(
             "  Owner DMs can use them already. Team channels still need "
             "[italic]mcp_servers.allowed[/italic] entries."
         )
-        await sync_team_channel_mcp_allow_lists(
+        sync_succeeded = await sync_team_channel_mcp_allow_lists(
             configured,
             current_coverage,
             home=home_path,
@@ -203,5 +220,15 @@ async def maybe_prompt_for_new_mcp_servers(
             if inspect.isawaitable(maybe_awaitable):
                 await maybe_awaitable
 
-    write_mcp_inventory_state(configured, home=home_path)
+    # State-write policy:
+    # - non-interactive (bridge daemon path): the owner_alert WAS the
+    #   action. Advance the state; re-alerting on every bridge restart
+    #   would be spammy. The operator can act on the alert manually.
+    # - interactive: only advance when at least one manifest was actually
+    #   updated. If the operator declined the prompt or the sync failed
+    #   (e.g. all manifests malformed and skipped — see Fix 3 above), do
+    #   NOT consume the prompt; the next startup should re-prompt so the
+    #   new MCP doesn't get stuck without team-channel coverage forever.
+    if not interactive or sync_succeeded:
+        write_mcp_inventory_state(configured, home=home_path)
     return new_uncovered

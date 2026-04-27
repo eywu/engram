@@ -587,6 +587,26 @@ def check_mcp_channel_coverage(
     if recent_exclusions:
         details["recent_exclusions"] = recent_exclusions
 
+    # GRO-532 fix: invalid manifests must surface as WARN, not silent PASS.
+    # Previously check_mcp_channel_coverage collected
+    # `coverage.invalid_manifest_paths` into details but never branched on it,
+    # so a corrupted team manifest would fall through to one of the PASS
+    # branches below and the operator would be told everything is fine.
+    if coverage.invalid_manifest_paths:
+        bad = ", ".join(str(p) for p in coverage.invalid_manifest_paths)
+        return DoctorCheck(
+            id="mcp_channel_coverage",
+            name="MCP channel coverage",
+            status=CheckStatus.WARN,
+            message=(
+                f"Could not parse {len(coverage.invalid_manifest_paths)} "
+                f"team channel manifest(s): {bad}. "
+                "Coverage analysis is incomplete until they are repaired "
+                "or removed."
+            ),
+            details=details,
+        )
+
     if not coverage.configured_servers:
         return DoctorCheck(
             id="mcp_channel_coverage",
@@ -608,7 +628,25 @@ def check_mcp_channel_coverage(
             details=details,
         )
 
+    # GRO-532 fix: surface recent_exclusions independently of uncovered_servers.
+    # If the audit thinks coverage is globally fine but a real per-channel
+    # exclusion was recently logged, the operator needs to see it. Without
+    # this branch, exclusions only surfaced when global coverage already
+    # failed, hiding per-channel issues behind global PASS.
     if not coverage.uncovered_servers:
+        if recent_exclusions:
+            return DoctorCheck(
+                id="mcp_channel_coverage",
+                name="MCP channel coverage",
+                status=CheckStatus.WARN,
+                message=(
+                    "Coverage looks complete globally, but recent bridge "
+                    "logs recorded mcp.excluded_by_manifest events. Some "
+                    "team channels may still be filtering MCPs you expect "
+                    "to be available; check `recent_exclusions` in details."
+                ),
+                details=details,
+            )
         return DoctorCheck(
             id="mcp_channel_coverage",
             name="MCP channel coverage",
