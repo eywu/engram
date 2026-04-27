@@ -22,6 +22,7 @@ READY_LOG="/tmp/engram.bridge.out.log"
 NIGHTLY_PLIST_SRC="$REPO_ROOT/launchd/com.engram.v3.nightly.plist"
 NIGHTLY_PLIST_DST="$HOME/Library/LaunchAgents/com.engram.v3.nightly.plist"
 NIGHTLY_SERVICE_LABEL="com.engram.v3.nightly"
+DEFAULT_BRIDGE_PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 MODE="bridge"
 case "${1:-}" in
@@ -103,6 +104,140 @@ resolve_bridge_env_file() {
     exit 1
 }
 
+list_node_dependent_mcps() {
+    python3 - "$HOME/.claude.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1]).expanduser()
+if not path.exists():
+    raise SystemExit(0)
+
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+
+servers = payload.get("mcpServers")
+if not isinstance(servers, dict):
+    raise SystemExit(0)
+
+for name, config in servers.items():
+    if not isinstance(name, str) or not isinstance(config, dict):
+        continue
+    command = str(config.get("command") or "").strip()
+    if command in {"npx", "node"}:
+        print(f"{name}\t{command}")
+PY
+}
+
+resolve_nvm_node_bin_dir() {
+    local nvm_dir="${NVM_DIR:-$HOME/.nvm}"
+    local nvm_sh="$nvm_dir/nvm.sh"
+    local current=""
+    local candidate=""
+
+    if [[ ! -s "$nvm_sh" ]]; then
+        return 0
+    fi
+
+    current="$(
+        NVM_DIR="$nvm_dir" bash -lc '
+            if [[ -s "$NVM_DIR/nvm.sh" ]]; then
+                . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
+                nvm current 2>/dev/null
+            fi
+        ' 2>/dev/null | tail -n 1 | tr -d '\r'
+    )"
+    if [[ -z "$current" || "$current" == "none" || "$current" == "system" ]]; then
+        return 0
+    fi
+
+    candidate="$nvm_dir/versions/node/$current/bin"
+    if [[ -x "$candidate/npx" || -x "$candidate/node" ]]; then
+        printf '%s\n' "$candidate"
+    fi
+}
+
+resolve_login_shell_node_bin_dir() {
+    local shell_bin="${SHELL:-/bin/zsh}"
+    local resolved=""
+
+    resolved="$("$shell_bin" -lic 'command -v npx || command -v node' 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$resolved" ]]; then
+        dirname "$resolved"
+    fi
+}
+
+resolve_node_bin_dir() {
+    local detected=""
+
+    detected="$(resolve_nvm_node_bin_dir)"
+    if [[ -n "$detected" ]]; then
+        printf '%s\n' "$detected"
+        return
+    fi
+
+    detected="$(resolve_login_shell_node_bin_dir)"
+    if [[ -n "$detected" ]]; then
+        printf '%s\n' "$detected"
+    fi
+}
+
+path_contains_dir() {
+    local path_value="$1"
+    local candidate="$2"
+    [[ ":$path_value:" == *":$candidate:"* ]]
+}
+
+build_bridge_path() {
+    local node_bin_dir="$1"
+
+    if [[ -n "$node_bin_dir" ]] && ! path_contains_dir "$DEFAULT_BRIDGE_PATH" "$node_bin_dir"; then
+        printf '%s:%s\n' "$node_bin_dir" "$DEFAULT_BRIDGE_PATH"
+        return
+    fi
+
+    printf '%s\n' "$DEFAULT_BRIDGE_PATH"
+}
+
+command_resolves_in_path() {
+    local path_value="$1"
+    local command_name="$2"
+    local dir=""
+    local -a parts=()
+
+    IFS=':' read -r -a parts <<< "$path_value"
+    for dir in "${parts[@]}"; do
+        if [[ -x "$dir/$command_name" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+require_node_for_mcps_if_needed() {
+    local bridge_path="$1"
+    local found_configured=0
+    local name=""
+    local command_name=""
+
+    while IFS=$'\t' read -r name command_name; do
+        found_configured=1
+        if command_resolves_in_path "$bridge_path" "$command_name"; then
+            continue
+        fi
+
+        echo "error: Found ${command_name}-based MCP \`$name\` in ~/.claude.json but ${command_name} is not on a stable path. Install Node via Homebrew (\`brew install node\`) or run \`nvm use --lts\` and rerun this installer." >&2
+        exit 1
+    done < <(list_node_dependent_mcps)
+
+    if [[ "$found_configured" -eq 0 ]]; then
+        return
+    fi
+}
+
 install_nightly() {
     local wrapper="$REPO_ROOT/scripts/engram_nightly_launchd.sh"
     local domain="gui/$(id -u)"
@@ -164,7 +299,14 @@ echo "==> uv:        $UV_BIN"
 echo "==> plist dst: $PLIST_DST"
 
 BRIDGE_ENV_FILE="$(resolve_bridge_env_file)"
+NODE_BIN_DIR="$(resolve_node_bin_dir)"
+BRIDGE_PATH="$(build_bridge_path "${NODE_BIN_DIR:-}")"
+require_node_for_mcps_if_needed "$BRIDGE_PATH"
+
 echo "==> env file:  $BRIDGE_ENV_FILE"
+if [[ -n "${NODE_BIN_DIR:-}" && "$BRIDGE_PATH" != "$DEFAULT_BRIDGE_PATH" ]]; then
+    echo "==> node bin:  $NODE_BIN_DIR"
+fi
 
 # 2. Render the plist
 mkdir -p "$HOME/Library/LaunchAgents"
@@ -173,6 +315,7 @@ sed \
     -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/engram-repo|$(escape_sed_replacement "$REPO_ROOT")|g" \
     -e "s|/REPLACE/WITH/HOME|$(escape_sed_replacement "$HOME")|g" \
     -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/engram.env|$(escape_sed_replacement "$BRIDGE_ENV_FILE")|g" \
+    -e "s|/REPLACE/WITH/OPTIONAL/NODE/PATH/PREFIX/|$(escape_sed_replacement "${BRIDGE_PATH%"$DEFAULT_BRIDGE_PATH"}")|g" \
     "$PLIST_SRC" > "$PLIST_DST"
 echo "==> wrote $PLIST_DST"
 

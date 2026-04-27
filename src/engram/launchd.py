@@ -17,6 +17,7 @@ _PLACEHOLDER_UV_BIN = "/REPLACE/WITH/ABSOLUTE/PATH/TO/uv"
 _PLACEHOLDER_REPO_ROOT = "/REPLACE/WITH/ABSOLUTE/PATH/TO/engram-repo"
 _PLACEHOLDER_HOME = "/REPLACE/WITH/HOME"
 _PLACEHOLDER_ENV_FILE = "/REPLACE/WITH/ABSOLUTE/PATH/TO/engram.env"
+_PLACEHOLDER_OPTIONAL_NODE_PATH_PREFIX = "/REPLACE/WITH/OPTIONAL/NODE/PATH/PREFIX/"
 _BRIDGE_PROGRAM_ARGUMENTS = (
     "run",
     "--project",
@@ -28,6 +29,9 @@ _BRIDGE_LOG_PATHS = {
     "StandardOutPath": "/tmp/engram.bridge.out.log",
     "StandardErrorPath": "/tmp/engram.bridge.err.log",
 }
+_DEFAULT_BRIDGE_PATH = (
+    f"{_PLACEHOLDER_HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+)
 _BRIDGE_ENV_KEYS = ("PATH", "LANG", "HOME", "ENGRAM_ENV_FILE")
 _BRIDGE_KEEPALIVE = {"SuccessfulExit": False, "Crashed": True}
 _BRIDGE_RESOURCE_LIMITS = {
@@ -131,6 +135,7 @@ def render_bridge_plist(
         _PLACEHOLDER_REPO_ROOT: str(repo_root),
         _PLACEHOLDER_HOME: str((home or Path.home()).resolve()),
         _PLACEHOLDER_ENV_FILE: str(env_file),
+        _PLACEHOLDER_OPTIONAL_NODE_PATH_PREFIX: "",
     }
     rendered = _replace_placeholders(template, replacements)
     if not isinstance(rendered, dict):
@@ -184,6 +189,16 @@ def setup_bridge_plist_issues(
         )
     else:
         for key, value in expected_env.items():
+            if key == "PATH":
+                issues.extend(
+                    _check_bridge_path(
+                        "env_vars",
+                        f"EnvironmentVariables.{key}",
+                        installed_env.get(key),
+                        value,
+                    )
+                )
+                continue
             _check_exact(
                 issues,
                 "env_vars",
@@ -359,6 +374,21 @@ def _check_exact(
     if actual == expected:
         return
     issues.append(PlistIssue(category=category, path=path, expected=expected, actual=actual))
+
+
+def _check_bridge_path(
+    category: str,
+    path: str,
+    actual: Any,
+    expected: Any,
+) -> list[PlistIssue]:
+    if (
+        isinstance(actual, str)
+        and isinstance(expected, str)
+        and (actual == expected or actual.endswith(f":{expected}"))
+    ):
+        return []
+    return [PlistIssue(category=category, path=path, expected=expected, actual=actual)]
 
 
 def _check_nonempty_str(

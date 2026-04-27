@@ -35,7 +35,7 @@
         <!-- Keep in sync with the smoke-test launchd env. HOME is explicit so
              ~/.engram resolves the same way under launchd and a login shell. -->
         <key>PATH</key>
-        <string>/REPLACE/WITH/HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/REPLACE/WITH/OPTIONAL/NODE/PATH/PREFIX//REPLACE/WITH/HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
         <string>/REPLACE/WITH/HOME</string>
         <key>LANG</key>

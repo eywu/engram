@@ -229,6 +229,14 @@ That pinned `ENGRAM_ENV_FILE` is how the launchd-managed bridge receives
 reboots, or crashes. If none of those files exists, the installer stops
 and tells you to either export `ENGRAM_ENV_FILE` or run `engram setup`.
 
+The installer also checks for Node-based MCP runtimes. If your
+`~/.claude.json` includes an MCP whose `command` is `npx` or `node`, the
+installer tries to detect the active Node bin directory and prepends it to
+the bridge plist `PATH` when needed. If detection fails, the install stops
+with an explicit fix: either install Node on a stable path with
+`brew install node`, or run `nvm use --lts` and rerun
+`./scripts/install_launchd.sh`.
+
 ### Nightly memory synthesis (also recommended)
 
 ```bash
