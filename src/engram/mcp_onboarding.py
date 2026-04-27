@@ -1,7 +1,6 @@
 """Operator-facing MCP onboarding helpers."""
 from __future__ import annotations
 
-import hashlib
 import inspect
 import logging
 from collections.abc import Awaitable, Callable
@@ -14,7 +13,7 @@ from rich.prompt import Confirm
 from engram import paths
 from engram.manifest import (
     ManifestError,
-    MCPManifestChangePlan,
+    build_mcp_manifest_change_plan,
     load_manifest,
     persist_approved_mcp_manifest_change,
 )
@@ -24,6 +23,10 @@ from engram.mcp import (
     detect_new_user_mcp_servers,
     load_claude_mcp_servers,
     write_mcp_inventory_state,
+)
+from engram.mcp_manifest_gate import (
+    MCPApprovalDisposition,
+    request_approved_mcp_manifest_change,
 )
 from engram.mcp_trust import MCPTrustTier, resolve_mcp_server_trust
 
@@ -54,32 +57,45 @@ async def sync_team_channel_mcp_allow_lists(
     trust_resolver: Callable[..., Awaitable[Any]] = resolve_mcp_server_trust,
 ) -> bool:
     """Interactively add uncovered MCPs to existing strict team manifests."""
-    target_filter = set(target_servers or coverage.uncovered_servers)
-    servers_to_sync = [
-        name for name in coverage.uncovered_servers if name in target_filter
+    target_filter = set(target_servers) if target_servers is not None else None
+    requested_servers = [
+        name for name in configured_servers if target_filter is None or name in target_filter
     ]
-    if not servers_to_sync:
+    manifests: list[tuple[object, Path]] = []
+    missing_pairs = 0
+    if not requested_servers:
         return False
 
     # GRO-532 fix: surface broken manifests to the operator instead of
     # silently skipping them. A wizard run that says "no team manifest
     # changes applied" with two corrupted manifests is silently failing.
     # The operator needs to know which manifests need repair.
-    manifests: list[tuple[object, Path]] = []
     for channel_id in coverage.team_channels:
         manifest_path = coverage.team_manifest_paths.get(channel_id)
         if manifest_path is None:
             continue
         try:
-            manifests.append((load_manifest(manifest_path), manifest_path))
+            manifest = load_manifest(manifest_path)
         except ManifestError as exc:
             printer(
                 f"  [yellow]⚠[/yellow] could not parse {manifest_path}: "
                 f"{exc}. Skipping this channel."
             )
             continue
+        manifests.append((manifest, manifest_path))
+        effective_allowed = {
+            name
+            for name in (manifest.mcp_servers.allowed or [])
+            if name not in manifest.mcp_servers.disallowed
+        }
+        missing_pairs += sum(
+            1 for server_name in requested_servers if server_name not in effective_allowed
+        )
+    if not manifests or missing_pairs == 0:
+        return False
 
-    if not manifests:
+    servers_to_sync = requested_servers
+    if not servers_to_sync:
         return False
 
     ask = confirm or (lambda message, default: Confirm.ask(message, default=default))
@@ -92,27 +108,18 @@ async def sync_team_channel_mcp_allow_lists(
     home_path = paths.engram_home(home)
     changed_any = False
     for server_name in servers_to_sync:
-        decision = await trust_resolver(
-            server_name,
-            configured_servers.get(server_name),
-            home=home_path,
-        )
-        if decision.tier == MCPTrustTier.UNKNOWN:
-            summary = decision.trust_summary or decision.reason or "metadata unavailable"
-            printer(
-                f"  [yellow]⚠[/yellow] {server_name} is [italic]{decision.tier.value}[/italic] "
-                f"({summary}). Explicit confirmation required per channel."
-            )
-
         for idx, (manifest, manifest_path) in enumerate(manifests):
             allowed = list(manifest.mcp_servers.allowed or [])
-            if server_name in allowed:
+            effective_allowed = [
+                name for name in allowed if name not in manifest.mcp_servers.disallowed
+            ]
+            if server_name in effective_allowed:
                 continue
 
             channel_label = manifest.label or manifest.channel_id
             should_allow = ask(
                 f"  Allow [cyan]{server_name}[/cyan] in {channel_label} ({manifest.channel_id})?",
-                decision.tier != MCPTrustTier.UNKNOWN,
+                True,
             )
             if not should_allow:
                 continue
@@ -125,19 +132,48 @@ async def sync_team_channel_mcp_allow_lists(
                     )
                 }
             )
+            plan = build_mcp_manifest_change_plan(manifest_path, updated_manifest)
+            if plan is None:
+                manifests[idx] = (load_manifest(manifest_path), manifest_path)
+                continue
+
+            async def _confirm_unknown(
+                _plan,
+                decisions,
+                _server_name: str = server_name,
+                _channel_id: str = manifest.channel_id,
+                _channel_label: str = channel_label,
+            ):
+                decision = decisions[0]
+                summary = decision.trust_summary or decision.reason or "metadata unavailable"
+                printer(
+                    f"  [yellow]⚠[/yellow] {_server_name} is [italic]{decision.tier.value}[/italic] "
+                    f"({summary}). Explicit confirmation required per channel."
+                )
+                approved = ask(
+                    f"  Trust-gate allow [cyan]{_server_name}[/cyan] in {_channel_label} "
+                    f"({_channel_id}) despite unknown tier?",
+                    False,
+                )
+                return (
+                    MCPApprovalDisposition.APPROVED
+                    if approved
+                    else MCPApprovalDisposition.DENIED
+                )
+
+            approval = await request_approved_mcp_manifest_change(
+                plan,
+                channel_label=channel_label,
+                confirm_unknown=_confirm_unknown,
+                home=home_path,
+                inventory=configured_servers,
+                trust_resolver=trust_resolver,
+            )
+            if approval.plan is None:
+                continue
             try:
-                current_text = manifest_path.read_text(encoding="utf-8")
-                persist_approved_mcp_manifest_change(
-                    MCPManifestChangePlan(
-                        manifest_path=manifest_path,
-                        current_manifest=manifest,
-                        staged_manifest=updated_manifest,
-                        staged_text="",
-                        baseline_sha256=hashlib.sha256(
-                            current_text.encode("utf-8")
-                        ).hexdigest(),
-                        additions=[server_name],
-                    ),
+                _previous, persisted_manifest, _path = persist_approved_mcp_manifest_change(
+                    approval.plan,
                     audit_source=audit_source,
                 )
             except ManifestError as exc:
@@ -146,9 +182,10 @@ async def sync_team_channel_mcp_allow_lists(
                 )
                 continue
 
-            manifests[idx] = (updated_manifest, manifest_path)
+            manifests[idx] = (persisted_manifest, manifest_path)
             changed_any = True
             suffix = ""
+            decision = approval.decisions[0]
             if decision.tier == MCPTrustTier.COMMUNITY_TRUSTED:
                 summary = decision.trust_summary or decision.reason or "community-trusted"
                 suffix = f"  [dim](community-trusted: {summary})[/dim]"

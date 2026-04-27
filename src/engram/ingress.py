@@ -13,6 +13,7 @@ import contextlib
 import datetime
 import logging
 import re
+import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -30,6 +31,7 @@ from engram.egress import (
     _always_allow_label,
     _suggestion_label,
     build_footgun_confirmation_modal,
+    post_question,
     post_reply,
     post_upgrade_result_in_channel,
     post_yolo_expired_notification,
@@ -37,26 +39,29 @@ from engram.egress import (
     update_question_resolved,
     update_upgrade_request_dm,
 )
-from engram.hitl import PendingQuestion, _resolve_question
+from engram.hitl import PendingQuestion, _resolve_question, watch_pending_question
 from engram.manifest import (
     YOLO_DURATION_CHOICES,
     YOLO_MAX_DURATION,
     ChannelManifest,
+    ChannelMCPChangeStatus,
     ChannelStatus,
     ManifestError,
     PermissionTier,
+    apply_channel_mcp_change,
     dump_manifest,
     load_manifest,
     normalize_mcp_server_name,
     parse_permission_tier,
     permission_tier_choices_text,
     persist_yolo_demotion,
-    set_channel_mcp_server_access,
     set_channel_nightly_included,
     set_channel_permission_tier,
     validate_upgrade_duration,
 )
 from engram.mcp import render_channel_mcp_access
+from engram.mcp_manifest_gate import MCPApprovalDisposition
+from engram.mcp_trust import add_trusted_publishers, render_owner_approval_markdown
 from engram.notifications import (
     PENDING_CHANNEL_ACTION_ID_PATTERN,
     handle_pending_channel_action,
@@ -1598,14 +1603,121 @@ async def handle_mcp_command(
         )
         return {"ok": False, "error": "not owner"}
 
-    previous, updated, _manifest_path, normalized_name = set_channel_mcp_server_access(
+    hitl_config = router.hitl_config_for_channel(
+        source_channel_id,
+        manifest=manifest_for_auth,
+    )
+    block_reason: str | None = None
+
+    async def _confirm_unknown(approval_plan, decisions) -> MCPApprovalDisposition:
+        nonlocal block_reason
+        owner_dm_channel_id = config.owner_dm_channel_id or router.owner_dm_channel_id
+        owner_user_id = config.owner_user_id
+        if not owner_dm_channel_id or not owner_user_id:
+            block_reason = (
+                "Blocked MCP manifest update: owner approval is required for "
+                "untrusted MCPs, but owner_dm_channel_id or owner_user_id is unset."
+            )
+            return MCPApprovalDisposition.DENIED
+
+        allowed, reason = router.hitl_limiter.check(
+            source_channel_id,
+            max_per_day=hitl_config.max_per_day,
+        )
+        if not allowed:
+            if reason.startswith("another question already pending"):
+                block_reason = (
+                    "MCP trust approval is already pending in the owner DM. "
+                    "Wait for approval before retrying `/engram mcp allow`."
+                )
+            else:
+                block_reason = f"MCP trust approval unavailable: {reason}"
+            return MCPApprovalDisposition.DENIED
+
+        q = PendingQuestion(
+            permission_request_id=str(uuid.uuid4()),
+            channel_id=source_channel_id,
+            session_id=session.session_id,
+            turn_id=str(uuid.uuid4()),
+            tool_name="SlashCommand",
+            tool_input={"command": f"mcp {action} {server_name}"},
+            suggestions=[
+                {"name": "Approve once"},
+                {"name": "Approve + add publisher to trust list"},
+            ],
+            who_can_answer=owner_user_id,
+            posted_at=datetime.datetime.now(datetime.UTC),
+            timeout_s=hitl_config.timeout_s,
+            channel_manifest=manifest,
+            approval_channel_id=owner_dm_channel_id,
+            prompt_title="🔐 Owner approval required for MCP addition",
+            prompt_body_markdown=render_owner_approval_markdown(
+                channel_id=source_channel_id,
+                channel_label=manifest.label,
+                decisions=decisions,
+            ),
+            deny_button_label="Reject",
+        )
+
+        async def _apply_approved_manifest(_result) -> None:
+            if q.resolution_choice == "deny":
+                return
+            from engram.manifest import persist_approved_mcp_manifest_change
+
+            _previous, updated, _path = persist_approved_mcp_manifest_change(
+                approval_plan,
+                audit_source="channel_mcp_allow",
+            )
+            if q.resolution_choice == "1":
+                trusted_publishers = [
+                    (decision.registry, decision.publisher or "")
+                    for decision in decisions
+                    if decision.publisher
+                ]
+                add_trusted_publishers(
+                    trusted_publishers,
+                    home=router.home,
+                )
+            await router.invalidate(source_channel_id)
+            router.replace_cached_manifest(updated)
+
+        q.on_resolve = _apply_approved_manifest
+        router.hitl.register(q)
+        router.hitl_limiter.reserve(source_channel_id)
+        try:
+            channel_ts, thread_ts = await post_question(q, slack_client)
+            q.slack_channel_ts = channel_ts
+            q.slack_thread_ts = thread_ts
+        except Exception:
+            router.hitl.resolve(
+                q.permission_request_id,
+                PermissionResultDeny(message="failed to post question"),
+            )
+            router.hitl.cleanup_resolved()
+            block_reason = (
+                "Blocked MCP manifest update: failed to post owner approval request."
+            )
+            return MCPApprovalDisposition.DENIED
+        block_reason = (
+            "Owner approval requested in the owner DM. "
+            "The manifest was not updated yet."
+        )
+        watch_pending_question(router, q)
+        return MCPApprovalDisposition.PENDING
+
+    result = await apply_channel_mcp_change(
         source_channel_id,
         server_name,
         action=action,
         home=router.home,
+        confirm_unknown=_confirm_unknown if action == "allow" else None,
+        audit_source=f"channel_mcp_{action}",
     )
-    if previous == updated:
-        text = f"{decision.reason}\n\n{render_channel_mcp_access(previous)}"
+    if result.status == ChannelMCPChangeStatus.UNCHANGED:
+        text = (
+            f"{decision.reason}\n\n"
+            f"{render_channel_mcp_access(result.previous_manifest)}"
+        )
         await _post_ephemeral_reply(
             slack_client,
             channel_id=source_channel_id,
@@ -1613,6 +1725,22 @@ async def handle_mcp_command(
             text=text,
         )
         return {"ok": True, "action": action, "changed": False, "text": text}
+    if result.status == ChannelMCPChangeStatus.APPROVAL_PENDING:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=block_reason or "Owner approval requested in the owner DM.",
+        )
+        return {"ok": True, "action": action, "changed": False, "pending": True}
+    if result.status == ChannelMCPChangeStatus.APPROVAL_DENIED:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=block_reason or "Blocked MCP manifest update.",
+        )
+        return {"ok": False, "error": "approval_denied"}
 
     # GRO-531 fix: invalidate the live SDK session so MCP changes take effect
     # immediately. `replace_cached_manifest` only swaps the manifest reference;
@@ -1622,8 +1750,8 @@ async def handle_mcp_command(
     await router.invalidate(source_channel_id)
     verb = "Allowed" if action == "allow" else "Denied"
     text = (
-        f"{verb} MCP server `{normalized_name}`.\n\n"
-        f"{render_channel_mcp_access(updated)}"
+        f"{verb} MCP server `{result.normalized_name}`.\n\n"
+        f"{render_channel_mcp_access(result.updated_manifest)}"
     )
     await _post_ephemeral_reply(
         slack_client,
@@ -1635,7 +1763,7 @@ async def handle_mcp_command(
         "channel.mcp_access_updated channel_id=%s action=%s server=%s user_id=%s",
         source_channel_id,
         action,
-        normalized_name,
+        result.normalized_name,
         user_id,
     )
     return {"ok": True, "action": action, "changed": True, "text": text}

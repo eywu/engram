@@ -6,18 +6,48 @@ from pathlib import Path
 import pytest
 
 from engram.bootstrap import provision_channel
-from engram.manifest import IdentityTemplate
+from engram.manifest import (
+    IdentityTemplate,
+    build_mcp_manifest_change_plan,
+    load_manifest,
+    persist_approved_mcp_manifest_change,
+)
 from engram.mcp import (
+    audit_mcp_channel_coverage,
     claude_mcp_config_path,
     detect_new_user_mcp_servers,
     write_mcp_inventory_state,
 )
-from engram.mcp_onboarding import maybe_prompt_for_new_mcp_servers
+from engram.mcp_onboarding import (
+    maybe_prompt_for_new_mcp_servers,
+    sync_team_channel_mcp_allow_lists,
+)
+from engram.mcp_trust import MCPTrustDecision, MCPTrustTier
+from engram.paths import channel_manifest_path
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _allow_mcp_for_test(home: Path, channel_id: str, server_name: str) -> None:
+    manifest_path = channel_manifest_path(channel_id, home)
+    manifest = load_manifest(manifest_path)
+    updated = manifest.model_copy(
+        update={
+            "mcp_servers": manifest.mcp_servers.model_copy(
+                update={
+                    "allowed": list(
+                        dict.fromkeys([*(manifest.mcp_servers.allowed or []), server_name])
+                    )
+                }
+            )
+        }
+    )
+    plan = build_mcp_manifest_change_plan(manifest_path, updated)
+    assert plan is not None
+    persist_approved_mcp_manifest_change(plan)
 
 
 @pytest.mark.asyncio
@@ -104,6 +134,121 @@ async def test_maybe_prompt_for_new_mcp_servers_reuses_sync_flow_with_tty(
     assert calls["target_servers"] == ["camoufox"]
     assert calls["audit_source"] == "startup_prompt"
     assert any("New MCPs detected" in line for line in output)
+
+
+@pytest.mark.asyncio
+async def test_sync_team_channel_mcp_allow_lists_fills_partial_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    home = tmp_path / ".engram"
+    _write_json(
+        claude_mcp_config_path(),
+        {
+            "mcpServers": {
+                "camoufox": {"command": "camoufox-mcp"},
+            }
+        },
+    )
+    provision_channel(
+        "C07A",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#alpha",
+        home=home,
+    )
+    provision_channel(
+        "C07B",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#beta",
+        home=home,
+    )
+    _allow_mcp_for_test(home, "C07A", "camoufox")
+
+    coverage = audit_mcp_channel_coverage(contexts_path=home / "contexts")
+    assert coverage.uncovered_servers == []
+
+    async def trust_fake(_server_name, _server_config, *, home=None):
+        return MCPTrustDecision(
+            server_name="camoufox",
+            tier=MCPTrustTier.OFFICIAL,
+            registry="custom",
+            package_name="camoufox-mcp",
+            version="0.1.1",
+            trust_summary="official server",
+            reason="test fixture",
+        )
+
+    answers = iter([True, True])
+    changed = await sync_team_channel_mcp_allow_lists(
+        {"camoufox": {"command": "camoufox-mcp"}},
+        coverage,
+        home=home,
+        confirm=lambda *_args, **_kwargs: next(answers),
+        trust_resolver=trust_fake,
+    )
+
+    assert changed is True
+    assert load_manifest(channel_manifest_path("C07A", home)).mcp_servers.allowed == [
+        "engram-memory",
+        "camoufox",
+    ]
+    assert load_manifest(channel_manifest_path("C07B", home)).mcp_servers.allowed == [
+        "engram-memory",
+        "camoufox",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_team_channel_mcp_allow_lists_requires_unknown_tier_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    home = tmp_path / ".engram"
+    _write_json(
+        claude_mcp_config_path(),
+        {
+            "mcpServers": {
+                "camoufox": {"command": "camoufox-mcp"},
+            }
+        },
+    )
+    provision_channel(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#growth",
+        home=home,
+    )
+    coverage = audit_mcp_channel_coverage(contexts_path=home / "contexts")
+    output: list[str] = []
+
+    async def trust_fake(_server_name, _server_config, *, home=None):
+        return MCPTrustDecision(
+            server_name="camoufox",
+            tier=MCPTrustTier.UNKNOWN,
+            registry="custom",
+            package_name="camoufox-mcp",
+            version="0.1.1",
+            trust_summary="metadata lookup failed",
+            reason="metadata lookup failed",
+        )
+
+    answers = iter([True, True, False])
+    changed = await sync_team_channel_mcp_allow_lists(
+        {"camoufox": {"command": "camoufox-mcp"}},
+        coverage,
+        home=home,
+        confirm=lambda *_args, **_kwargs: next(answers),
+        printer=output.append,
+        trust_resolver=trust_fake,
+    )
+
+    assert changed is False
+    assert load_manifest(channel_manifest_path("C07TEAM", home)).mcp_servers.allowed == [
+        "engram-memory"
+    ]
+    assert any("camoufox is [italic]unknown[/italic]" in line for line in output)
 
 
 @pytest.mark.asyncio

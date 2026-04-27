@@ -19,9 +19,12 @@ from engram.manifest import (
     ChannelStatus,
     IdentityTemplate,
     PermissionTier,
+    build_mcp_manifest_change_plan,
     dump_manifest,
     load_manifest,
+    persist_approved_mcp_manifest_change,
 )
+from engram.mcp_trust import MCPTrustDecision, MCPTrustTier
 from engram.paths import channel_manifest_path
 
 
@@ -48,6 +51,25 @@ def _write_mcp_inventory(tmp_path: Path, payload: dict[str, object]) -> None:
         json.dumps({"mcpServers": payload}),
         encoding="utf-8",
     )
+
+
+def _allow_mcp_for_test(home: Path, channel_id: str, server_name: str) -> None:
+    manifest_path = channel_manifest_path(channel_id, home)
+    manifest = load_manifest(manifest_path)
+    updated = manifest.model_copy(
+        update={
+            "mcp_servers": manifest.mcp_servers.model_copy(
+                update={
+                    "allowed": list(
+                        dict.fromkeys([*(manifest.mcp_servers.allowed or []), server_name])
+                    )
+                }
+            )
+        }
+    )
+    plan = build_mcp_manifest_change_plan(manifest_path, updated)
+    assert plan is not None
+    persist_approved_mcp_manifest_change(plan)
 
 
 # ── list ────────────────────────────────────────────────────────────────
@@ -353,7 +375,11 @@ def test_upgrade_yolo_duration_and_tier_output(cli, tmp_path: Path):
     assert "expiry:" in tier_result.output
 
 
-def test_mcp_allow_updates_allow_list(cli, tmp_path: Path):
+def test_mcp_allow_updates_allow_list(
+    cli,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     from engram.bootstrap import provision_channel as pc
 
     home = tmp_path / ".engram"
@@ -370,6 +396,25 @@ def test_mcp_allow_updates_allow_list(cli, tmp_path: Path):
         home=home,
     )
 
+    async def trust_fake(server_name, server_config, *, home=None):
+        assert server_name == "camoufox"
+        assert server_config == {
+            "command": "uvx",
+            "args": ["camoufox-browser[mcp]==0.1.1"],
+        }
+        return MCPTrustDecision(
+            server_name="camoufox",
+            tier=MCPTrustTier.UNKNOWN,
+            registry="pypi",
+            package_name="camoufox-browser[mcp]",
+            version="0.1.1",
+            trust_summary="metadata lookup failed",
+            reason="metadata lookup failed",
+        )
+
+    monkeypatch.setattr("engram.cli_channels.Confirm.ask", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("engram.mcp_manifest_gate.resolve_mcp_server_trust", trust_fake)
+
     result = cli.invoke(app, ["mcp", "allow", "C07TEAM", "camoufox"])
     manifest = load_manifest(channel_manifest_path("C07TEAM", home))
 
@@ -378,6 +423,50 @@ def test_mcp_allow_updates_allow_list(cli, tmp_path: Path):
     assert manifest.mcp_servers.allowed == ["engram-memory", "camoufox"]
     assert manifest.mcp_servers.disallowed == []
     assert "Effective: engram-memory, camoufox" in result.output
+
+
+def test_mcp_allow_unknown_tier_decline_keeps_manifest_unchanged(
+    cli,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from engram.bootstrap import provision_channel as pc
+
+    home = tmp_path / ".engram"
+    _write_mcp_inventory(
+        tmp_path,
+        {
+            "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+        },
+    )
+    pc(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#growth",
+        home=home,
+    )
+
+    async def trust_fake(_server_name, _server_config, *, home=None):
+        return MCPTrustDecision(
+            server_name="camoufox",
+            tier=MCPTrustTier.UNKNOWN,
+            registry="pypi",
+            package_name="camoufox-browser[mcp]",
+            version="0.1.1",
+            trust_summary="metadata lookup failed",
+            reason="metadata lookup failed",
+        )
+
+    monkeypatch.setattr("engram.cli_channels.Confirm.ask", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr("engram.mcp_manifest_gate.resolve_mcp_server_trust", trust_fake)
+
+    result = cli.invoke(app, ["mcp", "allow", "C07TEAM", "camoufox"])
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+
+    assert result.exit_code == 1
+    assert "owner confirmation was declined" in result.output
+    assert manifest.mcp_servers.allowed == ["engram-memory"]
+    assert manifest.mcp_servers.disallowed == []
 
 
 def test_mcp_allow_in_inherit_mode_is_noop(cli, tmp_path: Path):
@@ -422,7 +511,7 @@ def test_mcp_deny_adds_disallowed_and_updates_effective_list(cli, tmp_path: Path
         label="#growth",
         home=home,
     )
-    cli.invoke(app, ["mcp", "allow", "C07TEAM", "camoufox"])
+    _allow_mcp_for_test(home, "C07TEAM", "camoufox")
 
     result = cli.invoke(app, ["mcp", "deny", "C07TEAM", "camoufox"])
     list_result = cli.invoke(app, ["mcp", "list", "C07TEAM"])

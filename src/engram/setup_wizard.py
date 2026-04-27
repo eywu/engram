@@ -255,17 +255,18 @@ def _step_mcp_inventory() -> None:
     rprint()
     rprint("  Owner DMs auto-discover from this shared user inventory.")
     rprint("  Team channels still gate MCPs per manifest with strict allow-lists.")
-    if coverage.uncovered_servers and coverage.team_channels:
+    if found and coverage.team_channels:
         servers = ", ".join(coverage.uncovered_servers)
-        rprint()
-        rprint(
-            "  [yellow]⚠[/yellow] Registered but not yet allowed in any team channel "
-            f"manifest: {servers}"
-        )
-        rprint(
-            "    Fix: add each server under [italic]mcp_servers.allowed[/italic] in "
-            "[cyan]~/.engram/contexts/<channel-id>/.claude/channel-manifest.yaml[/cyan]"
-        )
+        if coverage.uncovered_servers:
+            rprint()
+            rprint(
+                "  [yellow]⚠[/yellow] Registered but not yet allowed in any team channel "
+                f"manifest: {servers}"
+            )
+            rprint(
+                "    Fix: add each server under [italic]mcp_servers.allowed[/italic] in "
+                "[cyan]~/.engram/contexts/<channel-id>/.claude/channel-manifest.yaml[/cyan]"
+            )
         _maybe_sync_team_channel_mcp_allow_lists(found, coverage)
     write_mcp_inventory_state(found, home=paths.engram_home())
 

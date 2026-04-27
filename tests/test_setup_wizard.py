@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 
 from engram.bootstrap import provision_channel
-from engram.manifest import IdentityTemplate, load_manifest
+from engram.manifest import (
+    IdentityTemplate,
+    build_mcp_manifest_change_plan,
+    load_manifest,
+    persist_approved_mcp_manifest_change,
+)
 from engram.mcp import detect_new_user_mcp_servers
 from engram.mcp_trust import MCPTrustDecision, MCPTrustTier
 from engram.paths import channel_manifest_path
@@ -29,6 +34,25 @@ def _docs_manifest_block() -> str:
     )
     assert match is not None
     return match.group("manifest") + "\n"
+
+
+def _allow_mcp_for_test(home: Path, channel_id: str, server_name: str) -> None:
+    manifest_path = channel_manifest_path(channel_id, home)
+    manifest = load_manifest(manifest_path)
+    updated = manifest.model_copy(
+        update={
+            "mcp_servers": manifest.mcp_servers.model_copy(
+                update={
+                    "allowed": list(
+                        dict.fromkeys([*(manifest.mcp_servers.allowed or []), server_name])
+                    )
+                }
+            )
+        }
+    )
+    plan = build_mcp_manifest_change_plan(manifest_path, updated)
+    assert plan is not None
+    persist_approved_mcp_manifest_change(plan)
 
 
 def test_setup_wizard_manifest_matches_install_doc() -> None:
@@ -219,7 +243,7 @@ def test_step_mcp_inventory_requires_explicit_confirmation_for_unknown_mcp(
         home=home,
     )
 
-    answers = iter([True, False])
+    answers = iter([True, True, False])
     monkeypatch.setattr(
         "engram.setup_wizard.Confirm.ask",
         lambda *_args, **_kwargs: next(answers),
@@ -253,6 +277,75 @@ def test_step_mcp_inventory_requires_explicit_confirmation_for_unknown_mcp(
     rendered = "\n".join(output)
     assert "camoufox is [italic]unknown[/italic]" in rendered
     assert "no team manifest changes applied" in rendered
+
+
+def test_step_mcp_inventory_syncs_partial_coverage_across_team_channels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "github": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-github@1.2.3"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    home = tmp_path / ".engram"
+    provision_channel(
+        "C07A",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#alpha",
+        home=home,
+    )
+    provision_channel(
+        "C07B",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#beta",
+        home=home,
+    )
+    _allow_mcp_for_test(home, "C07A", "github")
+
+    answers = iter([True, True])
+    monkeypatch.setattr(
+        "engram.setup_wizard.Confirm.ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+
+    async def fake_resolve(server_name, server_config, *, home=None):
+        assert server_name == "github"
+        assert server_config == {
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-github@1.2.3"],
+        }
+        return MCPTrustDecision(
+            server_name="github",
+            tier=MCPTrustTier.OFFICIAL,
+            registry="npm",
+            package_name="@modelcontextprotocol/server-github",
+            version="1.2.3",
+            trust_summary="official server",
+            reason="official package",
+        )
+
+    monkeypatch.setattr("engram.setup_wizard.resolve_mcp_server_trust", fake_resolve)
+
+    _step_mcp_inventory()
+
+    assert load_manifest(channel_manifest_path("C07A", home)).mcp_servers.allowed == [
+        "engram-memory",
+        "github",
+    ]
+    assert load_manifest(channel_manifest_path("C07B", home)).mcp_servers.allowed == [
+        "engram-memory",
+        "github",
+    ]
 
 
 def test_step_launchd_sync_refreshes_drifted_plist(

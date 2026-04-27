@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import tempfile
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -200,6 +201,31 @@ class MCPManifestChangePlan:
     staged_text: str
     baseline_sha256: str
     additions: list[str]
+
+
+@dataclass(frozen=True)
+class ChannelMCPChange:
+    previous_manifest: ChannelManifest
+    proposed_manifest: ChannelManifest
+    manifest_path: Path
+    normalized_name: str
+    approval_plan: MCPManifestChangePlan | None
+
+
+class ChannelMCPChangeStatus(StrEnum):
+    UNCHANGED = "unchanged"
+    APPLIED = "applied"
+    APPROVAL_DENIED = "approval_denied"
+    APPROVAL_PENDING = "approval_pending"
+
+
+@dataclass(frozen=True)
+class AppliedChannelMCPChange:
+    previous_manifest: ChannelManifest
+    updated_manifest: ChannelManifest
+    manifest_path: Path
+    normalized_name: str
+    status: ChannelMCPChangeStatus
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1016,6 +1042,26 @@ def detect_mcp_allow_list_additions(
     )
 
 
+def build_mcp_manifest_change_plan(
+    manifest_path: Path,
+    staged_manifest: ChannelManifest,
+) -> MCPManifestChangePlan | None:
+    """Build a staged MCP allow-list change plan from a proposed manifest."""
+    current_text = manifest_path.read_text(encoding="utf-8")
+    current_manifest = load_manifest(manifest_path)
+    additions = _mcp_allow_list_additions(current_manifest, staged_manifest)
+    if not additions:
+        return None
+    return MCPManifestChangePlan(
+        manifest_path=manifest_path,
+        current_manifest=current_manifest,
+        staged_manifest=staged_manifest,
+        staged_text=_manifest_yaml(staged_manifest),
+        baseline_sha256=_sha256_text(current_text),
+        additions=additions,
+    )
+
+
 def persist_approved_mcp_manifest_change(
     plan: MCPManifestChangePlan,
     *,
@@ -1633,14 +1679,14 @@ def normalize_mcp_server_name(server_name: str) -> str:
     return normalized
 
 
-def set_channel_mcp_server_access(
+def compute_channel_mcp_change(
     channel_id: str,
     server_name: str,
     *,
     action: Literal["allow", "deny"],
     home: Path | None = None,
-) -> tuple[ChannelManifest, ChannelManifest, Path, str]:
-    """Load a channel manifest, mutate MCP access, and persist it."""
+) -> ChannelMCPChange:
+    """Compute a channel MCP allow/deny update without persisting it."""
     normalized_name = normalize_mcp_server_name(server_name)
     manifest_path = paths.channel_manifest_path(channel_id, home)
     manifest = load_manifest(manifest_path)
@@ -1671,15 +1717,138 @@ def set_channel_mcp_server_access(
             "disallowed": updated_disallowed,
         }
     )
-    updated = manifest.model_copy(update={"mcp_servers": updated_scope})
-    if updated == manifest:
-        return manifest, manifest, manifest_path, normalized_name
+    proposed = manifest.model_copy(update={"mcp_servers": updated_scope})
+    return ChannelMCPChange(
+        previous_manifest=manifest,
+        proposed_manifest=proposed,
+        manifest_path=manifest_path,
+        normalized_name=normalized_name,
+        approval_plan=(
+            None if proposed == manifest else build_mcp_manifest_change_plan(manifest_path, proposed)
+        ),
+    )
 
-    additions = _mcp_allow_list_additions(manifest, updated)
-    _previous, persisted, persisted_path = _persist_manifest_update(
-        updated,
-        manifest_path,
-        approved_mcp_additions=additions,
+
+async def apply_channel_mcp_change(
+    channel_id: str,
+    server_name: str,
+    *,
+    action: Literal["allow", "deny"],
+    owner_alert: Callable[[str], Awaitable[None] | None] | None = None,
+    confirm_unknown: Callable[
+        [MCPManifestChangePlan, list[object]],
+        Awaitable[object] | object,
+    ]
+    | None = None,
+    home: Path | None = None,
+    inventory: dict[str, dict[str, object]] | None = None,
+    trust_resolver: Callable[..., Awaitable[object]] | None = None,
+    audit_source: str | None = None,
+) -> AppliedChannelMCPChange:
+    """Apply a channel MCP update, routing new allow-list entries through trust."""
+    change = compute_channel_mcp_change(
+        channel_id,
+        server_name,
+        action=action,
+        home=home,
+    )
+    if change.proposed_manifest == change.previous_manifest:
+        return AppliedChannelMCPChange(
+            previous_manifest=change.previous_manifest,
+            updated_manifest=change.previous_manifest,
+            manifest_path=change.manifest_path,
+            normalized_name=change.normalized_name,
+            status=ChannelMCPChangeStatus.UNCHANGED,
+        )
+
+    if change.approval_plan is None:
+        previous, updated, persisted_path = _persist_manifest_update(
+            change.proposed_manifest,
+            change.manifest_path,
+            audit_source=audit_source or f"channel_mcp_{action}",
+        )
+        return AppliedChannelMCPChange(
+            previous_manifest=previous or change.previous_manifest,
+            updated_manifest=updated,
+            manifest_path=persisted_path,
+            normalized_name=change.normalized_name,
+            status=ChannelMCPChangeStatus.APPLIED,
+        )
+
+    from engram.mcp_manifest_gate import (
+        MCPApprovalDisposition,
+        request_approved_mcp_manifest_change,
+    )
+
+    gate_kwargs: dict[str, object] = {
+        "channel_label": change.previous_manifest.label,
+        "owner_alert": owner_alert,
+        "confirm_unknown": confirm_unknown,
+        "home": home,
+        "inventory": inventory,
+    }
+    if trust_resolver is not None:
+        gate_kwargs["trust_resolver"] = trust_resolver
+    approval = await request_approved_mcp_manifest_change(
+        change.approval_plan,
+        **gate_kwargs,
+    )
+    if approval.plan is None:
+        status = (
+            ChannelMCPChangeStatus.APPROVAL_PENDING
+            if approval.disposition == MCPApprovalDisposition.PENDING
+            else ChannelMCPChangeStatus.APPROVAL_DENIED
+        )
+        return AppliedChannelMCPChange(
+            previous_manifest=change.previous_manifest,
+            updated_manifest=change.previous_manifest,
+            manifest_path=change.manifest_path,
+            normalized_name=change.normalized_name,
+            status=status,
+        )
+
+    previous, updated, persisted_path = persist_approved_mcp_manifest_change(
+        approval.plan,
+        audit_source=audit_source or f"channel_mcp_{action}",
+    )
+    return AppliedChannelMCPChange(
+        previous_manifest=previous,
+        updated_manifest=updated,
+        manifest_path=persisted_path,
+        normalized_name=change.normalized_name,
+        status=ChannelMCPChangeStatus.APPLIED,
+    )
+
+
+def set_channel_mcp_server_access(
+    channel_id: str,
+    server_name: str,
+    *,
+    action: Literal["allow", "deny"],
+    home: Path | None = None,
+) -> tuple[ChannelManifest, ChannelManifest, Path, str]:
+    """Compatibility wrapper for callers that do not add new MCP allow entries."""
+    change = compute_channel_mcp_change(
+        channel_id,
+        server_name,
+        action=action,
+        home=home,
+    )
+    if change.proposed_manifest == change.previous_manifest:
+        return (
+            change.previous_manifest,
+            change.previous_manifest,
+            change.manifest_path,
+            change.normalized_name,
+        )
+    if change.approval_plan is not None:
+        raise ManifestError(
+            "Blocked manifest write: new MCP allow-list entries require "
+            "trust-gated approval via apply_channel_mcp_change."
+        )
+    previous, updated, persisted_path = _persist_manifest_update(
+        change.proposed_manifest,
+        change.manifest_path,
         audit_source=f"channel_mcp_{action}",
     )
-    return manifest, persisted, persisted_path, normalized_name
+    return previous or change.previous_manifest, updated, persisted_path, change.normalized_name

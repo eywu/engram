@@ -15,6 +15,7 @@ next restart, or when a channel hasn't been resolved yet this run.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -22,13 +23,16 @@ from pathlib import Path
 import typer
 from rich import print as rprint
 from rich.console import Console
+from rich.prompt import Confirm
 from rich.table import Table
 
 from engram import paths
 from engram.manifest import (
+    ChannelMCPChangeStatus,
     ChannelStatus,
     ManifestError,
     PermissionTier,
+    apply_channel_mcp_change,
     load_manifest,
     parse_permission_tier,
     permission_tier_choices_text,
@@ -39,6 +43,7 @@ from engram.manifest import (
     validate_upgrade_duration,
 )
 from engram.mcp import render_channel_mcp_access
+from engram.mcp_manifest_gate import MCPApprovalDisposition
 
 app = typer.Typer(
     name="channels",
@@ -529,11 +534,25 @@ def mcp_allow(
 ) -> None:
     """Allow one MCP server in a channel manifest."""
     try:
-        previous, updated, _manifest_path, normalized_name = (
-            set_channel_mcp_server_access(
+        async def _confirm_unknown(_plan, decisions) -> MCPApprovalDisposition:
+            decision = decisions[0]
+            summary = decision.trust_summary or decision.reason or "metadata unavailable"
+            approved = Confirm.ask(
+                f"Allow unknown-tier MCP '{decision.server_name}' ({summary})?",
+                default=False,
+            )
+            return (
+                MCPApprovalDisposition.APPROVED
+                if approved
+                else MCPApprovalDisposition.DENIED
+            )
+
+        result = asyncio.run(
+            apply_channel_mcp_change(
                 channel_id,
                 server_name,
                 action="allow",
+                confirm_unknown=_confirm_unknown,
             )
         )
     except ValueError as exc:
@@ -543,21 +562,27 @@ def mcp_allow(
         rprint(f"[red]Failed to load manifest: {exc}[/red]")
         raise typer.Exit(code=2) from exc
 
-    if previous == updated:
+    if result.status == ChannelMCPChangeStatus.UNCHANGED:
         rprint(
             _mcp_access_noop_text(
                 action="allow",
-                manifest=previous,
-                server_name=normalized_name,
+                manifest=result.previous_manifest,
+                server_name=result.normalized_name,
             )
         )
         return
+    if result.status == ChannelMCPChangeStatus.APPROVAL_DENIED:
+        rprint(
+            f"[yellow]Skipped MCP server [bold]{result.normalized_name}[/bold]; "
+            "owner confirmation was declined.[/yellow]"
+        )
+        raise typer.Exit(code=1)
 
     rprint(
-        f"[green]✓[/] Allowed MCP server [bold]{normalized_name}[/bold] "
+        f"[green]✓[/] Allowed MCP server [bold]{result.normalized_name}[/bold] "
         f"in [bold]{channel_id}[/bold]."
     )
-    rprint(render_channel_mcp_access(updated))
+    rprint(render_channel_mcp_access(result.updated_manifest))
 
 
 @mcp_app.command("deny")

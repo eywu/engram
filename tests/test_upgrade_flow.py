@@ -1,6 +1,7 @@
 """Tests for GRO-511 button-driven tier changes."""
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ import pytest
 from engram.config import AnthropicConfig, EngramConfig, SlackConfig
 from engram.ingress import (
     ACTION_ID_TIER_PICK,
+    handle_block_action,
     handle_engram_command,
     handle_tier_pick_action,
 )
@@ -19,10 +21,13 @@ from engram.manifest import (
     IdentityTemplate,
     PermissionTier,
     ScopeList,
+    build_mcp_manifest_change_plan,
     dump_manifest,
     load_manifest,
+    persist_approved_mcp_manifest_change,
     set_channel_mcp_server_access,
 )
+from engram.mcp_trust import MCPTrustDecision, MCPTrustTier
 from engram.paths import channel_manifest_path
 from engram.router import Router
 
@@ -114,6 +119,49 @@ def picker_payload(
 
 def action_texts(blocks: list[dict[str, Any]]) -> list[str]:
     return [str(element["text"]["text"]) for element in blocks[1]["elements"]]
+
+
+def _block_action_payload(value: str, *, user_id: str = "U07OWNER") -> dict[str, Any]:
+    choice = value.split("|", 2)[1]
+    return {
+        "type": "block_actions",
+        "actions": [
+            {
+                "action_id": f"hitl_choice_{choice}",
+                "block_id": "hitl_actions",
+                "value": value,
+            }
+        ],
+        "user": {"id": user_id},
+    }
+
+
+def allow_mcp_for_test(home: Path, channel_id: str, server_name: str) -> None:
+    manifest_path = channel_manifest_path(channel_id, home)
+    manifest = load_manifest(manifest_path)
+    updated = manifest.model_copy(
+        update={
+            "mcp_servers": manifest.mcp_servers.model_copy(
+                update={
+                    "allowed": list(
+                        dict.fromkeys([*(manifest.mcp_servers.allowed or []), server_name])
+                    )
+                }
+            )
+        }
+    )
+    plan = build_mcp_manifest_change_plan(manifest_path, updated)
+    assert plan is not None
+    persist_approved_mcp_manifest_change(plan)
+
+
+async def _wait_until(predicate, *, timeout_s: float = 1.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not met before timeout")
 
 
 @pytest.mark.asyncio
@@ -263,12 +311,7 @@ async def test_mcp_list_command_renders_effective_servers(
         },
     )
     write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
-    set_channel_mcp_server_access(
-        "C07TEAM",
-        "camoufox",
-        action="allow",
-        home=home,
-    )
+    allow_mcp_for_test(home, "C07TEAM", "camoufox")
     router = Router(home=home, owner_dm_channel_id="D07OWNER")
     slack = FakeSlackClient()
 
@@ -377,6 +420,7 @@ async def test_non_owner_cannot_grant_mcp_access_via_slash_command(
 @pytest.mark.asyncio
 async def test_owner_can_allow_mcp_access_via_slash_command(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / ".engram"
     write_mcp_inventory(
@@ -389,6 +433,21 @@ async def test_owner_can_allow_mcp_access_via_slash_command(
     router = Router(home=home, owner_dm_channel_id="D07OWNER")
     slack = FakeSlackClient()
 
+    async def trust_fake(_server_name, _server_config, *, home=None):
+        return MCPTrustDecision(
+            server_name="camoufox",
+            tier=MCPTrustTier.UNKNOWN,
+            registry="pypi",
+            package_name="camoufox-browser[mcp]",
+            version="0.1.1",
+            publisher="camoufox-labs",
+            publishers=["camoufox-labs"],
+            trust_summary="metadata lookup failed",
+            reason="metadata lookup failed",
+        )
+
+    monkeypatch.setattr("engram.mcp_manifest_gate.resolve_mcp_server_trust", trust_fake)
+
     result = await handle_engram_command(
         router=router,
         config=make_config(),
@@ -399,11 +458,85 @@ async def test_owner_can_allow_mcp_access_via_slash_command(
         command_text="mcp allow camoufox",
     )
 
+    assert result == {"ok": True, "action": "allow", "changed": False, "pending": True}
+    assert len(slack.post_calls) == 1
+    assert slack.post_calls[0]["channel"] == "D07OWNER"
+    assert "Owner approval required for MCP addition" in slack.post_calls[0]["blocks"][0]["text"]["text"]
+    assert "Owner approval requested in the owner DM." in slack.ephemeral_calls[0]["text"]
+
+    pending = router.hitl.pending_for_channel("C07TEAM")
+    assert len(pending) == 1
+    q = pending[0]
+    ack = await handle_block_action(
+        _block_action_payload(f"{q.permission_request_id}|0"),
+        router,
+        slack,
+    )
+
+    assert ack == {"ok": True}
+    await _wait_until(
+        lambda: load_manifest(channel_manifest_path("C07TEAM", home)).mcp_servers.allowed
+        == ["engram-memory", "camoufox"]
+    )
     manifest = load_manifest(channel_manifest_path("C07TEAM", home))
-    assert result["ok"] is True
     assert manifest.mcp_servers.allowed == ["engram-memory", "camoufox"]
-    assert "Allowed MCP server `camoufox`." in slack.ephemeral_calls[0]["text"]
-    assert "Effective: engram-memory, camoufox" in slack.ephemeral_calls[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_owner_can_reject_unknown_mcp_access_via_slash_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / ".engram"
+    write_mcp_inventory(
+        tmp_path,
+        {
+            "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+        },
+    )
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    async def trust_fake(_server_name, _server_config, *, home=None):
+        return MCPTrustDecision(
+            server_name="camoufox",
+            tier=MCPTrustTier.UNKNOWN,
+            registry="pypi",
+            package_name="camoufox-browser[mcp]",
+            version="0.1.1",
+            publisher="camoufox-labs",
+            publishers=["camoufox-labs"],
+            trust_summary="metadata lookup failed",
+            reason="metadata lookup failed",
+        )
+
+    monkeypatch.setattr("engram.mcp_manifest_gate.resolve_mcp_server_trust", trust_fake)
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OWNER",
+        command_text="mcp allow camoufox",
+    )
+
+    assert result == {"ok": True, "action": "allow", "changed": False, "pending": True}
+    pending = router.hitl.pending_for_channel("C07TEAM")
+    assert len(pending) == 1
+    q = pending[0]
+    ack = await handle_block_action(
+        _block_action_payload(f"{q.permission_request_id}|deny"),
+        router,
+        slack,
+    )
+
+    assert ack == {"ok": True}
+    await _wait_until(lambda: q.future.done() and bool(slack.update_calls))
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert manifest.mcp_servers.allowed == ["engram-memory"]
 
 
 @pytest.mark.asyncio
@@ -418,12 +551,7 @@ async def test_anyone_can_deny_mcp_access_via_slash_command(
         },
     )
     write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
-    set_channel_mcp_server_access(
-        "C07TEAM",
-        "camoufox",
-        action="allow",
-        home=home,
-    )
+    allow_mcp_for_test(home, "C07TEAM", "camoufox")
     router = Router(home=home, owner_dm_channel_id="D07OWNER")
     slack = FakeSlackClient()
 
@@ -511,6 +639,7 @@ async def test_mcp_command_authorizes_against_fresh_disk_manifest(
 @pytest.mark.asyncio
 async def test_mcp_command_invalidates_session_for_immediate_effect(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GRO-531 regression: MCP changes must take effect immediately.
 
@@ -534,6 +663,19 @@ async def test_mcp_command_invalidates_session_for_immediate_effect(
     # Prime the session cache.
     await router.get("C07TEAM", channel_name="growth", is_dm=False)
     assert router.session_count() == 1
+
+    async def trust_fake(_server_name, _server_config, *, home=None):
+        return MCPTrustDecision(
+            server_name="camoufox",
+            tier=MCPTrustTier.OFFICIAL,
+            registry="pypi",
+            package_name="camoufox-browser[mcp]",
+            version="0.1.1",
+            trust_summary="official server",
+            reason="official package",
+        )
+
+    monkeypatch.setattr("engram.mcp_manifest_gate.resolve_mcp_server_trust", trust_fake)
 
     slack = FakeSlackClient()
     result = await handle_engram_command(

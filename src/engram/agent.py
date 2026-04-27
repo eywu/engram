@@ -65,16 +65,17 @@ from engram.mcp_health import (
     disable_failed_mcps_pre_turn,
     warning_chunk_for_pre_turn,
 )
+from engram.mcp_manifest_gate import (
+    MCPApprovalDisposition,
+    request_approved_mcp_manifest_change,
+)
 from engram.mcp_tools import (
     MEMORY_SEARCH_FULL_TOOL_NAMES,
     MEMORY_SEARCH_SERVER_NAME,
     make_memory_search_server,
 )
 from engram.mcp_trust import (
-    MCPTrustDecision,
-    MCPTrustTier,
     add_trusted_publishers,
-    render_community_notification,
     render_owner_approval_markdown,
     resolve_mcp_server_trust,
 )
@@ -179,120 +180,111 @@ class Agent:
             return None
 
         inventory = self._load_manifest_inventory()
-        decisions: list[MCPTrustDecision] = []
-        for server_name in plan.additions:
-            server_config = inventory.get(server_name)
-            decisions.append(
-                await resolve_mcp_server_trust(
-                    server_name,
-                    server_config,
-                    home=self._router.home,
-                )
+        block_reason: str | None = None
+
+        async def _confirm_unknown(_plan, decisions) -> MCPApprovalDisposition:
+            nonlocal block_reason
+            owner_dm_channel_id = (
+                self._config.owner_dm_channel_id or self._router.owner_dm_channel_id
             )
-
-        unknown = [decision for decision in decisions if decision.tier == MCPTrustTier.UNKNOWN]
-        community = [
-            decision
-            for decision in decisions
-            if decision.tier == MCPTrustTier.COMMUNITY_TRUSTED
-        ]
-        if not unknown:
-            if community and self._owner_alert is not None:
-                message = render_community_notification(
-                    channel_id=session.channel_id,
-                    channel_label=manifest.label,
-                    decisions=community,
-                )
-                maybe_awaitable = self._owner_alert(message)
-                if inspect.isawaitable(maybe_awaitable):
-                    await maybe_awaitable
-            return PermissionResultAllow()
-
-        owner_dm_channel_id = self._config.owner_dm_channel_id or self._router.owner_dm_channel_id
-        owner_user_id = self._config.owner_user_id
-        if not owner_dm_channel_id or not owner_user_id:
-            return PermissionResultDeny(
-                message=(
+            owner_user_id = self._config.owner_user_id
+            if not owner_dm_channel_id or not owner_user_id:
+                block_reason = (
                     "Blocked MCP manifest update: owner approval is required for "
                     "untrusted MCPs, but owner_dm_channel_id or owner_user_id is unset."
-                ),
-            )
+                )
+                return MCPApprovalDisposition.DENIED
 
-        allowed, reason = self._router.hitl_limiter.check(
-            session.channel_id,
-            max_per_day=max_per_day,
-        )
-        if not allowed:
-            if reason.startswith("another question already pending"):
-                return PermissionResultDeny(
-                    message=(
+            allowed, reason = self._router.hitl_limiter.check(
+                session.channel_id,
+                max_per_day=max_per_day,
+            )
+            if not allowed:
+                if reason.startswith("another question already pending"):
+                    block_reason = (
                         "MCP trust approval is already pending in the owner DM. "
                         "Wait for approval, then retry the manifest update."
-                    ),
-                )
-            return PermissionResultDeny(message=f"MCP trust approval unavailable: {reason}")
+                    )
+                else:
+                    block_reason = f"MCP trust approval unavailable: {reason}"
+                return MCPApprovalDisposition.DENIED
 
-        q = PendingQuestion(
-            permission_request_id=str(uuid.uuid4()),
-            channel_id=session.channel_id,
-            session_id=session.session_id,
-            turn_id=str(uuid.uuid4()),
-            tool_name=tool_name,
-            tool_input=tool_input,
-            suggestions=[
-                {"name": "Approve once"},
-                {"name": "Approve + add publisher to trust list"},
-            ],
-            who_can_answer=owner_user_id,
-            posted_at=datetime.datetime.now(datetime.UTC),
-            timeout_s=timeout_s,
-            channel_manifest=manifest,
-            approval_channel_id=owner_dm_channel_id,
-            prompt_title="🔐 Owner approval required for MCP addition",
-            prompt_body_markdown=render_owner_approval_markdown(
+            q = PendingQuestion(
+                permission_request_id=str(uuid.uuid4()),
                 channel_id=session.channel_id,
-                channel_label=manifest.label,
-                decisions=decisions,
-            ),
-            deny_button_label="Reject",
-        )
+                session_id=session.session_id,
+                turn_id=str(uuid.uuid4()),
+                tool_name=tool_name,
+                tool_input=tool_input,
+                suggestions=[
+                    {"name": "Approve once"},
+                    {"name": "Approve + add publisher to trust list"},
+                ],
+                who_can_answer=owner_user_id,
+                posted_at=datetime.datetime.now(datetime.UTC),
+                timeout_s=timeout_s,
+                channel_manifest=manifest,
+                approval_channel_id=owner_dm_channel_id,
+                prompt_title="🔐 Owner approval required for MCP addition",
+                prompt_body_markdown=render_owner_approval_markdown(
+                    channel_id=session.channel_id,
+                    channel_label=manifest.label,
+                    decisions=decisions,
+                ),
+                deny_button_label="Reject",
+            )
 
-        async def _apply_approved_manifest(_result) -> None:
-            if q.resolution_choice == "deny":
-                return
-            _previous, updated, _path = persist_approved_mcp_manifest_change(plan)
-            self._router.replace_cached_manifest(updated)
-            if q.resolution_choice == "1":
-                trusted_publishers = [
-                    (decision.registry, decision.publisher or "")
-                    for decision in decisions
-                    if decision.publisher
-                ]
-                add_trusted_publishers(
-                    trusted_publishers,
-                    home=self._router.home,
+            async def _apply_approved_manifest(_result) -> None:
+                if q.resolution_choice == "deny":
+                    return
+                _previous, updated, _path = persist_approved_mcp_manifest_change(plan)
+                self._router.replace_cached_manifest(updated)
+                if q.resolution_choice == "1":
+                    trusted_publishers = [
+                        (decision.registry, decision.publisher or "")
+                        for decision in decisions
+                        if decision.publisher
+                    ]
+                    add_trusted_publishers(
+                        trusted_publishers,
+                        home=self._router.home,
+                    )
+
+            q.on_resolve = _apply_approved_manifest
+            self._router.hitl.register(q)
+            self._router.hitl_limiter.reserve(session.channel_id)
+            try:
+                await on_new_question(q)
+            except Exception:
+                self._router.hitl.resolve(
+                    q.permission_request_id,
+                    PermissionResultDeny(message="failed to post question"),
                 )
-
-        q.on_resolve = _apply_approved_manifest
-        self._router.hitl.register(q)
-        self._router.hitl_limiter.reserve(session.channel_id)
-        try:
-            await on_new_question(q)
-        except Exception:
-            self._router.hitl.resolve(
-                q.permission_request_id,
-                PermissionResultDeny(message="failed to post question"),
-            )
-            self._router.hitl.cleanup_resolved()
-            return PermissionResultDeny(
-                message="Blocked MCP manifest update: failed to post owner approval request.",
-            )
-        watch_pending_question(self._router, q)
-        return PermissionResultDeny(
-            message=(
+                self._router.hitl.cleanup_resolved()
+                block_reason = (
+                    "Blocked MCP manifest update: failed to post owner approval request."
+                )
+                return MCPApprovalDisposition.DENIED
+            watch_pending_question(self._router, q)
+            block_reason = (
                 "MCP trust approval requested in the owner DM. "
                 "The manifest was not updated; retry after approval."
-            ),
+            )
+            return MCPApprovalDisposition.PENDING
+
+        approval = await request_approved_mcp_manifest_change(
+            plan,
+            channel_label=manifest.label,
+            owner_alert=self._owner_alert,
+            confirm_unknown=_confirm_unknown,
+            home=self._router.home,
+            inventory=inventory,
+            trust_resolver=resolve_mcp_server_trust,
+        )
+        if approval.plan is not None:
+            return PermissionResultAllow()
+        return PermissionResultDeny(
+            message=block_reason or "Blocked MCP manifest update: owner approval declined."
         )
 
     def _load_manifest_inventory(self) -> dict[str, dict[str, object]]:
