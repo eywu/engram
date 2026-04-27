@@ -241,21 +241,30 @@ require_node_for_mcps_if_needed() {
 install_nightly() {
     local wrapper="$REPO_ROOT/scripts/engram_nightly_launchd.sh"
     local domain="gui/$(id -u)"
+    local node_bin_dir=""
+    local bridge_path=""
 
     if [[ ! -x "$wrapper" ]]; then
         echo "error: nightly wrapper is not executable: $wrapper" >&2
         exit 1
     fi
 
+    node_bin_dir="$(resolve_node_bin_dir)"
+    bridge_path="$(build_bridge_path "${node_bin_dir:-}")"
+
     echo "==> repo:      $REPO_ROOT"
     echo "==> uv:        $UV_BIN"
     echo "==> plist dst: $NIGHTLY_PLIST_DST"
+    if [[ -n "${node_bin_dir:-}" && "$bridge_path" != "$DEFAULT_BRIDGE_PATH" ]]; then
+        echo "==> node bin:  $node_bin_dir"
+    fi
 
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.engram/logs"
     sed \
         -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/uv|$(escape_sed_replacement "$UV_BIN")|g" \
         -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/engram-repo|$(escape_sed_replacement "$REPO_ROOT")|g" \
         -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/engram/scripts/engram_nightly_launchd.sh|$(escape_sed_replacement "$wrapper")|g" \
+        -e "s|/REPLACE/WITH/OPTIONAL/NODE/PATH/PREFIX/|$(escape_sed_replacement "${bridge_path%"$DEFAULT_BRIDGE_PATH"}")|g" \
         -e "s|/REPLACE/WITH/HOME|$(escape_sed_replacement "$HOME")|g" \
         "$NIGHTLY_PLIST_SRC" > "$NIGHTLY_PLIST_DST"
     echo "==> wrote $NIGHTLY_PLIST_DST"

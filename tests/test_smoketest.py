@@ -258,12 +258,21 @@ def test_install_launchd_install_nightly_is_idempotent(tmp_path: Path):
         "    ;;\n"
         "esac\n"
     )
-    uv.chmod(0o755)
-    launchctl.chmod(0o755)
+    fake_shell = bin_dir / "login-shell"
+    fake_shell.write_text(
+        "#!/bin/sh\n"
+        "shift\n"
+        "exec /bin/sh -c \"$1\"\n",
+        encoding="utf-8",
+    )
+    for binary in (uv, launchctl, fake_shell):
+        binary.chmod(0o755)
+    base_env = {key: value for key, value in os.environ.items() if key != "NVM_DIR"}
     env = {
-        **os.environ,
+        **base_env,
         "HOME": str(home),
-        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "PATH": f"{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "SHELL": str(fake_shell),
         "LAUNCHCTL_CALLS": str(calls),
         "LAUNCHCTL_STATE": str(state),
     }
@@ -275,6 +284,9 @@ def test_install_launchd_install_nightly_is_idempotent(tmp_path: Path):
     assert installed["Label"] == "com.engram.v3.nightly"
     assert installed["EnvironmentVariables"]["HOME"] == str(home)
     assert installed["EnvironmentVariables"]["ENGRAM_UV_BIN"] == str(uv)
+    assert installed["EnvironmentVariables"]["PATH"] == (
+        f"{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    )
     assert installed["ProgramArguments"] == [
         str(Path.cwd() / "scripts" / "engram_nightly_launchd.sh")
     ]
@@ -282,6 +294,68 @@ def test_install_launchd_install_nightly_is_idempotent(tmp_path: Path):
     call_text = calls.read_text(encoding="utf-8")
     assert call_text.count("bootstrap ") == 2
     assert "bootout " in call_text
+
+
+def test_install_launchd_install_nightly_prefixes_detected_node_bin(tmp_path: Path):
+    home = tmp_path / "home"
+    bin_dir = tmp_path / "bin"
+    node_bin = tmp_path / "node-bin"
+    home.mkdir()
+    bin_dir.mkdir()
+    node_bin.mkdir()
+    calls = tmp_path / "launchctl-calls.txt"
+    state = tmp_path / "launchctl-state.txt"
+
+    uv = bin_dir / "uv"
+    uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    npx = node_bin / "npx"
+    npx.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launchctl = bin_dir / "launchctl"
+    launchctl.write_text(
+        "#!/bin/sh\n"
+        "cmd=\"$1\"\n"
+        "shift || true\n"
+        "case \"$cmd\" in\n"
+        "  list)\n"
+        "    [ -f \"$LAUNCHCTL_STATE\" ] && cat \"$LAUNCHCTL_STATE\"\n"
+        "    ;;\n"
+        "  bootstrap|load)\n"
+        "    printf '%s\\n' '- 0 com.engram.v3.nightly' > \"$LAUNCHCTL_STATE\"\n"
+        "    printf '%s %s\\n' \"$cmd\" \"$*\" >> \"$LAUNCHCTL_CALLS\"\n"
+        "    ;;\n"
+        "  bootout|unload)\n"
+        "    rm -f \"$LAUNCHCTL_STATE\"\n"
+        "    printf '%s %s\\n' \"$cmd\" \"$*\" >> \"$LAUNCHCTL_CALLS\"\n"
+        "    ;;\n"
+        "  enable)\n"
+        "    printf '%s %s\\n' \"$cmd\" \"$*\" >> \"$LAUNCHCTL_CALLS\"\n"
+        "    ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_shell = bin_dir / "login-shell"
+    fake_shell.write_text(
+        "#!/bin/sh\n"
+        "shift\n"
+        "exec /bin/sh -c \"$1\"\n",
+        encoding="utf-8",
+    )
+    for binary in (uv, npx, launchctl, fake_shell):
+        binary.chmod(0o755)
+    base_env = {key: value for key, value in os.environ.items() if key != "NVM_DIR"}
+    env = {
+        **base_env,
+        "HOME": str(home),
+        "PATH": f"{node_bin}:{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "SHELL": str(fake_shell),
+        "LAUNCHCTL_CALLS": str(calls),
+        "LAUNCHCTL_STATE": str(state),
+    }
+
+    subprocess.run(["scripts/install_launchd.sh", "--install-nightly"], env=env, check=True)
+
+    installed = _plist(home / "Library" / "LaunchAgents" / "com.engram.v3.nightly.plist")
+    assert installed["EnvironmentVariables"]["PATH"].startswith(f"{node_bin}:")
 
 
 def test_install_launchd_bridge_writes_explicit_env_file_into_plist(tmp_path: Path):
