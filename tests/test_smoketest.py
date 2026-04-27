@@ -181,6 +181,7 @@ def test_launchd_nightly_plist_is_daily_2am_and_copies_smoketest_env():
     assert nightly_env["PATH"] == smoke_env["PATH"]
     assert nightly_env["LANG"] == smoke_env["LANG"]
     assert nightly_env["HOME"] == "/REPLACE/WITH/HOME"
+    assert nightly_env["ENGRAM_ENV_FILE"] == "/REPLACE/WITH/ABSOLUTE/PATH/TO/engram.env"
     assert nightly_env["ENGRAM_REPO_ROOT"] == "/REPLACE/WITH/ABSOLUTE/PATH/TO/engram-repo"
     assert nightly_env["ENGRAM_UV_BIN"] == "/REPLACE/WITH/ABSOLUTE/PATH/TO/uv"
     assert "nightly-stdio-" in nightly["StandardOutPath"]
@@ -231,6 +232,9 @@ def test_install_launchd_install_nightly_is_idempotent(tmp_path: Path):
     bin_dir = tmp_path / "bin"
     home.mkdir()
     bin_dir.mkdir()
+    env_file = home / ".engram" / ".env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text("ANTHROPIC_API_KEY=sk-test\n", encoding="utf-8")
     calls = tmp_path / "launchctl-calls.txt"
     state = tmp_path / "launchctl-state.txt"
 
@@ -283,6 +287,7 @@ def test_install_launchd_install_nightly_is_idempotent(tmp_path: Path):
     installed = _plist(home / "Library" / "LaunchAgents" / "com.engram.v3.nightly.plist")
     assert installed["Label"] == "com.engram.v3.nightly"
     assert installed["EnvironmentVariables"]["HOME"] == str(home)
+    assert installed["EnvironmentVariables"]["ENGRAM_ENV_FILE"] == str(env_file)
     assert installed["EnvironmentVariables"]["ENGRAM_UV_BIN"] == str(uv)
     assert installed["EnvironmentVariables"]["PATH"] == (
         f"{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -303,6 +308,9 @@ def test_install_launchd_install_nightly_prefixes_detected_node_bin(tmp_path: Pa
     home.mkdir()
     bin_dir.mkdir()
     node_bin.mkdir()
+    env_file = home / ".engram" / ".env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text("ANTHROPIC_API_KEY=sk-test\n", encoding="utf-8")
     calls = tmp_path / "launchctl-calls.txt"
     state = tmp_path / "launchctl-state.txt"
 
@@ -355,6 +363,7 @@ def test_install_launchd_install_nightly_prefixes_detected_node_bin(tmp_path: Pa
     subprocess.run(["scripts/install_launchd.sh", "--install-nightly"], env=env, check=True)
 
     installed = _plist(home / "Library" / "LaunchAgents" / "com.engram.v3.nightly.plist")
+    assert installed["EnvironmentVariables"]["ENGRAM_ENV_FILE"] == str(env_file)
     assert installed["EnvironmentVariables"]["PATH"].startswith(f"{node_bin}:")
 
 

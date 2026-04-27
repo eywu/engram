@@ -78,7 +78,7 @@ resolve_absolute_path() {
     printf '%s/%s\n' "$dir" "$(basename "$path")"
 }
 
-resolve_bridge_env_file() {
+resolve_env_file() {
     local candidate
 
     if [[ -n "${ENGRAM_ENV_FILE:-}" ]]; then
@@ -241,6 +241,7 @@ require_node_for_mcps_if_needed() {
 install_nightly() {
     local wrapper="$REPO_ROOT/scripts/engram_nightly_launchd.sh"
     local domain="gui/$(id -u)"
+    local env_file=""
     local node_bin_dir=""
     local bridge_path=""
 
@@ -249,12 +250,14 @@ install_nightly() {
         exit 1
     fi
 
+    env_file="$(resolve_env_file)"
     node_bin_dir="$(resolve_node_bin_dir)"
     bridge_path="$(build_bridge_path "${node_bin_dir:-}")"
 
     echo "==> repo:      $REPO_ROOT"
     echo "==> uv:        $UV_BIN"
     echo "==> plist dst: $NIGHTLY_PLIST_DST"
+    echo "==> env file:  $env_file"
     if [[ -n "${node_bin_dir:-}" && "$bridge_path" != "$DEFAULT_BRIDGE_PATH" ]]; then
         echo "==> node bin:  $node_bin_dir"
     fi
@@ -264,6 +267,7 @@ install_nightly() {
         -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/uv|$(escape_sed_replacement "$UV_BIN")|g" \
         -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/engram-repo|$(escape_sed_replacement "$REPO_ROOT")|g" \
         -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/engram/scripts/engram_nightly_launchd.sh|$(escape_sed_replacement "$wrapper")|g" \
+        -e "s|/REPLACE/WITH/ABSOLUTE/PATH/TO/engram.env|$(escape_sed_replacement "$env_file")|g" \
         -e "s|/REPLACE/WITH/OPTIONAL/NODE/PATH/PREFIX/|$(escape_sed_replacement "${bridge_path%"$DEFAULT_BRIDGE_PATH"}")|g" \
         -e "s|/REPLACE/WITH/HOME|$(escape_sed_replacement "$HOME")|g" \
         "$NIGHTLY_PLIST_SRC" > "$NIGHTLY_PLIST_DST"
@@ -307,7 +311,7 @@ echo "==> repo:      $REPO_ROOT"
 echo "==> uv:        $UV_BIN"
 echo "==> plist dst: $PLIST_DST"
 
-BRIDGE_ENV_FILE="$(resolve_bridge_env_file)"
+BRIDGE_ENV_FILE="$(resolve_env_file)"
 NODE_BIN_DIR="$(resolve_node_bin_dir)"
 BRIDGE_PATH="$(build_bridge_path "${NODE_BIN_DIR:-}")"
 require_node_for_mcps_if_needed "$BRIDGE_PATH"

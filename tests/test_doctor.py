@@ -25,6 +25,7 @@ from engram.doctor import (
     check_gemini_api_key,
     check_launchd_bridge_plist_drift,
     check_launchd_job,
+    check_launchd_nightly_env_file,
     check_log_dir_writable,
     check_mcp_channel_coverage,
     check_mcp_commands_on_bridge_path,
@@ -550,6 +551,28 @@ def test_check_launchd_nightly_job_not_installed_fails() -> None:
     assert check.details["state"] == "not_installed"
 
 
+def test_check_launchd_nightly_env_file_warns_when_missing(tmp_path: Path) -> None:
+    installed_path = tmp_path / "Library" / "LaunchAgents" / "com.engram.v3.nightly.plist"
+    installed_path.parent.mkdir(parents=True)
+    with installed_path.open("wb") as handle:
+        plistlib.dump(
+            {
+                "Label": "com.engram.v3.nightly",
+                "EnvironmentVariables": {
+                    "HOME": str(tmp_path),
+                    "LANG": "en_US.UTF-8",
+                },
+            },
+            handle,
+            sort_keys=False,
+        )
+
+    check = check_launchd_nightly_env_file(home=tmp_path)
+
+    assert check.status == CheckStatus.WARN
+    assert "EnvironmentVariables.ENGRAM_ENV_FILE" in check.message
+
+
 def test_check_launchd_bridge_plist_drift_warns_on_missing_soft_resource_limits(
     tmp_path: Path,
 ) -> None:
@@ -748,6 +771,23 @@ def test_doctor_cli_json_against_tmp_config(
     )
     with installed_plist.open("wb") as handle:
         plistlib.dump(payload, handle, sort_keys=False)
+    nightly_plist = tmp_path / "Library" / "LaunchAgents" / "com.engram.v3.nightly.plist"
+    with nightly_plist.open("wb") as handle:
+        plistlib.dump(
+            {
+                "Label": "com.engram.v3.nightly",
+                "EnvironmentVariables": {
+                    "HOME": str(tmp_path),
+                    "LANG": "en_US.UTF-8",
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "ENGRAM_ENV_FILE": str(env_file),
+                    "ENGRAM_REPO_ROOT": str(Path.cwd()),
+                    "ENGRAM_UV_BIN": "/tmp/uv",
+                },
+            },
+            handle,
+            sort_keys=False,
+        )
 
     result = CliRunner().invoke(app, ["doctor", "--json"])
 
@@ -755,8 +795,8 @@ def test_doctor_cli_json_against_tmp_config(
     payload = json.loads(result.output)
     assert payload["schema_version"] == 1
     assert payload["summary"] == {
-        "total": 20,
-        "passed": 20,
+        "total": 21,
+        "passed": 21,
         "warnings": 0,
         "failed": 0,
         "exit_code": 0,
@@ -779,6 +819,7 @@ def test_doctor_cli_json_against_tmp_config(
         "launchd_bridge",
         "launchd_bridge_plist",
         "launchd_nightly",
+        "launchd_nightly_env_file",
         "fd_pressure",
         "memory_db_disk_space",
         "log_dir_writable",

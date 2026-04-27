@@ -40,6 +40,8 @@
         <string>/REPLACE/WITH/HOME</string>
         <key>LANG</key>
         <string>en_US.UTF-8</string>
+        <key>ENGRAM_ENV_FILE</key>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/engram.env</string>
         <key>ENGRAM_REPO_ROOT</key>
         <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/engram-repo</string>
         <key>ENGRAM_UV_BIN</key>

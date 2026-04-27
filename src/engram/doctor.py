@@ -165,6 +165,7 @@ def run_doctor(config_path: Path | None = None) -> DoctorReport:
             "launchd nightly job",
             "com.engram.v3.nightly",
         ),
+        check_launchd_nightly_env_file(),
         check_fd_pressure(log_dir),
         check_disk_space(path.parent),
         check_log_dir_writable(log_dir),
@@ -1065,6 +1066,55 @@ def check_launchd_bridge_plist_drift(
         name="launchd bridge plist",
         status=CheckStatus.WARN,
         message=_launchd_bridge_plist_drift_message(issues, template_commit=commit),
+        details=details,
+    )
+
+
+def check_launchd_nightly_env_file(*, home: Path | None = None) -> DoctorCheck:
+    installed_path = (home or Path.home()) / "Library" / "LaunchAgents" / "com.engram.v3.nightly.plist"
+    details = {"installed_path": str(installed_path)}
+    if not installed_path.exists():
+        return DoctorCheck(
+            id="launchd_nightly_env_file",
+            name="launchd nightly env file",
+            status=CheckStatus.WARN,
+            message=(
+                f"{installed_path} is missing; run `./scripts/install_launchd.sh --install-nightly` "
+                "to install the current nightly plist."
+            ),
+            details=details,
+        )
+
+    try:
+        installed = load_plist(installed_path)
+    except Exception as exc:
+        return DoctorCheck(
+            id="launchd_nightly_env_file",
+            name="launchd nightly env file",
+            status=CheckStatus.WARN,
+            message=f"Installed nightly plist could not be parsed: {type(exc).__name__}: {exc}",
+            details=details | {"error_class": type(exc).__name__},
+        )
+
+    environment = installed.get("EnvironmentVariables")
+    env_file = environment.get("ENGRAM_ENV_FILE") if isinstance(environment, dict) else None
+    if isinstance(env_file, str) and env_file.strip():
+        return DoctorCheck(
+            id="launchd_nightly_env_file",
+            name="launchd nightly env file",
+            status=CheckStatus.PASS,
+            message=f"{installed_path} includes EnvironmentVariables.ENGRAM_ENV_FILE.",
+            details=details | {"env_file": env_file},
+        )
+
+    return DoctorCheck(
+        id="launchd_nightly_env_file",
+        name="launchd nightly env file",
+        status=CheckStatus.WARN,
+        message=(
+            f"{installed_path} is missing EnvironmentVariables.ENGRAM_ENV_FILE; "
+            "reinstall it with `./scripts/install_launchd.sh --install-nightly`."
+        ),
         details=details,
     )
 
