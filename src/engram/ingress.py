@@ -1560,12 +1560,32 @@ async def handle_mcp_command(
         )
         return {"ok": False, "error": "owner user is not configured"}
 
+    # GRO-531 fix: reload manifest from disk before authorization check.
+    # The cached `session.manifest` may be stale relative to on-disk state if
+    # an on-host CLI edit (`engram channels mcp ...`) has run since the
+    # session was last loaded. Authorizing against stale state and then
+    # writing against fresh state is a TOCTOU hole on a security-sensitive op.
+    manifest_path_for_auth = paths.channel_manifest_path(
+        source_channel_id, router.home
+    )
+    try:
+        manifest_for_auth = load_manifest(manifest_path_for_auth)
+    except ManifestError:
+        # Disk manifest is invalid; fall back to cached state but log the
+        # condition. The subsequent `set_channel_mcp_server_access` call will
+        # surface the same error to the operator.
+        log.warning(
+            "mcp_command.manifest_reload_failed channel_id=%s falling_back_to_cache=true",
+            source_channel_id,
+        )
+        manifest_for_auth = manifest
+
     decision = can_change_mcp_access(
         action=action,
         server_name=server_name,
-        has_allow_list=manifest.mcp_servers.allowed is not None,
-        is_allowed=server_name in (manifest.mcp_servers.allowed or []),
-        is_disallowed=server_name in manifest.mcp_servers.disallowed,
+        has_allow_list=manifest_for_auth.mcp_servers.allowed is not None,
+        is_allowed=server_name in (manifest_for_auth.mcp_servers.allowed or []),
+        is_disallowed=server_name in manifest_for_auth.mcp_servers.disallowed,
         invoker_user_id=user_id or "",
         channel_owner_user_id=config.owner_user_id or "",
     )
@@ -1594,7 +1614,12 @@ async def handle_mcp_command(
         )
         return {"ok": True, "action": action, "changed": False, "text": text}
 
-    router.replace_cached_manifest(updated)
+    # GRO-531 fix: invalidate the live SDK session so MCP changes take effect
+    # immediately. `replace_cached_manifest` only swaps the manifest reference;
+    # it does NOT disconnect the running ClaudeSDKClient, which would keep the
+    # OLD MCP set until idle timeout (~15min). The whole point of a first-class
+    # CLI is *immediate effect*.
+    await router.invalidate(source_channel_id)
     verb = "Allowed" if action == "allow" else "Denied"
     text = (
         f"{verb} MCP server `{normalized_name}`.\n\n"
