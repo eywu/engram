@@ -351,7 +351,8 @@ def build_nightly_options(
         # session_id values. Keep nightly synthesis ephemeral and use a raw
         # UUID here; adding human-readable prefixes breaks SDK validation.
         session_id=str(uuid.uuid4()),
-        max_turns=1,
+        # GRO-565: synthesis may need tool use + a final JSON response.
+        max_turns=5,
         permission_mode="dontAsk",
         allowed_tools=list(MEMORY_SEARCH_FULL_TOOL_NAMES),
         disallowed_tools=[
@@ -464,6 +465,8 @@ async def _synthesize_channel(
                     run_date=run_date,
                     error=retry_exc.detail,
                     raw_outputs=raw_outputs,
+                    result=retry_turn.result or first_turn.result,
+                    prompt_template=prompt_template,
                 )
                 raise
     except Exception as exc:
@@ -728,12 +731,20 @@ async def _run_claude_turn(
     text_chunks: list[str] = []
     result: ResultMessage | None = None
     await client.query(prompt, session_id=session_id)
-    async for message in client.receive_response():
+    receive_messages = getattr(client, "receive_messages", None)
+    message_stream = receive_messages() if callable(receive_messages) else client.receive_response()
+    async for message in message_stream:
         if isinstance(message, AssistantMessage):
             text_chunks.extend(_assistant_text(message))
         elif isinstance(message, ResultMessage):
             result = message
-    return ClaudeTurnResult(raw_output="".join(text_chunks).strip(), result=result)
+            if message.stop_reason != "tool_use":
+                break
+
+    raw_output = "".join(text_chunks).strip()
+    if not raw_output and result is not None and getattr(result, "structured_output", None) is not None:
+        raw_output = json.dumps(result.structured_output)
+    return ClaudeTurnResult(raw_output=raw_output, result=result)
 
 
 def _repair_prompt(error: str) -> str:
@@ -780,7 +791,10 @@ def _log_parse_fail_final(
     run_date: str,
     error: str,
     raw_outputs: list[str],
+    result: ResultMessage | None,
+    prompt_template: str,
 ) -> None:
+    prompt_tokens, model_actual = _prompt_tokens_and_model(result)
     log.error(
         "nightly.parse_fail_final",
         extra={
@@ -792,8 +806,36 @@ def _log_parse_fail_final(
             "raw_outputs": raw_outputs,
             "raw_output_initial": raw_outputs[0] if raw_outputs else "",
             "raw_output_retry": raw_outputs[1] if len(raw_outputs) > 1 else "",
+            "stop_reason": getattr(result, "stop_reason", None) if result is not None else None,
+            "message_count": getattr(result, "message_count", None) if result is not None else None,
+            "prompt_tokens": prompt_tokens,
+            "prompt_preview": prompt_template[:2000],
+            "model_actual": model_actual or plan.model,
         },
     )
+
+
+def _prompt_tokens_and_model(result: ResultMessage | None) -> tuple[int, str | None]:
+    if result is None:
+        return 0, None
+
+    usage = getattr(result, "usage", None) or {}
+    prompt_tokens = _int_token(usage.get("input_tokens"))
+    model_usage = getattr(result, "model_usage", None) or {}
+    model_actual: str | None = None
+
+    if isinstance(model_usage, dict) and model_usage:
+        model_keys = [str(key) for key in model_usage if key]
+        if model_keys:
+            model_actual = ",".join(sorted(model_keys))
+
+        if prompt_tokens == 0:
+            for value in model_usage.values():
+                if not isinstance(value, dict):
+                    continue
+                prompt_tokens += _int_token(value.get("input_tokens"))
+
+    return prompt_tokens, model_actual
 
 
 def _prompt_cache(result: ResultMessage) -> dict[str, int | str]:

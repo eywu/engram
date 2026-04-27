@@ -24,6 +24,7 @@ from engram.manifest import (
 from engram.mcp_tools import MEMORY_SEARCH_FULL_TOOL_NAMES
 from engram.nightly.schema import META_CHANNEL_ID
 from engram.nightly.synthesize import (
+    DEFAULT_PROMPT_TEMPLATE,
     NIGHTLY_CHANNEL_ID,
     AnthropicRuntime,
     PlannedChannel,
@@ -99,6 +100,32 @@ class _BudgetAbortClient:
         yield
 
 
+class _MultiTurnMessageClient:
+    def __init__(self, options: ClaudeAgentOptions, final_response: str):
+        self.options = options
+        self.final_response = final_response
+        self.connected = False
+        self.disconnected = False
+        self.prompts: list[str] = []
+        self.session_ids: list[str] = []
+
+    async def connect(self) -> None:
+        self.connected = True
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
+
+    async def query(self, prompt: str, session_id: str = "default") -> None:
+        self.prompts.append(prompt)
+        self.session_ids.append(session_id)
+
+    async def receive_messages(self):
+        yield AssistantMessage(content=[_TextBlock("")], model="fake")
+        yield _result(stop_reason="tool_use", input_tokens=100)
+        yield AssistantMessage(content=[_TextBlock(self.final_response)], model="fake")
+        yield _result(cost=0.02, stop_reason="end_turn", input_tokens=120)
+
+
 class _ClientFactory:
     def __init__(
         self,
@@ -117,23 +144,35 @@ class _ClientFactory:
         return client
 
 
-def _result(cost: float = 0.01, *, cache_read: int = 0) -> ResultMessage:
-    return ResultMessage(
+def _result(
+    cost: float = 0.01,
+    *,
+    cache_read: int = 0,
+    input_tokens: int = 100,
+    model_usage: dict[str, Any] | None = None,
+    stop_reason: str | None = "end_turn",
+    message_count: int | None = None,
+) -> ResultMessage:
+    result = ResultMessage(
         subtype="success",
         duration_ms=1,
         duration_api_ms=1,
         is_error=False,
         num_turns=1,
         session_id="session-test",
+        stop_reason=stop_reason,
         total_cost_usd=cost,
         usage={
-            "input_tokens": 100,
+            "input_tokens": input_tokens,
             "output_tokens": 20,
             "cache_creation_input_tokens": 0 if cache_read else 7,
             "cache_read_input_tokens": cache_read,
         },
-        model_usage={"claude-test-model": {"input_tokens": 100}},
+        model_usage=model_usage or {"claude-test-model": {"input_tokens": input_tokens}},
     )
+    if message_count is not None:
+        result.message_count = message_count
+    return result
 
 
 def _synthesis_json(channel_id: str, *, summary: str = "durable summary") -> str:
@@ -257,6 +296,7 @@ async def test_synthesize_sets_nightly_sdk_invariants_and_records_budget(
     options = factory.options[0]
     assert options.cwd == str(tmp_path / "nightly" / "current")
     assert options.max_budget_usd == 5.0
+    assert options.max_turns >= 5
     assert options.output_format is not None
     assert options.output_format["type"] == "json_schema"
     assert options.allowed_tools == MEMORY_SEARCH_FULL_TOOL_NAMES
@@ -302,6 +342,14 @@ def test_build_nightly_options_uses_uuid_session_id(
         r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         options.session_id,
     )
+    assert options.max_turns >= 5
+
+
+def test_default_prompt_template_includes_json_mode_instruction() -> None:
+    prompt_template = DEFAULT_PROMPT_TEMPLATE.read_text(encoding="utf-8")
+
+    assert "Respond ONLY with valid JSON matching the schema." in prompt_template
+    assert "Do not call tools unless absolutely necessary." in prompt_template
 
 
 def test_golden_fixture_outputs_match_schema() -> None:
@@ -358,6 +406,33 @@ async def test_mocked_sdk_malformed_then_valid_retries_and_accepts(
 
 
 @pytest.mark.asyncio
+async def test_receive_messages_continues_past_tool_use_until_final_json(
+    tmp_path: Path,
+) -> None:
+    harvest = _write_harvest(tmp_path, [_channel("C07TOOLUSE")])
+    budget = _FakeBudget()
+
+    def factory(options: ClaudeAgentOptions) -> _MultiTurnMessageClient:
+        return _MultiTurnMessageClient(options, _synthesis_json("C07TOOLUSE"))
+
+    result = await synthesize(
+        harvest,
+        output_root=tmp_path / "nightly",
+        config=NightlyConfig(),
+        contexts_dir=tmp_path / "contexts",
+        anthropic_runtime=AnthropicRuntime(api_key=None, model="sonnet"),
+        budget=budget,
+        client_factory=factory,
+    )
+
+    channel = result.payload["channels"][0]
+    assert channel["status"] == "synthesized"
+    assert channel["synthesis"]["channel_id"] == "C07TOOLUSE"
+    assert channel["cost_usd"] == "0.020000"
+    assert len(budget.records) == 1
+
+
+@pytest.mark.asyncio
 async def test_retry_failure_logs_both_raw_outputs_and_aborts(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -365,7 +440,16 @@ async def test_retry_failure_logs_both_raw_outputs_and_aborts(
     caplog.set_level(logging.INFO, logger="engram.nightly.synthesize")
     harvest = _write_harvest(tmp_path, [_channel("C07FAIL")])
     second_raw = json.dumps({"schema_version": 1, "date": "2026-04-22"})
-    factory = _ClientFactory([[("not json", _result()), (second_raw, _result())]])
+    final_result = _result(
+        stop_reason="max_turns_exhausted",
+        input_tokens=321,
+        model_usage={
+            "claude-haiku-4-5": {"input_tokens": 111},
+            "claude-sonnet-4-6": {"input_tokens": 210},
+        },
+        message_count=4,
+    )
+    factory = _ClientFactory([[("not json", _result()), (second_raw, final_result)]])
 
     with pytest.raises(SynthesisOutputError):
         await synthesize(
@@ -385,13 +469,27 @@ async def test_retry_failure_logs_both_raw_outputs_and_aborts(
     assert record.raw_outputs == ["not json", second_raw]
     assert record.raw_output_initial == "not json"
     assert record.raw_output_retry == second_raw
+    assert record.stop_reason == "max_turns_exhausted"
+    assert record.message_count == 4
+    assert record.prompt_tokens == 321
+    assert record.prompt_preview == DEFAULT_PROMPT_TEMPLATE.read_text(encoding="utf-8")[:2000]
+    assert record.model_actual == "claude-haiku-4-5,claude-sonnet-4-6"
 
 
 @pytest.mark.asyncio
 async def test_retry_failure_writes_raw_outputs_to_nightly_jsonl(tmp_path: Path) -> None:
     harvest = _write_harvest(tmp_path, [_channel("C07FAILJSONL")])
     second_raw = json.dumps({"schema_version": 1, "date": "2026-04-22"})
-    factory = _ClientFactory([[("not json", _result()), (second_raw, _result())]])
+    final_result = _result(
+        stop_reason="max_turns_exhausted",
+        input_tokens=432,
+        model_usage={
+            "claude-haiku-4-5": {"input_tokens": 200},
+            "claude-sonnet-4-6": {"input_tokens": 232},
+        },
+        message_count=6,
+    )
+    factory = _ClientFactory([[("not json", _result()), (second_raw, final_result)]])
     root_logger = logging.getLogger()
     original_handlers = root_logger.handlers[:]
     original_level = root_logger.level
@@ -423,6 +521,11 @@ async def test_retry_failure_writes_raw_outputs_to_nightly_jsonl(tmp_path: Path)
     assert record["raw_output_initial"] == "not json"
     assert record["raw_output_retry"] == second_raw
     assert record["error"]
+    assert record["stop_reason"] == "max_turns_exhausted"
+    assert record["message_count"] == 6
+    assert record["prompt_tokens"] == 432
+    assert record["prompt_preview"] == DEFAULT_PROMPT_TEMPLATE.read_text(encoding="utf-8")[:2000]
+    assert record["model_actual"] == "claude-haiku-4-5,claude-sonnet-4-6"
 
 
 @pytest.mark.asyncio
