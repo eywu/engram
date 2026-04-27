@@ -96,6 +96,111 @@ def _is_manifest_update_call(
     )
 
 
+def _assigned_name_values(tree: ast.AST) -> dict[str, list[ast.AST]]:
+    assignments: dict[str, list[ast.AST]] = {}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+
+        if value is None or len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            continue
+
+        assignments.setdefault(targets[0].id, []).append(value)
+
+    return assignments
+
+
+def _resolved_value_candidates(
+    node: ast.AST,
+    *,
+    assignments: dict[str, list[ast.AST]],
+    seen_names: frozenset[str] = frozenset(),
+) -> list[ast.AST]:
+    if not isinstance(node, ast.Name):
+        return [node]
+
+    if node.id in seen_names:
+        return [node]
+
+    values = assignments.get(node.id)
+    if not values:
+        return [node]
+
+    candidates: list[ast.AST] = []
+    next_seen = seen_names | {node.id}
+    for value in values:
+        candidates.extend(
+            _resolved_value_candidates(
+                value,
+                assignments=assignments,
+                seen_names=next_seen,
+            )
+        )
+    return candidates or [node]
+
+
+def _approved_additions_candidates_from_mapping(
+    mapping: ast.Dict,
+    *,
+    assignments: dict[str, list[ast.AST]],
+) -> list[ast.AST]:
+    candidates: list[ast.AST] = []
+
+    for key, value in zip(mapping.keys, mapping.values, strict=False):
+        if not (isinstance(key, ast.Constant) and key.value == "approved_mcp_additions"):
+            continue
+        candidates.extend(
+            _resolved_value_candidates(
+                value,
+                assignments=assignments,
+            )
+        )
+    return candidates
+
+
+def _approved_additions_candidates_for_call(
+    call: ast.Call,
+    *,
+    assignments: dict[str, list[ast.AST]],
+) -> list[ast.AST]:
+    candidates: list[ast.AST] = []
+
+    for keyword in call.keywords:
+        if keyword.arg == "approved_mcp_additions":
+            candidates.extend(
+                _resolved_value_candidates(
+                    keyword.value,
+                    assignments=assignments,
+                )
+            )
+            continue
+
+        if keyword.arg is not None:
+            continue
+
+        for value in _resolved_value_candidates(
+            keyword.value,
+            assignments=assignments,
+        ):
+            if not isinstance(value, ast.Dict):
+                continue
+            candidates.extend(
+                _approved_additions_candidates_from_mapping(
+                    value,
+                    assignments=assignments,
+                )
+            )
+
+    return candidates
+
+
 def _find_external_approved_mcp_manifest_updates(
     project_root: Path,
 ) -> list[str]:
@@ -108,6 +213,7 @@ def _find_external_approved_mcp_manifest_updates(
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         direct_names, module_names = _manifest_helper_aliases(tree)
+        assignments = _assigned_name_values(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -117,27 +223,15 @@ def _find_external_approved_mcp_manifest_updates(
                 module_names=module_names,
             ):
                 continue
-            approved_additions = None
-            for keyword in node.keywords:
-                if keyword.arg == "approved_mcp_additions":
-                    approved_additions = keyword.value
-                    break
-                if keyword.arg is not None or not isinstance(keyword.value, ast.Dict):
-                    continue
-                for key, value in zip(keyword.value.keys, keyword.value.values, strict=False):
-                    if (
-                        isinstance(key, ast.Constant)
-                        and key.value == "approved_mcp_additions"
-                    ):
-                        approved_additions = value
-                        break
-                if approved_additions is not None:
-                    break
-            if approved_additions is None:
+            approved_additions = _approved_additions_candidates_for_call(
+                node,
+                assignments=assignments,
+            )
+            if not approved_additions:
                 continue
-            if (
-                isinstance(approved_additions, ast.Constant)
-                and approved_additions.value is None
+            if all(
+                isinstance(value, ast.Constant) and value.value is None
+                for value in approved_additions
             ):
                 continue
             offenders.append(f"{path.relative_to(project_root)}:{node.lineno}")
@@ -187,6 +281,24 @@ def test_manifest_ci_guard_detects_external_approved_mcp_updates(
         ),
         encoding="utf-8",
     )
+    (engram_src / "good_named_none.py").write_text(
+        dedent(
+            """
+            from engram.manifest import _persist_manifest_update
+
+
+            def allowed_none_alias(manifest, path):
+                approved = None
+                kwargs = {"approved_mcp_additions": approved}
+                _persist_manifest_update(
+                    manifest,
+                    path,
+                    **kwargs,
+                )
+            """
+        ),
+        encoding="utf-8",
+    )
     (engram_src / "bad_direct.py").write_text(
         dedent(
             """
@@ -198,6 +310,25 @@ def test_manifest_ci_guard_detects_external_approved_mcp_updates(
                     manifest,
                     path,
                     approved_mcp_additions=["camoufox"],
+                )
+            """
+        ),
+        encoding="utf-8",
+    )
+    (engram_src / "bad_kwargs_alias.py").write_text(
+        dedent(
+            """
+            from engram.manifest import _persist_manifest_update
+
+
+            def offender(manifest, path):
+                approved = ["camoufox"]
+                kwargs = {"approved_mcp_additions": approved}
+                persist_kwargs = kwargs
+                _persist_manifest_update(
+                    manifest,
+                    path,
+                    **persist_kwargs,
                 )
             """
         ),
@@ -255,8 +386,9 @@ def test_manifest_ci_guard_detects_external_approved_mcp_updates(
 
     offenders = _find_external_approved_mcp_manifest_updates(project_root)
 
-    assert len(offenders) == 4
+    assert len(offenders) == 5
     assert any(entry.startswith("src/engram/bad_direct.py:") for entry in offenders)
+    assert any(entry.startswith("src/engram/bad_kwargs_alias.py:") for entry in offenders)
     assert any(entry.startswith("src/engram/bad_attr.py:") for entry in offenders)
     assert any(
         entry.startswith("src/engram/bad_assigned_alias.py:") for entry in offenders
