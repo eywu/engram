@@ -6,6 +6,7 @@ Sub-commands:
   engram channels approve <id>      — flip PENDING → ACTIVE
   engram channels deny <id>         — flip any → DENIED (silently ignored)
   engram channels reset <id>        — back to PENDING (owner must re-approve)
+  engram channels mcp ...           — manage per-channel MCP allow/deny state
 
 The CLI is the human-friendly front-end for the `status` field in
 ChannelManifest. It edits YAML directly (round-trip via dump_manifest),
@@ -31,11 +32,13 @@ from engram.manifest import (
     load_manifest,
     parse_permission_tier,
     permission_tier_choices_text,
+    set_channel_mcp_server_access,
     set_channel_nightly_included,
     set_channel_permission_tier,
     set_channel_status,
     validate_upgrade_duration,
 )
+from engram.mcp import render_channel_mcp_access
 
 app = typer.Typer(
     name="channels",
@@ -43,9 +46,20 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+mcp_app = typer.Typer(
+    name="mcp",
+    help="Manage per-channel MCP access without editing YAML by hand.",
+    no_args_is_help=True,
+    add_completion=False,
+)
 console = Console()
 log = logging.getLogger(__name__)
 CHANNEL_LIST_SCHEMA_VERSION = "1"
+app.add_typer(
+    mcp_app,
+    name="mcp",
+    help="Manage per-channel MCP access.",
+)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
@@ -128,6 +142,28 @@ def _channel_name(manifest) -> str:
     if manifest.is_owner_dm():
         return "owner-dm"
     return manifest.label or manifest.channel_id
+
+
+def _mcp_access_noop_text(
+    *,
+    action: str,
+    manifest,
+    server_name: str,
+) -> str:
+    if action == "allow":
+        if manifest.mcp_servers.allowed is None and server_name not in manifest.mcp_servers.disallowed:
+            return (
+                f"[dim]MCP server '{server_name}' already inherits into "
+                f"'{manifest.channel_id}'. No change.[/dim]"
+            )
+        return (
+            f"[dim]MCP server '{server_name}' is already allowed in "
+            f"'{manifest.channel_id}'. No change.[/dim]"
+        )
+    return (
+        f"[dim]MCP server '{server_name}' is already denied in "
+        f"'{manifest.channel_id}'. No change.[/dim]"
+    )
 
 
 def _channel_list_record(manifest_path: Path) -> dict[str, object]:
@@ -484,6 +520,91 @@ def include(
 ) -> None:
     """Include a channel in the nightly cross-channel summary."""
     _set_nightly_state(channel_id, nightly_included=True)
+
+
+@mcp_app.command("allow")
+def mcp_allow(
+    channel_id: str = typer.Argument(..., help="Slack channel ID."),
+    server_name: str = typer.Argument(..., help="MCP server name."),
+) -> None:
+    """Allow one MCP server in a channel manifest."""
+    try:
+        previous, updated, _manifest_path, normalized_name = (
+            set_channel_mcp_server_access(
+                channel_id,
+                server_name,
+                action="allow",
+            )
+        )
+    except ValueError as exc:
+        rprint(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    except ManifestError as exc:
+        rprint(f"[red]Failed to load manifest: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    if previous == updated:
+        rprint(
+            _mcp_access_noop_text(
+                action="allow",
+                manifest=previous,
+                server_name=normalized_name,
+            )
+        )
+        return
+
+    rprint(
+        f"[green]✓[/] Allowed MCP server [bold]{normalized_name}[/bold] "
+        f"in [bold]{channel_id}[/bold]."
+    )
+    rprint(render_channel_mcp_access(updated))
+
+
+@mcp_app.command("deny")
+def mcp_deny(
+    channel_id: str = typer.Argument(..., help="Slack channel ID."),
+    server_name: str = typer.Argument(..., help="MCP server name."),
+) -> None:
+    """Deny one MCP server in a channel manifest."""
+    try:
+        previous, updated, _manifest_path, normalized_name = (
+            set_channel_mcp_server_access(
+                channel_id,
+                server_name,
+                action="deny",
+            )
+        )
+    except ValueError as exc:
+        rprint(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    except ManifestError as exc:
+        rprint(f"[red]Failed to load manifest: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    if previous == updated:
+        rprint(
+            _mcp_access_noop_text(
+                action="deny",
+                manifest=previous,
+                server_name=normalized_name,
+            )
+        )
+        return
+
+    rprint(
+        f"[green]✓[/] Denied MCP server [bold]{normalized_name}[/bold] "
+        f"in [bold]{channel_id}[/bold]."
+    )
+    rprint(render_channel_mcp_access(updated))
+
+
+@mcp_app.command("list")
+def mcp_list(
+    channel_id: str = typer.Argument(..., help="Slack channel ID."),
+) -> None:
+    """Show the effective MCP access for one channel."""
+    _manifest_path, manifest = _load_manifest_or_exit(channel_id)
+    rprint(render_channel_mcp_access(manifest))
 
 
 if __name__ == "__main__":
