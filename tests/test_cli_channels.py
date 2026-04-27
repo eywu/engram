@@ -43,6 +43,13 @@ def _provision(tmp_path: Path, channel_id: str, identity: IdentityTemplate):
     )
 
 
+def _write_mcp_inventory(tmp_path: Path, payload: dict[str, object]) -> None:
+    (tmp_path / ".claude.json").write_text(
+        json.dumps({"mcpServers": payload}),
+        encoding="utf-8",
+    )
+
+
 # ── list ────────────────────────────────────────────────────────────────
 
 
@@ -344,6 +351,89 @@ def test_upgrade_yolo_duration_and_tier_output(cli, tmp_path: Path):
     assert "tier:   yolo" in tier_result.output
     assert "yolo:   active" in tier_result.output
     assert "expiry:" in tier_result.output
+
+
+def test_mcp_allow_updates_allow_list(cli, tmp_path: Path):
+    from engram.bootstrap import provision_channel as pc
+
+    home = tmp_path / ".engram"
+    _write_mcp_inventory(
+        tmp_path,
+        {
+            "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+        },
+    )
+    pc(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#growth",
+        home=home,
+    )
+
+    result = cli.invoke(app, ["mcp", "allow", "C07TEAM", "camoufox"])
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+
+    assert result.exit_code == 0
+    assert "Allowed MCP server camoufox in C07TEAM." in result.output
+    assert manifest.mcp_servers.allowed == ["engram-memory", "camoufox"]
+    assert manifest.mcp_servers.disallowed == []
+    assert "Effective: engram-memory, camoufox" in result.output
+
+
+def test_mcp_allow_in_inherit_mode_is_noop(cli, tmp_path: Path):
+    from engram.bootstrap import provision_channel as pc
+
+    home = tmp_path / ".engram"
+    _write_mcp_inventory(
+        tmp_path,
+        {
+            "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+        },
+    )
+    pc(
+        "D07OWNER",
+        identity=IdentityTemplate.OWNER_DM_FULL,
+        label="Owner DM",
+        home=home,
+    )
+
+    result = cli.invoke(app, ["mcp", "allow", "D07OWNER", "camoufox"])
+    manifest = load_manifest(channel_manifest_path("D07OWNER", home))
+
+    assert result.exit_code == 0
+    assert "already inherits into 'D07OWNER'. No change." in result.output
+    assert manifest.mcp_servers.allowed is None
+    assert manifest.mcp_servers.disallowed == []
+
+
+def test_mcp_deny_adds_disallowed_and_updates_effective_list(cli, tmp_path: Path):
+    from engram.bootstrap import provision_channel as pc
+
+    home = tmp_path / ".engram"
+    _write_mcp_inventory(
+        tmp_path,
+        {
+            "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+        },
+    )
+    pc(
+        "C07TEAM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        label="#growth",
+        home=home,
+    )
+    cli.invoke(app, ["mcp", "allow", "C07TEAM", "camoufox"])
+
+    result = cli.invoke(app, ["mcp", "deny", "C07TEAM", "camoufox"])
+    list_result = cli.invoke(app, ["mcp", "list", "C07TEAM"])
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+
+    assert result.exit_code == 0
+    assert "Denied MCP server camoufox in C07TEAM." in result.output
+    assert manifest.mcp_servers.allowed == ["engram-memory", "camoufox"]
+    assert manifest.mcp_servers.disallowed == ["camoufox"]
+    assert "Effective: engram-memory" in list_result.output
+    assert "Denied: camoufox" in list_result.output
 
 
 def test_exclude_happy_path_and_idempotent(cli, tmp_path: Path):

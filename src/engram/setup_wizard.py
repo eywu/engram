@@ -62,8 +62,8 @@ SLACK_APP_MANIFEST = dedent(
         messages_tab_read_only_enabled: false
       slash_commands:
         - command: /engram
-          description: "Manage Engram permission tiers, YOLO mode, and nightly-summary inclusion"
-          usage_hint: "upgrade | yolo | channels | exclude | include"
+          description: "Manage Engram channel MCP access, permission tiers, YOLO mode, and nightly-summary inclusion"
+          usage_hint: "channels | mcp | upgrade | yolo | exclude | include"
           should_escape: false
         - command: /exclude-from-nightly
           description: "Exclude this channel from the nightly cross-channel summary"

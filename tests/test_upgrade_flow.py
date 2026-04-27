@@ -1,6 +1,7 @@
 """Tests for GRO-511 button-driven tier changes."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -17,8 +18,10 @@ from engram.manifest import (
     ChannelStatus,
     IdentityTemplate,
     PermissionTier,
+    ScopeList,
     dump_manifest,
     load_manifest,
+    set_channel_mcp_server_access,
 )
 from engram.paths import channel_manifest_path
 from engram.router import Router
@@ -72,10 +75,22 @@ def write_active_manifest(
         "status": ChannelStatus.ACTIVE,
         "label": label,
         "permission_tier": tier,
+        "mcp_servers": (
+            ScopeList(allowed=["engram-memory"])
+            if channel_id.startswith("C")
+            else ScopeList()
+        ),
     }
     if nightly_included is not None:
         payload["nightly_included"] = nightly_included
     dump_manifest(ChannelManifest(**payload), path)
+
+
+def write_mcp_inventory(tmp_path: Path, payload: dict[str, object]) -> None:
+    (tmp_path / ".claude.json").write_text(
+        json.dumps({"mcpServers": payload}),
+        encoding="utf-8",
+    )
 
 
 def picker_payload(
@@ -234,6 +249,309 @@ async def test_owner_tier_pick_updates_manifest_and_posts_public_notice(
             "_ts": slack.post_calls[0]["_ts"],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_mcp_list_command_renders_effective_servers(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_mcp_inventory(
+        tmp_path,
+        {
+            "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+        },
+    )
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
+    set_channel_mcp_server_access(
+        "C07TEAM",
+        "camoufox",
+        action="allow",
+        home=home,
+    )
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OWNER",
+        command_text="mcp list",
+    )
+
+    assert result["ok"] is True
+    assert "MCP access for #growth (C07TEAM)" in slack.ephemeral_calls[0]["text"]
+    assert "Effective: engram-memory, camoufox" in slack.ephemeral_calls[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_allow_in_inherit_mode_is_noop_via_slash_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / ".engram"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    write_mcp_inventory(
+        tmp_path,
+        {
+            "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+        },
+    )
+    write_active_manifest(
+        home,
+        "D07OWNER",
+        label="Owner DM",
+        tier=PermissionTier.OWNER_SCOPED,
+    )
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="D07OWNER",
+        source_channel_name=None,
+        user_id="U07OTHER",
+        command_text="mcp allow camoufox",
+    )
+
+    manifest = load_manifest(channel_manifest_path("D07OWNER", home))
+    assert result["ok"] is True
+    assert manifest.mcp_servers.allowed is None
+    assert manifest.mcp_servers.disallowed == []
+    assert slack.ephemeral_calls == [
+        {
+            "channel": "D07OWNER",
+            "user": "U07OTHER",
+            "text": (
+                "MCP server `camoufox` already inherits here.\n\n"
+                "MCP access for Owner DM (D07OWNER)\n"
+                "Tier: trusted\n"
+                "Mode: inherit-all\n"
+                "Allowed: inherit-all\n"
+                "Denied: (none)\n"
+                "Effective: camoufox, engram-memory"
+            ),
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_non_owner_cannot_grant_mcp_access_via_slash_command(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OTHER",
+        command_text="mcp allow camoufox",
+    )
+
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result == {"ok": False, "error": "not owner"}
+    assert manifest.mcp_servers.allowed == ["engram-memory"]
+    assert slack.ephemeral_calls == [
+        {
+            "channel": "C07TEAM",
+            "user": "U07OTHER",
+            "text": (
+                "Only the channel owner can grant MCP access to `camoufox`. "
+                "Ask owner to run `/engram mcp allow camoufox`."
+            ),
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_owner_can_allow_mcp_access_via_slash_command(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_mcp_inventory(
+        tmp_path,
+        {
+            "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+        },
+    )
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OWNER",
+        command_text="mcp allow camoufox",
+    )
+
+    manifest = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result["ok"] is True
+    assert manifest.mcp_servers.allowed == ["engram-memory", "camoufox"]
+    assert "Allowed MCP server `camoufox`." in slack.ephemeral_calls[0]["text"]
+    assert "Effective: engram-memory, camoufox" in slack.ephemeral_calls[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_anyone_can_deny_mcp_access_via_slash_command(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_mcp_inventory(
+        tmp_path,
+        {
+            "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+        },
+    )
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
+    set_channel_mcp_server_access(
+        "C07TEAM",
+        "camoufox",
+        action="allow",
+        home=home,
+    )
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OTHER",
+        command_text="mcp deny camoufox",
+    )
+
+    updated = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert result["ok"] is True
+    assert updated.mcp_servers.disallowed == ["camoufox"]
+    assert "Denied MCP server `camoufox`." in slack.ephemeral_calls[0]["text"]
+    assert "Effective: engram-memory" in slack.ephemeral_calls[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_command_authorizes_against_fresh_disk_manifest(
+    tmp_path: Path,
+) -> None:
+    """GRO-531 regression: TOCTOU between cached manifest and disk.
+
+    The slash-command must reload the manifest from disk before running
+    `can_change_mcp_access`, otherwise an on-host CLI edit between
+    `get(channel)` and the auth check creates a window where authorization
+    decisions are made against stale state but writes happen against fresh
+    disk state.
+
+    Setup: cached manifest has NO allow list (inherit-all mode). On-disk
+    manifest has been edited by a CLI to ADD an allow list. The slash
+    command must see the disk version and refuse to allow into a fresh
+    explicit allow list when the requester isn't the owner.
+    """
+    home = tmp_path / ".engram"
+    write_mcp_inventory(
+        tmp_path,
+        {
+            "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+        },
+    )
+    # Initial state: explicit allow list with engram-memory only.
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    # Prime the router cache by loading the channel session BEFORE the
+    # CLI edit happens. Now `session.manifest` reflects the original state.
+    await router.get("C07TEAM", channel_name="growth", is_dm=False)
+
+    # Simulate a CLI edit between cache prime and slash-command processing:
+    # an on-host CLI run (or another slash-command) explicitly DENIES
+    # camoufox in the on-disk manifest.
+    set_channel_mcp_server_access(
+        "C07TEAM", "camoufox", action="deny", home=home
+    )
+
+    # Now a non-owner asks to allow camoufox. With the bug, the cached
+    # manifest doesn't know about the deny, so `is_disallowed=False` is
+    # passed to can_change_mcp_access; without the trust gate the request
+    # would route to set_channel_mcp_server_access against fresh disk
+    # state and silently undo the deny. With the fix, the disk reload
+    # reveals camoufox is explicitly disallowed.
+    slack = FakeSlackClient()
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OTHER",  # not the owner
+        command_text="mcp allow camoufox",
+    )
+
+    # Non-owner cannot change access. The auth check must be against
+    # fresh disk state, so it sees the explicit disallowed entry.
+    assert result["ok"] is False
+    # On-disk state must be unchanged: camoufox still disallowed, NOT in allowed.
+    on_disk = load_manifest(channel_manifest_path("C07TEAM", home))
+    assert "camoufox" in on_disk.mcp_servers.disallowed
+    assert "camoufox" not in (on_disk.mcp_servers.allowed or [])
+
+
+@pytest.mark.asyncio
+async def test_mcp_command_invalidates_session_for_immediate_effect(
+    tmp_path: Path,
+) -> None:
+    """GRO-531 regression: MCP changes must take effect immediately.
+
+    Previously the slash-command called `router.replace_cached_manifest`
+    which only updates the cached manifest reference but does NOT
+    disconnect the live ClaudeSDKClient. The running SDK keeps the OLD
+    MCP set until idle timeout (~15 min).
+
+    The fix calls `router.invalidate(channel_id)` which disconnects the
+    agent client and removes the session from the cache.
+    """
+    home = tmp_path / ".engram"
+    write_mcp_inventory(
+        tmp_path,
+        {
+            "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+        },
+    )
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.TASK_ASSISTANT)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    # Prime the session cache.
+    await router.get("C07TEAM", channel_name="growth", is_dm=False)
+    assert router.session_count() == 1
+
+    slack = FakeSlackClient()
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OWNER",
+        command_text="mcp allow camoufox",
+    )
+
+    assert result["ok"] is True
+    assert result["changed"] is True
+    # Session must be evicted from the cache so the next request
+    # rebuilds the SDK client with the new MCP set. Before the fix the
+    # session would still be cached with the old client.
+    assert router.session_count() == 0
 
 
 @pytest.mark.asyncio
