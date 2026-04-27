@@ -160,6 +160,17 @@ async def _reconnect_failed_mcp_servers(
         name = server.get("name")
         if not name:
             continue
+        # GRO-555: respect the per-channel circuit-breaker ban list.
+        # Without this, the runtime status snapshot's periodic retry loop
+        # would re-trigger the very reconnect storm we just disabled at
+        # the agent layer.
+        if name in session.disabled_mcp_servers:
+            log.debug(
+                "runtime.mcp_reconnect_skipped_disabled session=%s server=%s",
+                session.label(),
+                name,
+            )
+            continue
         try:
             await client.reconnect_mcp_server(name)
         except Exception:

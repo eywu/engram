@@ -71,6 +71,12 @@ class SessionState:
     rate_limit_status: str = "allowed"
     rate_limit_reset_at: int | None = None
     rate_limit_updated_at: str | None = None
+    # GRO-555: MCP servers circuit-broken by the per-turn watchdog or the
+    # pre-turn health check. Honored by both the agent (skip pre-turn check
+    # for these) and the runtime status snapshot (skip reconnect retries).
+    # Reset by ``router.invalidate_agent_client`` so a fresh client starts
+    # with a clean ban list.
+    disabled_mcp_servers: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if not self.session_id:
@@ -378,6 +384,9 @@ class Router:
                     continue
                 await session.agent_client.disconnect()
                 session.agent_client = None
+                # GRO-555: reset circuit-breaker ban list — a fresh client
+                # gets a fresh CLI subprocess that will reload all MCPs.
+                session.disabled_mcp_servers.clear()
                 closed += 1
                 log.info("router.agent_client_closed_idle session=%s", session.label())
         return closed
@@ -391,6 +400,8 @@ class Router:
                     continue
                 await session.agent_client.disconnect()
                 session.agent_client = None
+                # GRO-555: reset circuit-breaker ban list (see above).
+                session.disabled_mcp_servers.clear()
                 closed += 1
                 log.info(
                     "router.agent_client_closed_shutdown session=%s",
