@@ -28,7 +28,7 @@ from engram.launchd import (
     installed_bridge_plist_path,
     load_plist,
 )
-from engram.mcp import audit_mcp_channel_coverage
+from engram.mcp import audit_mcp_channel_coverage, load_claude_mcp_servers
 from engram.runtime import fd_usage_snapshot, read_latest_fd_snapshot
 
 SLACK_AUTH_TEST_URL = "https://slack.com/api/auth.test"
@@ -136,6 +136,7 @@ def run_doctor(config_path: Path | None = None) -> DoctorReport:
     checks = [
         check_uv_on_path(),
         check_claude_on_path(),
+        check_mcp_commands_on_bridge_path(),
         check_python_version(),
         check_config_file(path),
         config_check,
@@ -215,6 +216,118 @@ def check_claude_on_path(
         install_hint="Install the Claude CLI or add it to PATH.",
         which=which,
         version_runner=version_runner,
+    )
+
+
+def check_mcp_commands_on_bridge_path(
+    *,
+    home: Path | None = None,
+    configured_servers: dict[str, dict[str, Any]] | None = None,
+    plist_loader: Callable[[Path], dict[str, Any]] | None = None,
+) -> DoctorCheck:
+    base_home = (home or Path.home()).expanduser()
+    inventory_path = base_home / ".claude.json"
+    installed_path = installed_bridge_plist_path(base_home)
+    servers = (
+        load_claude_mcp_servers(config_path=inventory_path)
+        if configured_servers is None
+        else dict(configured_servers)
+    )
+    details: dict[str, Any] = {
+        "inventory_path": str(inventory_path),
+        "installed_path": str(installed_path),
+        "configured_servers": sorted(servers),
+    }
+
+    if not servers:
+        return DoctorCheck(
+            id="mcp_bridge_path",
+            name="MCP bridge PATH",
+            status=CheckStatus.PASS,
+            message="No user MCP servers are registered in ~/.claude.json.",
+            details=details,
+        )
+
+    if not installed_path.exists():
+        return DoctorCheck(
+            id="mcp_bridge_path",
+            name="MCP bridge PATH",
+            status=CheckStatus.WARN,
+            message=(
+                f"{installed_path} is missing; run `./scripts/install_launchd.sh` "
+                "before checking MCP command resolution under launchd."
+            ),
+            details=details,
+        )
+
+    try:
+        installed = (plist_loader or load_plist)(installed_path)
+    except Exception as exc:
+        return DoctorCheck(
+            id="mcp_bridge_path",
+            name="MCP bridge PATH",
+            status=CheckStatus.WARN,
+            message=f"Installed bridge plist could not be parsed: {type(exc).__name__}: {exc}",
+            details=details | {"error_class": type(exc).__name__},
+        )
+
+    env_vars = installed.get("EnvironmentVariables")
+    bridge_path = env_vars.get("PATH") if isinstance(env_vars, dict) else None
+    if not isinstance(bridge_path, str) or not bridge_path.strip():
+        return DoctorCheck(
+            id="mcp_bridge_path",
+            name="MCP bridge PATH",
+            status=CheckStatus.WARN,
+            message="Installed bridge plist is missing EnvironmentVariables.PATH.",
+            details=details,
+        )
+
+    details["bridge_path"] = bridge_path
+    unreachable: list[dict[str, str]] = []
+    checked: list[dict[str, str]] = []
+    for name in sorted(servers):
+        command = _mcp_server_command(servers[name])
+        if not command:
+            continue
+        resolved = _resolve_command_on_bridge_path(command, bridge_path)
+        checked.append(
+            {
+                "server": name,
+                "command": command,
+                "resolved_path": resolved or "",
+            }
+        )
+        if resolved is None:
+            unreachable.append({"server": name, "command": command})
+
+    details["checked_commands"] = checked
+    details["unreachable"] = unreachable
+
+    if not unreachable:
+        return DoctorCheck(
+            id="mcp_bridge_path",
+            name="MCP bridge PATH",
+            status=CheckStatus.PASS,
+            message="Every configured MCP command resolves under the bridge PATH.",
+            details=details,
+        )
+
+    summary = ", ".join(f"{item['server']} -> {item['command']}" for item in unreachable[:3])
+    if len(unreachable) > 3:
+        summary = f"{summary}, +{len(unreachable) - 3} more"
+    node_runtime_hint = any(item["command"] in {"npx", "node"} for item in unreachable)
+    hint = (
+        " Reinstall the bridge with `./scripts/install_launchd.sh` after `nvm use --lts`, "
+        "or install Node via Homebrew (`brew install node`)."
+        if node_runtime_hint
+        else " Reinstall the bridge with `./scripts/install_launchd.sh` after fixing the missing binary."
+    )
+    return DoctorCheck(
+        id="mcp_bridge_path",
+        name="MCP bridge PATH",
+        status=CheckStatus.FAIL,
+        message=f"Bridge PATH cannot resolve configured MCP commands: {summary}.{hint}",
+        details=details,
     )
 
 
@@ -1137,6 +1250,24 @@ def _launchd_bridge_plist_drift_message(
         "restart bridge with corrected plist to apply."
         f"{suffix}"
     )
+
+
+def _mcp_server_command(server_config: dict[str, Any] | None) -> str | None:
+    if not isinstance(server_config, dict):
+        return None
+    command = server_config.get("command")
+    if not isinstance(command, str):
+        return None
+    stripped = command.strip()
+    return stripped or None
+
+
+def _resolve_command_on_bridge_path(command: str, bridge_path: str) -> str | None:
+    expanded = Path(command).expanduser()
+    if os.sep in command:
+        return str(expanded) if expanded.exists() and os.access(expanded, os.X_OK) else None
+    resolved = shutil.which(command, path=bridge_path)
+    return str(Path(resolved)) if resolved else None
 
 
 def _check_binary_on_path(

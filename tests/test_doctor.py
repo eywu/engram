@@ -27,6 +27,7 @@ from engram.doctor import (
     check_launchd_job,
     check_log_dir_writable,
     check_mcp_channel_coverage,
+    check_mcp_commands_on_bridge_path,
     check_owner_dm_channel_id,
     check_owner_user_id,
     check_python_version,
@@ -104,6 +105,47 @@ def test_check_claude_on_path_missing_fails() -> None:
 
     assert check.status == CheckStatus.FAIL
     assert "not found" in check.message
+
+
+def test_check_mcp_commands_on_bridge_path_fails_when_npx_is_missing_from_bridge_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "camoufox": {
+                        "command": "npx",
+                        "args": ["-y", "mcp-camoufox@latest"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    installed_path = tmp_path / "Library" / "LaunchAgents" / "com.engram.bridge.plist"
+    installed_path.parent.mkdir(parents=True)
+    with installed_path.open("wb") as handle:
+        plistlib.dump(
+            {
+                "Label": "com.engram.bridge",
+                "EnvironmentVariables": {
+                    "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                },
+            },
+            handle,
+            sort_keys=False,
+        )
+
+    check = check_mcp_commands_on_bridge_path(home=tmp_path)
+
+    assert check.status == CheckStatus.FAIL
+    assert "camoufox -> npx" in check.message
+    assert "install_launchd.sh" in check.message
+    assert "brew install node" in check.message
+    assert check.details["unreachable"] == [{"server": "camoufox", "command": "npx"}]
 
 
 def test_check_python_version_requires_312() -> None:
@@ -713,8 +755,8 @@ def test_doctor_cli_json_against_tmp_config(
     payload = json.loads(result.output)
     assert payload["schema_version"] == 1
     assert payload["summary"] == {
-        "total": 19,
-        "passed": 19,
+        "total": 20,
+        "passed": 20,
         "warnings": 0,
         "failed": 0,
         "exit_code": 0,
@@ -722,6 +764,7 @@ def test_doctor_cli_json_against_tmp_config(
     assert [check["id"] for check in payload["checks"]] == [
         "uv_path",
         "claude_path",
+        "mcp_bridge_path",
         "python_version",
         "config_file",
         "config_load",
