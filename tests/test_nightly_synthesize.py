@@ -126,6 +126,42 @@ class _MultiTurnMessageClient:
         yield _result(cost=0.02, stop_reason="end_turn", input_tokens=120)
 
 
+class _AssistantModelFallbackClient:
+    def __init__(self, options: ClaudeAgentOptions, retry_response: str):
+        self.options = options
+        self.retry_response = retry_response
+        self.connected = False
+        self.disconnected = False
+        self.receive_count = 0
+
+    async def connect(self) -> None:
+        self.connected = True
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
+
+    async def query(self, prompt: str, session_id: str = "default") -> None:
+        del prompt, session_id
+
+    async def receive_messages(self):
+        if self.receive_count == 0:
+            self.receive_count += 1
+            yield AssistantMessage(content=[_TextBlock("not json")], model="claude-haiku-4-5")
+            yield _result(model_usage={}, input_tokens=0)
+            return
+
+        self.receive_count += 1
+        yield AssistantMessage(
+            content=[_TextBlock(self.retry_response)],
+            model="claude-sonnet-4-6",
+        )
+        yield _result(
+            stop_reason="max_turns_exhausted",
+            model_usage={},
+            input_tokens=0,
+        )
+
+
 class _ClientFactory:
     def __init__(
         self,
@@ -168,7 +204,11 @@ def _result(
             "cache_creation_input_tokens": 0 if cache_read else 7,
             "cache_read_input_tokens": cache_read,
         },
-        model_usage=model_usage or {"claude-test-model": {"input_tokens": input_tokens}},
+        model_usage=(
+            {"claude-test-model": {"input_tokens": input_tokens}}
+            if model_usage is None
+            else model_usage
+        ),
     )
     if message_count is not None:
         result.message_count = message_count
@@ -474,6 +514,36 @@ async def test_retry_failure_logs_both_raw_outputs_and_aborts(
     assert record.prompt_tokens == 321
     assert record.prompt_preview == DEFAULT_PROMPT_TEMPLATE.read_text(encoding="utf-8")[:2000]
     assert record.model_actual == "claude-haiku-4-5,claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_retry_failure_logs_assistant_model_and_observed_message_count_when_sdk_omits_them(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="engram.nightly.synthesize")
+    harvest = _write_harvest(tmp_path, [_channel("C07FALLBACK")])
+    second_raw = json.dumps({"schema_version": 1, "date": "2026-04-22"})
+
+    def factory(options: ClaudeAgentOptions) -> _AssistantModelFallbackClient:
+        return _AssistantModelFallbackClient(options, second_raw)
+
+    with pytest.raises(SynthesisOutputError):
+        await synthesize(
+            harvest,
+            output_root=tmp_path / "nightly",
+            config=NightlyConfig(),
+            contexts_dir=tmp_path / "contexts",
+            anthropic_runtime=AnthropicRuntime(api_key=None, model="configured-model"),
+            budget=_FakeBudget(),
+            client_factory=factory,
+        )
+
+    record = _single_log(caplog.records, "nightly.parse_fail_final")
+    assert record.channel_id == "C07FALLBACK"
+    assert record.message_count == 2
+    assert record.prompt_tokens == 0
+    assert record.model_actual == "claude-sonnet-4-6"
 
 
 @pytest.mark.asyncio

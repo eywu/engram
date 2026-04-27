@@ -99,6 +99,8 @@ class SynthesisResult:
 class ClaudeTurnResult:
     raw_output: str
     result: ResultMessage | None
+    message_count: int
+    assistant_models: tuple[str, ...]
 
 
 class SynthesisOutputError(ValueError):
@@ -465,7 +467,7 @@ async def _synthesize_channel(
                     run_date=run_date,
                     error=retry_exc.detail,
                     raw_outputs=raw_outputs,
-                    result=retry_turn.result or first_turn.result,
+                    turn=retry_turn if retry_turn.result is not None else first_turn,
                     prompt_template=prompt_template,
                 )
                 raise
@@ -730,12 +732,18 @@ async def _run_claude_turn(
 ) -> ClaudeTurnResult:
     text_chunks: list[str] = []
     result: ResultMessage | None = None
+    message_count = 0
+    assistant_models: list[str] = []
     await client.query(prompt, session_id=session_id)
     receive_messages = getattr(client, "receive_messages", None)
     message_stream = receive_messages() if callable(receive_messages) else client.receive_response()
     async for message in message_stream:
+        message_count += 1
         if isinstance(message, AssistantMessage):
             text_chunks.extend(_assistant_text(message))
+            model = str(getattr(message, "model", "") or "").strip()
+            if model and model not in assistant_models:
+                assistant_models.append(model)
         elif isinstance(message, ResultMessage):
             result = message
             if message.stop_reason != "tool_use":
@@ -744,7 +752,12 @@ async def _run_claude_turn(
     raw_output = "".join(text_chunks).strip()
     if not raw_output and result is not None and getattr(result, "structured_output", None) is not None:
         raw_output = json.dumps(result.structured_output)
-    return ClaudeTurnResult(raw_output=raw_output, result=result)
+    return ClaudeTurnResult(
+        raw_output=raw_output,
+        result=result,
+        message_count=message_count,
+        assistant_models=tuple(assistant_models),
+    )
 
 
 def _repair_prompt(error: str) -> str:
@@ -791,10 +804,16 @@ def _log_parse_fail_final(
     run_date: str,
     error: str,
     raw_outputs: list[str],
-    result: ResultMessage | None,
+    turn: ClaudeTurnResult | None,
     prompt_template: str,
 ) -> None:
+    result = turn.result if turn is not None else None
     prompt_tokens, model_actual = _prompt_tokens_and_model(result)
+    message_count = getattr(result, "message_count", None) if result is not None else None
+    if message_count is None and turn is not None:
+        message_count = turn.message_count
+    if model_actual is None and turn is not None and turn.assistant_models:
+        model_actual = ",".join(turn.assistant_models)
     log.error(
         "nightly.parse_fail_final",
         extra={
@@ -807,7 +826,7 @@ def _log_parse_fail_final(
             "raw_output_initial": raw_outputs[0] if raw_outputs else "",
             "raw_output_retry": raw_outputs[1] if len(raw_outputs) > 1 else "",
             "stop_reason": getattr(result, "stop_reason", None) if result is not None else None,
-            "message_count": getattr(result, "message_count", None) if result is not None else None,
+            "message_count": message_count,
             "prompt_tokens": prompt_tokens,
             "prompt_preview": prompt_template[:2000],
             "model_actual": model_actual or plan.model,
