@@ -65,6 +65,12 @@ Tier and trust policy answer "is Engram allowed to make that change?"
 
 This applies when Engram itself is asked to modify a channel manifest.
 
+Implementation note for Engram code paths: external callers that persist an
+already-approved MCP allow-list addition must route the write through
+`persist_approved_mcp_manifest_change`.
+`_persist_manifest_update(..., approved_mcp_additions=...)` is reserved for
+`src/engram/manifest.py` internals.
+
 ## Why the Default for Team Channels Stays Restrictive
 
 Team channels use `setting_sources: [project]` plus strict MCP config on

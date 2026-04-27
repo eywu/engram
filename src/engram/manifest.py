@@ -1018,6 +1018,8 @@ def detect_mcp_allow_list_additions(
 
 def persist_approved_mcp_manifest_change(
     plan: MCPManifestChangePlan,
+    *,
+    audit_source: str | None = None,
 ) -> tuple[ChannelManifest, ChannelManifest, Path]:
     """Persist an approved staged MCP allow-list change.
 
@@ -1054,7 +1056,7 @@ def persist_approved_mcp_manifest_change(
         updated_manifest,
         plan.manifest_path,
         approved_mcp_additions=plan.additions,
-        audit_source="approved_addition",
+        audit_source=audit_source or "approved_addition",
     )
     return previous_manifest or current_manifest, persisted_manifest, persisted_path
 

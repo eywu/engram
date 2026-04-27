@@ -1,6 +1,7 @@
 """Operator-facing MCP onboarding helpers."""
 from __future__ import annotations
 
+import hashlib
 import inspect
 import logging
 from collections.abc import Awaitable, Callable
@@ -11,7 +12,12 @@ from rich import print as rprint
 from rich.prompt import Confirm
 
 from engram import paths
-from engram.manifest import ManifestError, _persist_manifest_update, load_manifest
+from engram.manifest import (
+    ManifestError,
+    MCPManifestChangePlan,
+    load_manifest,
+    persist_approved_mcp_manifest_change,
+)
 from engram.mcp import (
     MCPChannelCoverage,
     audit_mcp_channel_coverage,
@@ -120,10 +126,18 @@ async def sync_team_channel_mcp_allow_lists(
                 }
             )
             try:
-                _persist_manifest_update(
-                    updated_manifest,
-                    manifest_path,
-                    approved_mcp_additions=[server_name],
+                current_text = manifest_path.read_text(encoding="utf-8")
+                persist_approved_mcp_manifest_change(
+                    MCPManifestChangePlan(
+                        manifest_path=manifest_path,
+                        current_manifest=manifest,
+                        staged_manifest=updated_manifest,
+                        staged_text="",
+                        baseline_sha256=hashlib.sha256(
+                            current_text.encode("utf-8")
+                        ).hexdigest(),
+                        additions=[server_name],
+                    ),
                     audit_source=audit_source,
                 )
             except ManifestError as exc:
