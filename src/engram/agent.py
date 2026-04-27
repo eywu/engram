@@ -10,6 +10,7 @@ M4 will add AskUserQuestion stream-watching.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import inspect
 import json
@@ -57,6 +58,13 @@ from engram.manifest import (
     persist_approved_mcp_manifest_change,
 )
 from engram.mcp import resolve_team_mcp_servers, warn_missing_mcp_servers
+from engram.mcp_health import (
+    DEFAULT_RECONNECT_FAIL_THRESHOLD,
+    DEFAULT_WATCHDOG_POLL_INTERVAL_S,
+    McpHealthWatchdog,
+    disable_failed_mcps_pre_turn,
+    warning_chunk_for_pre_turn,
+)
 from engram.mcp_tools import (
     MEMORY_SEARCH_FULL_TOOL_NAMES,
     MEMORY_SEARCH_SERVER_NAME,
@@ -130,6 +138,11 @@ class Agent:
         self._embedder = embedder
         self._embedding_queue = embedding_queue
         self._retry_base_delay_seconds = retry_base_delay_seconds
+        # GRO-555 Layer 1+2 tuning. Exposed as instance attributes (not
+        # constructor args) to keep the public Agent signature stable;
+        # tests reach in to override them.
+        self._mcp_watchdog_threshold = DEFAULT_RECONNECT_FAIL_THRESHOLD
+        self._mcp_watchdog_poll_interval_s = DEFAULT_WATCHDOG_POLL_INTERVAL_S
 
     async def _maybe_gate_manifest_mcp_additions(
         self,
@@ -439,35 +452,90 @@ class Agent:
         client = await self._ensure_client(session)
         uses_raw_stream = callable(getattr(client, "receive_messages", None))
 
-        await client.query(user_text, session_id=session.session_id)
-        # receive_response() stops at the first ResultMessage, but tool-driven
-        # turns can continue with tool_result + assistant text after an
-        # intermediate result. Consume the raw message stream instead.
-        async for message in self._iter_turn_messages(client):
-            if isinstance(message, AssistantMessage):
-                for block in getattr(message, "content", []) or []:
-                    text = getattr(block, "text", None)
-                    if text:
-                        text_chunks.append(text)
-                    tool_use_id = getattr(block, "id", None)
-                    tool_use_input = getattr(block, "input", None)
-                    if tool_use_id and isinstance(tool_use_input, dict):
-                        pending_tool_use_ids.add(tool_use_id)
-            elif isinstance(message, UserMessage):
-                for block in getattr(message, "content", []) or []:
-                    tool_use_id = getattr(block, "tool_use_id", None)
-                    if tool_use_id:
-                        pending_tool_use_ids.discard(tool_use_id)
-            elif isinstance(message, ResultMessage):
-                result = message
-                if uses_raw_stream and self._is_terminal_turn_result(
-                    message,
-                    pending_tool_use_ids=pending_tool_use_ids,
-                ):
-                    break
-            elif isinstance(message, RateLimitEvent):
-                await self._handle_rate_limit_event(session, message)
+        # GRO-555 Layer 1: snapshot MCP health before the turn starts and
+        # disable any server already in failed/needs-auth state, so the
+        # model never tries to invoke its tools during this turn. Skipped
+        # silently for fakes that don't expose MCP control.
+        pre_turn_warning: str | None = None
+        if self._supports_mcp_control(client):
+            outcome = await disable_failed_mcps_pre_turn(
+                client,
+                session_label=session.label(),
+                already_disabled=session.disabled_mcp_servers,
+            )
+            pre_turn_warning = warning_chunk_for_pre_turn(outcome.disabled)
+
+        # GRO-555 Layer 2: spawn the in-turn watchdog. It polls MCP health
+        # at a fixed cadence and circuit-breaks any server that stays in
+        # a failed state across consecutive polls. Always cancelled in the
+        # finally block.
+        watchdog: McpHealthWatchdog | None = None
+        watchdog_task: asyncio.Task[None] | None = None
+        if self._supports_mcp_control(client):
+            watchdog = McpHealthWatchdog(
+                client,
+                session_label=session.label(),
+                already_disabled=session.disabled_mcp_servers,
+                threshold=self._mcp_watchdog_threshold,
+                poll_interval_s=self._mcp_watchdog_poll_interval_s,
+            )
+            watchdog_task = asyncio.create_task(watchdog.run())
+
+        try:
+            await client.query(user_text, session_id=session.session_id)
+            # receive_response() stops at the first ResultMessage, but tool-driven
+            # turns can continue with tool_result + assistant text after an
+            # intermediate result. Consume the raw message stream instead.
+            async for message in self._iter_turn_messages(client):
+                if isinstance(message, AssistantMessage):
+                    for block in getattr(message, "content", []) or []:
+                        text = getattr(block, "text", None)
+                        if text:
+                            text_chunks.append(text)
+                        tool_use_id = getattr(block, "id", None)
+                        tool_use_input = getattr(block, "input", None)
+                        if tool_use_id and isinstance(tool_use_input, dict):
+                            pending_tool_use_ids.add(tool_use_id)
+                elif isinstance(message, UserMessage):
+                    for block in getattr(message, "content", []) or []:
+                        tool_use_id = getattr(block, "tool_use_id", None)
+                        if tool_use_id:
+                            pending_tool_use_ids.discard(tool_use_id)
+                elif isinstance(message, ResultMessage):
+                    result = message
+                    if uses_raw_stream and self._is_terminal_turn_result(
+                        message,
+                        pending_tool_use_ids=pending_tool_use_ids,
+                    ):
+                        break
+                elif isinstance(message, RateLimitEvent):
+                    await self._handle_rate_limit_event(session, message)
+        finally:
+            if watchdog_task is not None:
+                watchdog_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await watchdog_task
+
+        # Splice user-visible warnings AFTER the model output so the
+        # response itself isn't disrupted. Pre-turn warning first (it
+        # tells the user why a tool was missing); then any in-turn
+        # circuit-breaker trips.
+        if pre_turn_warning:
+            text_chunks.append(pre_turn_warning)
+        if watchdog is not None:
+            text_chunks.extend(watchdog.warnings)
         return text_chunks, result
+
+    @staticmethod
+    def _supports_mcp_control(client: object) -> bool:
+        """True iff ``client`` exposes the MCP-control primitives we need.
+
+        Tests pass minimal fakes that only implement query/receive; those
+        skip the GRO-555 health layers entirely.
+        """
+        return callable(getattr(client, "get_mcp_status", None)) and callable(
+            getattr(client, "toggle_mcp_server", None)
+        )
 
     def _iter_turn_messages(self, client: ClaudeSDKClient):
         receive_messages = getattr(client, "receive_messages", None)
@@ -545,6 +613,9 @@ class Agent:
             )
         finally:
             session.agent_client = None
+            # GRO-555: reset the per-channel circuit-breaker ban list. A
+            # new client gets a fresh CLI subprocess and reloads all MCPs.
+            session.disabled_mcp_servers.clear()
 
     async def _tag_session(
         self,
