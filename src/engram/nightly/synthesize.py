@@ -347,7 +347,10 @@ def build_nightly_options(
         setting_sources=["project"],
         cwd=str(current_dir),
         model=plan.model,
-        session_id=f"engram-nightly-{run_date}-{plan.channel_id}-{uuid.uuid4().hex}",
+        # GRO-564: Claude Agent SDK / Claude Code CLI rejects non-UUID
+        # session_id values. Keep nightly synthesis ephemeral and use a raw
+        # UUID here; adding human-readable prefixes breaks SDK validation.
+        session_id=str(uuid.uuid4()),
         max_turns=1,
         permission_mode="dontAsk",
         allowed_tools=list(MEMORY_SEARCH_FULL_TOOL_NAMES),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -272,6 +273,35 @@ async def test_synthesize_sets_nightly_sdk_invariants_and_records_budget(
     assert startup.hitl_disabled is True
     assert startup.hitl_config_enabled is False
     assert _single_log(caplog.records, "nightly.parse_ok").attempt == 1
+
+
+def test_build_nightly_options_uses_uuid_session_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "engram.nightly.synthesize.make_memory_search_server",
+        lambda *args, **kwargs: {"name": "engram-memory"},
+    )
+    options = build_nightly_options(
+        plan=PlannedChannel(
+            channel=_channel("C07TEST123"),
+            manifest=None,
+            model="sonnet",
+            estimated_cost_usd=Decimal("0.01"),
+        ),
+        run_date="2026-04-22",
+        current_dir=tmp_path,
+        runtime=AnthropicRuntime(api_key=None, model="global-model"),
+        hitl_config=HITLConfig(enabled=False),
+        config=NightlyConfig(),
+    )
+
+    assert options.session_id is not None
+    assert re.fullmatch(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        options.session_id,
+    )
 
 
 def test_golden_fixture_outputs_match_schema() -> None:
