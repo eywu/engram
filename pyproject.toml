@@ -67,3 +67,6 @@ ignore = ["E501"]  # line length handled by formatter
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "requires_api_key: integration tests that call Anthropic directly and are skipped in CI",
+]
