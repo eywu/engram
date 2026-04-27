@@ -40,6 +40,40 @@ def _manifest_helper_aliases(tree: ast.AST) -> tuple[set[str], set[str]]:
                 if alias.name.endswith(".manifest") and alias.asname is not None:
                     module_names.add(alias.asname)
 
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+                value = node.value
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+                value = node.value
+            else:
+                continue
+
+            if value is None or len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                continue
+
+            target_name = targets[0].id
+            if target_name in direct_names:
+                continue
+
+            value_name = _dotted_name(value)
+            if value_name is None:
+                continue
+            if value_name == "_persist_manifest_update" or value_name in direct_names:
+                direct_names.add(target_name)
+                changed = True
+                continue
+            if not value_name.endswith("._persist_manifest_update"):
+                continue
+            prefix = value_name.removesuffix("._persist_manifest_update")
+            if prefix in module_names or value_name.endswith("manifest._persist_manifest_update"):
+                direct_names.add(target_name)
+                changed = True
+
     return direct_names, module_names
 
 
@@ -83,14 +117,22 @@ def _find_external_approved_mcp_manifest_updates(
                 module_names=module_names,
             ):
                 continue
-            approved_additions = next(
-                (
-                    keyword.value
-                    for keyword in node.keywords
-                    if keyword.arg == "approved_mcp_additions"
-                ),
-                None,
-            )
+            approved_additions = None
+            for keyword in node.keywords:
+                if keyword.arg == "approved_mcp_additions":
+                    approved_additions = keyword.value
+                    break
+                if keyword.arg is not None or not isinstance(keyword.value, ast.Dict):
+                    continue
+                for key, value in zip(keyword.value.keys, keyword.value.values, strict=False):
+                    if (
+                        isinstance(key, ast.Constant)
+                        and key.value == "approved_mcp_additions"
+                    ):
+                        approved_additions = value
+                        break
+                if approved_additions is not None:
+                    break
             if approved_additions is None:
                 continue
             if (
@@ -177,12 +219,49 @@ def test_manifest_ci_guard_detects_external_approved_mcp_updates(
         ),
         encoding="utf-8",
     )
+    (engram_src / "bad_assigned_alias.py").write_text(
+        dedent(
+            """
+            from engram.manifest import _persist_manifest_update
+
+
+            def offender(manifest, path):
+                persist_update = _persist_manifest_update
+                persist_update(
+                    manifest,
+                    path,
+                    approved_mcp_additions=["camoufox"],
+                )
+            """
+        ),
+        encoding="utf-8",
+    )
+    (engram_src / "bad_kwargs.py").write_text(
+        dedent(
+            """
+            from engram.manifest import _persist_manifest_update
+
+
+            def offender(manifest, path):
+                _persist_manifest_update(
+                    manifest,
+                    path,
+                    **{"approved_mcp_additions": ["camoufox"]},
+                )
+            """
+        ),
+        encoding="utf-8",
+    )
 
     offenders = _find_external_approved_mcp_manifest_updates(project_root)
 
-    assert len(offenders) == 2
+    assert len(offenders) == 4
     assert any(entry.startswith("src/engram/bad_direct.py:") for entry in offenders)
     assert any(entry.startswith("src/engram/bad_attr.py:") for entry in offenders)
+    assert any(
+        entry.startswith("src/engram/bad_assigned_alias.py:") for entry in offenders
+    )
+    assert any(entry.startswith("src/engram/bad_kwargs.py:") for entry in offenders)
 
 
 def test_manifest_ci_guard_has_no_live_offenders() -> None:

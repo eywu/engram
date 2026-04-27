@@ -65,9 +65,9 @@ Tier and trust policy answer "is Engram allowed to make that change?"
 
 This applies when Engram itself is asked to modify a channel manifest.
 
-Implementation note for Engram code paths: external callers that persist an
-already-approved MCP allow-list addition must route the write through
-`persist_approved_mcp_manifest_change`.
+Implementation note for Engram code paths: CI enforces that external callers
+which persist an already-approved MCP allow-list addition must route the write
+through `persist_approved_mcp_manifest_change`.
 `_persist_manifest_update(..., approved_mcp_additions=...)` is reserved for
 `src/engram/manifest.py` internals.
 
