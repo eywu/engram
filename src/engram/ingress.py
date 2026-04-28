@@ -14,6 +14,7 @@ import datetime
 import logging
 import re
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -61,7 +62,11 @@ from engram.manifest import (
 )
 from engram.mcp import render_channel_mcp_access
 from engram.mcp_manifest_gate import MCPApprovalDisposition
-from engram.mcp_trust import add_trusted_publishers, render_owner_approval_markdown
+from engram.mcp_trust import (
+    add_trusted_publishers,
+    render_owner_approval_markdown,
+    render_trust_add_recovery_message,
+)
 from engram.notifications import (
     PENDING_CHANNEL_ACTION_ID_PATTERN,
     handle_pending_channel_action,
@@ -1080,6 +1085,16 @@ async def handle_engram_command(
             args=parts[1:],
         )
 
+    if subcommand == "trust":
+        return await handle_trust_command(
+            router=router,
+            config=config,
+            slack_client=slack_client,
+            source_channel_id=source_channel_id,
+            user_id=user_id,
+            args=parts[1:],
+        )
+
     if subcommand == "yolo":
         return await handle_yolo_command(
             router=router,
@@ -1097,6 +1112,59 @@ async def handle_engram_command(
         text=f"Unknown /engram subcommand: {subcommand}",
     )
     return {"ok": False, "error": "unknown subcommand"}
+
+
+async def handle_trust_command(
+    *,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+    source_channel_id: str,
+    user_id: str | None,
+    args: list[str],
+) -> dict[str, object]:
+    if not args or args[0].lower() != "add":
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text="Usage: /engram trust add <publisher> [publisher...]",
+        )
+        return {"ok": False, "error": "unknown trust subcommand"}
+
+    if not _is_owner_user(config=config, user_id=user_id):
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text="Owner-only.",
+        )
+        return {"ok": False, "error": "not owner"}
+
+    publishers = _parse_trust_add_publishers(args[1:])
+    if not publishers:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text="Usage: /engram trust add <publisher> [publisher...]",
+        )
+        return {"ok": False, "error": "missing publisher"}
+
+    changed = add_trusted_publishers(publishers, home=router.home)
+    publisher_text = ", ".join(f"{registry}:{publisher}" for registry, publisher in publishers)
+    text = (
+        f"Trusted publishers updated: {publisher_text}"
+        if changed
+        else f"Publishers already trusted: {publisher_text}"
+    )
+    await _post_ephemeral_reply(
+        slack_client,
+        channel_id=source_channel_id,
+        user_id=user_id,
+        text=text,
+    )
+    return {"ok": True, "action": "trust add", "changed": changed}
 
 
 async def handle_channels_command(
@@ -1668,18 +1736,30 @@ async def handle_mcp_command(
                 approval_plan,
                 audit_source="channel_mcp_allow",
             )
+            await router.invalidate(source_channel_id)
+            router.replace_cached_manifest(updated)
             if q.resolution_choice == "1":
                 trusted_publishers = [
                     (decision.registry, decision.publisher or "")
                     for decision in decisions
                     if decision.publisher
                 ]
-                add_trusted_publishers(
-                    trusted_publishers,
-                    home=router.home,
-                )
-            await router.invalidate(source_channel_id)
-            router.replace_cached_manifest(updated)
+                try:
+                    add_trusted_publishers(
+                        trusted_publishers,
+                        home=router.home,
+                    )
+                except Exception as exc:
+                    q.resolution_status_message = (
+                        render_trust_add_recovery_message(trusted_publishers)
+                    )
+                    log.warning(
+                        "mcp.publisher_trust_add_failed_after_manifest_persist "
+                        "permission_request_id=%s publishers=%r: %s",
+                        q.permission_request_id,
+                        trusted_publishers,
+                        exc,
+                    )
 
         q.on_resolve = _apply_approved_manifest
         router.hitl.register(q)
@@ -3161,6 +3241,40 @@ def _normalize_target_text(raw: str | None) -> str | None:
     return target
 
 
+def _parse_trust_add_publishers(args: list[str]) -> list[tuple[str, str]]:
+    if not args:
+        return []
+
+    registries = {"npm", "pypi"}
+    if args[0].lower() in registries:
+        registry = args[0].lower()
+        return _dedupe_publishers((registry, publisher) for publisher in args[1:])
+
+    parsed: list[tuple[str, str]] = []
+    for raw in args:
+        publisher = str(raw or "").strip().lower()
+        if not publisher:
+            continue
+        registry, separator, name = publisher.partition(":")
+        if separator and registry in registries and name:
+            parsed.append((registry, name))
+        else:
+            parsed.extend((registry_name, publisher) for registry_name in sorted(registries))
+    return _dedupe_publishers(parsed)
+
+
+def _dedupe_publishers(
+    publishers: Iterable[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    deduped: dict[tuple[str, str], None] = {}
+    for registry, publisher in publishers:
+        registry_name = str(registry or "").strip().lower()
+        publisher_name = str(publisher or "").strip().lower()
+        if registry_name in {"npm", "pypi"} and publisher_name:
+            deduped[(registry_name, publisher_name)] = None
+    return list(deduped)
+
+
 def _is_owner_user(*, config: EngramConfig, user_id: str | None) -> bool:
     return bool(config.owner_user_id and user_id == config.owner_user_id)
 
@@ -3672,6 +3786,8 @@ async def _resolve_block_action(
             if q.on_resolve is not None:
                 try:
                     await q.on_resolve(result)
+                    if q.resolution_status_message is not None:
+                        answer_text = q.resolution_status_message
                 except Exception as exc:
                     applied_successfully = False
                     log.exception(
@@ -3680,6 +3796,7 @@ async def _resolve_block_action(
                         choice_key,
                     )
                     answer_text = f"Approval failed to apply: {exc}"
+            q.applied_successfully = applied_successfully
         await update_question_resolved(
             q,
             answer_text,

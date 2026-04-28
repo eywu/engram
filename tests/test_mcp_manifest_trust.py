@@ -13,7 +13,7 @@ from claude_agent_sdk.types import ToolPermissionContext
 from engram.agent import Agent
 from engram.config import AnthropicConfig, EngramConfig, HITLConfig, SlackConfig
 from engram.egress import post_question
-from engram.ingress import handle_block_action
+from engram.ingress import handle_block_action, handle_engram_command
 from engram.manifest import (
     ChannelManifest,
     ChannelStatus,
@@ -32,12 +32,18 @@ from engram.router import Router
 class FakeSlackClient:
     def __init__(self) -> None:
         self.post_calls: list[dict] = []
+        self.ephemeral_calls: list[dict] = []
         self.update_calls: list[dict] = []
         self.chat_postMessage = self._chat_post_message
+        self.chat_postEphemeral = self._chat_post_ephemeral
 
     async def _chat_post_message(self, **kwargs):
         self.post_calls.append(kwargs)
         return {"ts": "1713800000.000100"}
+
+    async def _chat_post_ephemeral(self, **kwargs):
+        self.ephemeral_calls.append(kwargs)
+        return {"ok": True}
 
     async def chat_update(self, **kwargs):
         self.update_calls.append(kwargs)
@@ -662,6 +668,181 @@ async def test_unknown_manifest_mcp_addition_apply_failure_updates_dm(
     assert slack.update_calls[-1]["blocks"][0]["text"]["text"].startswith(
         "❌ Answered: Approval failed to apply:"
     )
+
+
+@pytest.mark.asyncio
+async def test_unknown_manifest_publisher_trust_add_failure_partial_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / ".engram"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (Path.home() / ".claude.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "camoufox": {
+                        "command": "uvx",
+                        "args": ["camoufox-browser[mcp]==0.1.1"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest_path = channel_manifest_path("C07TEAM", home)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_manifest(_manifest(), manifest_path)
+
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    session = await router.get("C07TEAM")
+    slack = FakeSlackClient()
+    agent = Agent(_cfg(), router=router)
+
+    async def on_new_question(q) -> None:
+        channel_ts, thread_ts = await post_question(q, slack)
+        q.slack_channel_ts = channel_ts
+        q.slack_thread_ts = thread_ts
+
+    agent._on_new_question = on_new_question
+    opts = agent._build_options(session)
+    staged = session.manifest.model_copy(update={"mcp_servers": ScopeList(allowed=["camoufox"])})
+
+    monkeypatch.setattr(
+        "engram.agent.resolve_mcp_server_trust",
+        _constant_trust_decision(
+            MCPTrustTier.UNKNOWN,
+            server_name="camoufox",
+            package_name="camoufox-browser",
+            version="0.1.1",
+            publisher="camoufox-labs",
+            summary="age=14d, downloads=25/week, contributors=1, repo_active=no",
+        ),
+    )
+
+    def fail_add_trusted_publishers(*args, **kwargs) -> None:
+        raise OSError("trust overlay unavailable")
+
+    monkeypatch.setattr(
+        "engram.agent.add_trusted_publishers",
+        fail_add_trusted_publishers,
+    )
+
+    result = await opts.can_use_tool(
+        "Write",
+        {"file_path": str(manifest_path), "content": _render_manifest(staged)},
+        ToolPermissionContext(tool_use_id="tool-1"),
+    )
+    assert isinstance(result, PermissionResultDeny)
+
+    pending = router.hitl.pending_for_channel("C07TEAM")
+    assert len(pending) == 1
+    q = pending[0]
+
+    ack = await handle_block_action(
+        _block_action_payload(f"{q.permission_request_id}|1"),
+        router,
+        slack,
+    )
+
+    assert ack == {"ok": True}
+    await _wait_until(lambda: q.future.done() and bool(slack.update_calls))
+    assert load_manifest(manifest_path).mcp_servers.allowed == ["camoufox"]
+    assert q.applied_successfully is True
+    assert "✅ MCP added" in slack.update_calls[-1]["text"]
+    assert "failed to add publisher to trust list" in slack.update_calls[-1]["text"]
+    assert "/engram trust add pypi:camoufox-labs" in slack.update_calls[-1]["text"]
+    assert slack.update_calls[-1]["blocks"][0]["text"]["text"].startswith(
+        "✅ Answered: ✅ MCP added;"
+    )
+    assert not (state_dir(home) / "trusted_publishers.yaml").exists()
+
+
+@pytest.mark.asyncio
+async def test_unknown_manifest_publisher_trust_add_failure_partial_success_ingress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / ".engram"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (Path.home() / ".claude.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "camoufox": {
+                        "command": "uvx",
+                        "args": ["camoufox-browser[mcp]==0.1.1"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest_path = channel_manifest_path("C07TEAM", home)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_manifest(
+        _manifest(allowed=[]).model_copy(
+            update={"permission_tier": PermissionTier.TASK_ASSISTANT}
+        ),
+        manifest_path,
+    )
+
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    async def trust_fake(_server_name, _server_config, *, home=None):
+        return MCPTrustDecision(
+            server_name="camoufox",
+            tier=MCPTrustTier.UNKNOWN,
+            registry="pypi",
+            package_name="camoufox-browser[mcp]",
+            version="0.1.1",
+            publisher="camoufox-labs",
+            publishers=["camoufox-labs"],
+            trust_summary="metadata lookup failed",
+            reason="metadata lookup failed",
+        )
+
+    def fail_add_trusted_publishers(*args, **kwargs) -> None:
+        raise OSError("trust overlay unavailable")
+
+    monkeypatch.setattr("engram.mcp_manifest_gate.resolve_mcp_server_trust", trust_fake)
+    monkeypatch.setattr(
+        "engram.ingress.add_trusted_publishers",
+        fail_add_trusted_publishers,
+    )
+
+    result = await handle_engram_command(
+        router=router,
+        config=_cfg(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OWNER",
+        command_text="mcp allow camoufox",
+    )
+
+    assert result == {"ok": True, "action": "allow", "changed": False, "pending": True}
+    pending = router.hitl.pending_for_channel("C07TEAM")
+    assert len(pending) == 1
+    q = pending[0]
+
+    ack = await handle_block_action(
+        _block_action_payload(f"{q.permission_request_id}|1"),
+        router,
+        slack,
+    )
+
+    assert ack == {"ok": True}
+    await _wait_until(lambda: q.future.done() and bool(slack.update_calls))
+    assert load_manifest(manifest_path).mcp_servers.allowed == ["camoufox"]
+    assert q.applied_successfully is True
+    assert "✅ MCP added" in slack.update_calls[-1]["text"]
+    assert "failed to add publisher to trust list" in slack.update_calls[-1]["text"]
+    assert "/engram trust add pypi:camoufox-labs" in slack.update_calls[-1]["text"]
+    assert not (state_dir(home) / "trusted_publishers.yaml").exists()
 
 
 def _constant_trust_decision(

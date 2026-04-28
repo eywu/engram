@@ -191,10 +191,10 @@ def add_trusted_publishers(
     publishers: list[tuple[str, str]],
     *,
     home: Path | None = None,
-) -> None:
+) -> bool:
     """Persist trusted publisher overrides in the operator overlay file."""
     if not publishers:
-        return
+        return False
     overlay_path = paths.state_dir(home) / TRUSTED_PUBLISHERS_OVERLAY_FILE
     overlay_path.parent.mkdir(parents=True, exist_ok=True)
     overlay = _load_yaml_mapping(overlay_path) if overlay_path.exists() else {}
@@ -214,6 +214,20 @@ def add_trusted_publishers(
             yaml.safe_dump(overlay, sort_keys=False, default_flow_style=False, indent=2),
             encoding="utf-8",
         )
+    return changed
+
+
+def render_trust_add_recovery_message(publishers: list[tuple[str, str]]) -> str:
+    """Render the Slack status for a manifest-applied/trust-overlay-failed result."""
+    command_args = " ".join(
+        arg
+        for registry, publisher in publishers
+        if (arg := _format_trust_add_arg(registry, publisher))
+    )
+    return (
+        "✅ MCP added; ⚠️ failed to add publisher to trust list - "
+        f"re-run with `/engram trust add {command_args}`"
+    )
 
 
 async def _resolve_uncached_decision(
@@ -804,6 +818,14 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any]:
 def _normalize_publisher(value: Any) -> str | None:
     text = str(value or "").strip().lower()
     return text or None
+
+
+def _format_trust_add_arg(registry: str, publisher: str) -> str:
+    registry_name = str(registry or "").strip().lower()
+    normalized = _normalize_publisher(publisher)
+    if registry_name in {"npm", "pypi"} and normalized:
+        return f"{registry_name}:{normalized}"
+    return normalized or ""
 
 
 def _cache_path(home: Path | None) -> Path:

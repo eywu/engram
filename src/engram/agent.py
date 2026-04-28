@@ -77,6 +77,7 @@ from engram.mcp_tools import (
 from engram.mcp_trust import (
     add_trusted_publishers,
     render_owner_approval_markdown,
+    render_trust_add_recovery_message,
     resolve_mcp_server_trust,
 )
 from engram.memory_hooks import make_memory_hooks_with_embeddings
@@ -245,10 +246,22 @@ class Agent:
                         for decision in decisions
                         if decision.publisher
                     ]
-                    add_trusted_publishers(
-                        trusted_publishers,
-                        home=self._router.home,
-                    )
+                    try:
+                        add_trusted_publishers(
+                            trusted_publishers,
+                            home=self._router.home,
+                        )
+                    except Exception as exc:
+                        q.resolution_status_message = (
+                            render_trust_add_recovery_message(trusted_publishers)
+                        )
+                        log.warning(
+                            "mcp.publisher_trust_add_failed_after_manifest_persist "
+                            "permission_request_id=%s publishers=%r: %s",
+                            q.permission_request_id,
+                            trusted_publishers,
+                            exc,
+                        )
 
             q.on_resolve = _apply_approved_manifest
             self._router.hitl.register(q)
