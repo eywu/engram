@@ -279,8 +279,8 @@ def test_check_slack_bot_token_fails_on_expected_team_mismatch(tmp_path: Path) -
     assert check.details["team_id"] == "T999"
     assert check.details["expected_team_id"] == "T123"
     assert "Other Workspace" in check.message
-    assert "T999" in check.message
-    assert "T123" in check.message
+    assert "auth.test returned team_id T999" in check.message
+    assert "config expects T123" in check.message
 
 
 def test_owner_approval_checks_warn_when_missing(tmp_path: Path) -> None:

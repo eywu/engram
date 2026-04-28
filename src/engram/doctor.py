@@ -569,7 +569,8 @@ def check_slack_bot_token(
             status=CheckStatus.FAIL,
             message=(
                 f"Slack token is valid for workspace {observed_workspace}, "
-                f"but config expects team_id {expected_team_id}."
+                f"but auth.test returned team_id {team_id} while config expects "
+                f"{expected_team_id}."
             ),
             details=details,
         )
