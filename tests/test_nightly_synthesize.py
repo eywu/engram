@@ -501,6 +501,72 @@ print(json.dumps({
     assert "Respond ONLY with valid JSON matching the schema." in payload["prompt_text"]
 
 
+@pytest.mark.requires_build
+@pytest.mark.skipif(
+    os.environ.get("ENGRAM_RUN_REQUIRES_BUILD_TESTS") != "1",
+    reason="set ENGRAM_RUN_REQUIRES_BUILD_TESTS=1 to run wheel build/install smoke tests",
+)
+def test_default_prompt_template_loads_from_built_wheel(tmp_path: Path) -> None:
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv is required to build and install the wheel")
+
+    repo_root = Path(__file__).resolve().parents[1]
+    dist_dir = tmp_path / "dist"
+    venv_dir = tmp_path / "venv"
+
+    subprocess.run(
+        [uv, "build", "--wheel", "--out-dir", str(dist_dir)],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=repo_root,
+    )
+    wheels = list(dist_dir.glob("engram-*.whl"))
+    assert len(wheels) == 1
+
+    subprocess.run(
+        [uv, "venv", str(venv_dir)],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+    venv_python = venv_dir / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    subprocess.run(
+        [uv, "pip", "install", "--python", str(venv_python), str(wheels[0])],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+
+    script = """
+import json
+import sys
+import engram.nightly.synthesize as synth
+
+print(json.dumps({
+    "module_file": synth.__file__,
+    "prompt_text": synth.DEFAULT_PROMPT_TEMPLATE.read_text(encoding="utf-8"),
+    "prefix": sys.prefix,
+}))
+"""
+    result = subprocess.run(
+        [str(venv_python), "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+    payload = json.loads(result.stdout)
+
+    assert Path(payload["prefix"]) == venv_dir
+    assert Path(payload["module_file"]).is_relative_to(venv_dir)
+    assert "site-packages" in payload["module_file"]
+    assert "Respond ONLY with valid JSON matching the schema." in payload["prompt_text"]
+
+
 def test_golden_fixture_outputs_match_schema() -> None:
     fixture_dir = Path(__file__).parent / "fixtures" / "nightly"
     harvest_paths = sorted(fixture_dir.glob("harvest-*.json"))
