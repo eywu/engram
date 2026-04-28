@@ -23,8 +23,13 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
-    McpServerConfig,
     ResultMessage,
+)
+from claude_agent_sdk.types import (
+    McpHttpServerConfig,
+    McpSdkServerConfig,
+    McpSSEServerConfig,
+    McpStdioServerConfig,
 )
 from dotenv import load_dotenv
 from pydantic import ValidationError
@@ -367,7 +372,16 @@ def build_nightly_options(
             "WebSearch",
         ],
         skills=[],
-        mcp_servers=cast(dict[str, McpServerConfig], mcp_servers),
+        mcp_servers=cast(
+            dict[
+                str,
+                McpSdkServerConfig
+                | McpStdioServerConfig
+                | McpSSEServerConfig
+                | McpHttpServerConfig,
+            ],
+            mcp_servers,
+        ),
         extra_args={"strict-mcp-config": None},
         max_budget_usd=MAX_TURN_BUDGET_USD,
         env=child_env,
