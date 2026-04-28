@@ -195,6 +195,7 @@ async def handle_pending_channel_action(
     request = _decode_action_value(action.get("value", ""))
     if request is None:
         return {"ok": False, "error": "malformed value"}
+    assert request["channel_id"] is not None
 
     if action_id == "pending_channel_approve":
         return await handle_approval_button(

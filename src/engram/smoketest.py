@@ -215,6 +215,7 @@ async def run_smoke(
     try:
         await client.connect()
         logger.event("smoketest.client_connected")
+        assert options.session_id is not None
         await client.query(SMOKE_PROMPT, session_id=options.session_id)
         async for message in client.receive_response():
             if isinstance(message, AssistantMessage):

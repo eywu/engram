@@ -5,7 +5,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from engram.config import DEFAULT_CONFIG_PATH, NightlyConfig, load_nightly_config
 from engram.nightly.apply import ApplyResult, apply_synthesis
@@ -129,8 +129,8 @@ async def run_nightly_pipeline(
         date=run_date_text,
         trigger="nightly",
         output_path=str(daily_harvest.output_path),
-        channels=len(daily_harvest.payload.get("channels") or []),
-        skipped_channels=len(daily_harvest.payload.get("skipped_channels") or []),
+        channels=len(cast(list, daily_harvest.payload.get("channels") or [])),
+        skipped_channels=len(cast(list, daily_harvest.payload.get("skipped_channels") or [])),
         dry_run=dry_run,
     )
     _verbose_event(
@@ -220,8 +220,8 @@ async def run_nightly_pipeline(
             date=run_date_text,
             trigger="nightly-weekly",
             output_path=str(weekly_harvest.output_path),
-            channels=len(weekly_harvest.payload.get("channels") or []),
-            skipped_channels=len(weekly_harvest.payload.get("skipped_channels") or []),
+            channels=len(cast(list, weekly_harvest.payload.get("channels") or [])),
+            skipped_channels=len(cast(list, weekly_harvest.payload.get("skipped_channels") or [])),
             dry_run=dry_run,
         )
         _verbose_event(
@@ -350,7 +350,7 @@ def _attach_weekly_source_row_ids(
             for row in channel.get("rows", [])
             if isinstance(row, dict) and "id" in row
         ]
-        for channel in harvest_payload.get("channels", [])
+        for channel in cast(list, harvest_payload.get("channels", []))
         if isinstance(channel, dict)
     }
     for channel in synthesis_payload.get("channels", []):

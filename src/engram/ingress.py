@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
@@ -1826,6 +1826,8 @@ async def handle_mcp_command(
         )
         return {"ok": False, "error": "missing mcp server"}
 
+    assert action in ("allow", "deny")
+    action = cast(Literal["allow", "deny"], action)
     try:
         server_name = normalize_mcp_server_name(" ".join(args[1:]))
     except ValueError as exc:
@@ -2605,7 +2607,7 @@ async def _post_ephemeral_reply(
 
 
 async def _maybe_respond_with_dashboard(*, result: dict[str, object], respond) -> None:
-    response = result.get("response")
+    response = cast(dict[str, Any] | None, result.get("response"))
     if not response or respond is None:
         return
     await respond(**response)
@@ -3686,6 +3688,7 @@ async def _extend_yolo_grant(
             "message": f"No active yolo grant for {channel_id}.",
         }
 
+    assert manifest.yolo_until is not None
     remaining = manifest.yolo_until - current_time
     requested_delta = _yolo_extension_delta(normalized_duration)
     if remaining + requested_delta > YOLO_MAX_DURATION:

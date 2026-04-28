@@ -296,9 +296,9 @@ async def _classify_decision(
     registry_key = package_ref.registry.value
     trusted = trusted_publishers.get(registry_key, {})
     publisher_names = [
-        _normalize_publisher(name)
+        normalized
         for name in metadata.get("publishers", [])
-        if _normalize_publisher(name)
+        if (normalized := _normalize_publisher(name))
     ]
     primary_publisher = next(iter(publisher_names), None)
     repo_url = metadata.get("repo_url")
@@ -797,9 +797,9 @@ def _load_trusted_publishers(home: Path | None) -> dict[str, dict[str, set[str]]
                 (overlay.get(registry_name) or {}).get(key) or [],
             ):
                 values.update(
-                    _normalize_publisher(value)
+                    normalized
                     for value in raw
-                    if _normalize_publisher(value)
+                    if (normalized := _normalize_publisher(value))
                 )
             registry_data[key] = values
         merged[registry_name] = registry_data

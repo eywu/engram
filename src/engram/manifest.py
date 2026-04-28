@@ -787,6 +787,7 @@ def _apply_tier_defaults(
         permission_tier = resolved_tier.value
         changed = True
 
+    assert isinstance(permission_tier, str)
     try:
         tier = PermissionTier(permission_tier)
     except (TypeError, ValueError):
@@ -1582,7 +1583,10 @@ def _assert_sticky_eligible(tool_name: str) -> None:
 
 def _assert_sticky_tier(manifest: ChannelManifest) -> None:
     """Raise ValueError if sticky allow would persist outside the trusted tier."""
-    current_tier = manifest.tier_effective().value
+    current_tier = cast(
+        Literal["safe", "trusted", "yolo"],
+        manifest.tier_effective().value,
+    )
     if (
         classify_transition(current_tier, PermissionTier.OWNER_SCOPED.value)
         != "no-op"
@@ -1709,6 +1713,7 @@ def set_channel_permission_tier(
         update_data["yolo_granted_at"] = None
         update_data["pre_yolo_tier"] = None
     elif is_active_yolo_extension:
+        assert manifest.yolo_until is not None
         update_data["yolo_until"] = manifest.yolo_until + UPGRADE_DURATION_DELTAS[normalized_duration]
         update_data["yolo_granted_at"] = manifest.yolo_granted_at or current_time
         update_data["pre_yolo_tier"] = (
