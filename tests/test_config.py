@@ -16,11 +16,13 @@ def clean_env(monkeypatch):
         "ENGRAM_SLACK_BOT_TOKEN",
         "ENGRAM_SLACK_APP_TOKEN",
         "ENGRAM_SLACK_SIGNING_SECRET",
+        "ENGRAM_SLACK_TEAM_ID",
         "ENGRAM_ANTHROPIC_API_KEY",
         "ENGRAM_MODEL",
         "SLACK_BOT_TOKEN",
         "SLACK_APP_TOKEN",
         "SLACK_SIGNING_SECRET",
+        "SLACK_TEAM_ID",
         "ANTHROPIC_API_KEY",
         "GEMINI_API_KEY",
     ):
@@ -130,11 +132,13 @@ def test_load_nightly_config_does_not_require_runtime_secrets(tmp_path, clean_en
 def test_env_fallback(tmp_path, clean_env, monkeypatch):
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-env")
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-env")
+    monkeypatch.setenv("SLACK_TEAM_ID", "T02ENV123")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env")
     path = tmp_path / "empty.yaml"  # doesn't exist
     cfg = EngramConfig.load(path)
     assert cfg.slack.bot_token == "xoxb-env"
     assert cfg.slack.app_token == "xapp-env"
+    assert cfg.slack.team_id == "T02ENV123"
     assert cfg.anthropic.api_key == "sk-ant-env"
 
 
