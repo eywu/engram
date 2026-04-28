@@ -787,7 +787,8 @@ def _apply_tier_defaults(
         permission_tier = resolved_tier.value
         changed = True
 
-    assert isinstance(permission_tier, str)
+    if not isinstance(permission_tier, str):
+        return data, changed
     try:
         tier = PermissionTier(permission_tier)
     except (TypeError, ValueError):
