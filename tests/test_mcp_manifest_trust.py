@@ -687,3 +687,179 @@ def _constant_trust_decision(
         )
 
     return _resolver
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# GRO-544: stale-merge inventory snapshot enforcement
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _write_inventory(tmp_path: Path, servers: dict[str, dict[str, object]]) -> Path:
+    path = tmp_path / ".claude.json"
+    path.write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+    return path
+
+
+def _seed_manifest_for_plan(
+    tmp_path: Path, *, channel_id: str = "C07TEAM"
+) -> Path:
+    home = tmp_path / ".engram"
+    manifest_path = channel_manifest_path(channel_id, home)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_manifest(_manifest(channel_id=channel_id), manifest_path)
+    return manifest_path
+
+
+def test_stale_merge_with_changed_inventory_config_requires_fresh_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from engram.manifest import (
+        ScopeList,
+        build_mcp_manifest_change_plan,
+        load_manifest,
+        persist_approved_mcp_manifest_change,
+    )
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    inventory_v1 = {
+        "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+    }
+    _write_inventory(tmp_path, inventory_v1)
+    manifest_path = _seed_manifest_for_plan(tmp_path)
+    current = load_manifest(manifest_path)
+    staged = current.model_copy(update={"mcp_servers": ScopeList(allowed=["camoufox"])})
+
+    plan = build_mcp_manifest_change_plan(
+        manifest_path, staged, inventory=inventory_v1
+    )
+    assert plan is not None
+    assert plan.addition_inventory_hashes["camoufox"]
+
+    # Simulate a concurrent inventory write (different version landing) AND
+    # a concurrent manifest write (different harmless edit) so we hit the
+    # stale-merge branch.
+    inventory_v2 = {
+        "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.2"]},
+    }
+    _write_inventory(tmp_path, inventory_v2)
+    drifted_text = manifest_path.read_text(encoding="utf-8") + "\n# concurrent edit\n"
+    manifest_path.write_text(drifted_text, encoding="utf-8")
+
+    with pytest.raises(ManifestError, match="Concurrent change detected"):
+        persist_approved_mcp_manifest_change(plan)
+
+    # Manifest unchanged from concurrent-write state (no allow-list update).
+    persisted = load_manifest(manifest_path)
+    assert persisted.mcp_servers.allowed is None
+
+
+def test_stale_merge_with_unchanged_inventory_config_persists_normally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from engram.manifest import (
+        ScopeList,
+        build_mcp_manifest_change_plan,
+        load_manifest,
+        persist_approved_mcp_manifest_change,
+    )
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    inventory = {
+        "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+    }
+    _write_inventory(tmp_path, inventory)
+    manifest_path = _seed_manifest_for_plan(tmp_path)
+    current = load_manifest(manifest_path)
+    staged = current.model_copy(update={"mcp_servers": ScopeList(allowed=["camoufox"])})
+
+    plan = build_mcp_manifest_change_plan(
+        manifest_path, staged, inventory=inventory
+    )
+    assert plan is not None
+
+    # Trigger stale-merge branch with manifest text drift, but inventory is
+    # untouched.
+    drifted_text = manifest_path.read_text(encoding="utf-8") + "\n# concurrent edit\n"
+    manifest_path.write_text(drifted_text, encoding="utf-8")
+
+    persist_approved_mcp_manifest_change(plan)
+    persisted = load_manifest(manifest_path)
+    assert persisted.mcp_servers.allowed == ["camoufox"]
+
+
+def test_happy_path_inventory_change_does_not_trigger_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Manifest baseline matches \u2192 staged_manifest written directly, no inventory check."""
+    from engram.manifest import (
+        ScopeList,
+        build_mcp_manifest_change_plan,
+        load_manifest,
+        persist_approved_mcp_manifest_change,
+    )
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    inventory_v1 = {
+        "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]},
+    }
+    _write_inventory(tmp_path, inventory_v1)
+    manifest_path = _seed_manifest_for_plan(tmp_path)
+    current = load_manifest(manifest_path)
+    staged = current.model_copy(update={"mcp_servers": ScopeList(allowed=["camoufox"])})
+
+    plan = build_mcp_manifest_change_plan(
+        manifest_path, staged, inventory=inventory_v1
+    )
+    assert plan is not None
+
+    # Inventory drifts but manifest text does NOT \u2014 happy path bypasses
+    # the verification (the staged_manifest the owner reviewed is what
+    # lands; inventory drift is a separate concern handled by the next
+    # plan creation).
+    inventory_v2 = {
+        "camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.2"]},
+    }
+    _write_inventory(tmp_path, inventory_v2)
+
+    persist_approved_mcp_manifest_change(plan)
+    persisted = load_manifest(manifest_path)
+    assert persisted.mcp_servers.allowed == ["camoufox"]
+
+
+def test_plan_without_inventory_snapshot_is_backward_compatible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy plan shape (no addition_inventory_hashes) skips enforcement."""
+    from engram.manifest import (
+        ScopeList,
+        build_mcp_manifest_change_plan,
+        load_manifest,
+        persist_approved_mcp_manifest_change,
+    )
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_inventory(
+        tmp_path,
+        {"camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==0.1.1"]}},
+    )
+    manifest_path = _seed_manifest_for_plan(tmp_path)
+    current = load_manifest(manifest_path)
+    staged = current.model_copy(update={"mcp_servers": ScopeList(allowed=["camoufox"])})
+
+    # Build plan WITHOUT inventory \u2014 simulates legacy callsite.
+    plan = build_mcp_manifest_change_plan(manifest_path, staged)
+    assert plan is not None
+    assert plan.addition_inventory_hashes == {}
+
+    # Drift both inventory and manifest \u2014 stale-merge branch fires but
+    # with empty snapshot, enforcement is skipped.
+    _write_inventory(
+        tmp_path,
+        {"camoufox": {"command": "uvx", "args": ["camoufox-browser[mcp]==9.9.9"]}},
+    )
+    drifted_text = manifest_path.read_text(encoding="utf-8") + "\n# concurrent edit\n"
+    manifest_path.write_text(drifted_text, encoding="utf-8")
+
+    persist_approved_mcp_manifest_change(plan)
+    persisted = load_manifest(manifest_path)
+    assert persisted.mcp_servers.allowed == ["camoufox"]

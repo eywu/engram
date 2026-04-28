@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
 import shutil
@@ -175,6 +176,23 @@ def _migrate_legacy_claude_mcp_config() -> None:
         added_names,
         skipped_names,
     )
+
+
+def hash_inventory_config(config: dict[str, Any] | None) -> str:
+    """Return a stable sha256 hash of an MCP server inventory entry.
+
+    Used by the trust gate to bind owner approval to the specific package
+    config (command, args, env, etc.) the owner reviewed. Hash semantics
+    (not raw config) keep env values out of plan logs and audit trails.
+
+    Returns an empty string for missing/None config so callers can use
+    "empty hash" as the sentinel for "no snapshot, no enforcement" — see
+    GRO-544.
+    """
+    if not config:
+        return ""
+    canonical = json.dumps(config, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def load_claude_mcp_servers(

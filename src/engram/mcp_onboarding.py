@@ -132,7 +132,11 @@ async def sync_team_channel_mcp_allow_lists(
                     )
                 }
             )
-            plan = build_mcp_manifest_change_plan(manifest_path, updated_manifest)
+            plan = build_mcp_manifest_change_plan(
+                manifest_path,
+                updated_manifest,
+                inventory=configured_servers,
+            )
             if plan is None:
                 manifests[idx] = (load_manifest(manifest_path), manifest_path)
                 continue
