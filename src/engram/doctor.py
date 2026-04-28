@@ -518,9 +518,14 @@ def check_slack_bot_token(
             details={"error_class": type(exc).__name__},
         )
 
+    team_id = _optional_str(response.payload.get("team_id"))
+    team_name = _optional_str(response.payload.get("team"))
+    url = _optional_str(response.payload.get("url"))
     details = {
         "status_code": response.status_code,
-        "team_id": response.payload.get("team_id"),
+        "team_id": team_id,
+        "team_name": team_name,
+        "url": url,
         "expected_team_id": expected_team_id,
     }
     if response.status_code != 200:
@@ -541,28 +546,38 @@ def check_slack_bot_token(
             details=details | {"slack_error": error},
         )
 
-    team_id = _optional_str(response.payload.get("team_id"))
-    if expected_team_id and team_id != expected_team_id:
-        return DoctorCheck(
-            id="slack_bot_token",
-            name="Slack bot token",
-            status=CheckStatus.FAIL,
-            message=f"Slack token is for team {team_id}; expected {expected_team_id}.",
-            details=details,
-        )
+    observed_workspace = _describe_slack_workspace(
+        team_name=team_name,
+        team_id=team_id,
+        url=url,
+    )
     if not team_id:
         return DoctorCheck(
             id="slack_bot_token",
             name="Slack bot token",
             status=CheckStatus.WARN,
-            message="Slack auth.test succeeded but did not return a team_id.",
+            message=(
+                f"Slack auth.test succeeded for {observed_workspace} "
+                "but did not return a team_id."
+            ),
+            details=details,
+        )
+    if expected_team_id and team_id != expected_team_id:
+        return DoctorCheck(
+            id="slack_bot_token",
+            name="Slack bot token",
+            status=CheckStatus.FAIL,
+            message=(
+                f"Slack token is valid for workspace {observed_workspace}, "
+                f"but config expects team_id {expected_team_id}."
+            ),
             details=details,
         )
     return DoctorCheck(
         id="slack_bot_token",
         name="Slack bot token",
         status=CheckStatus.PASS,
-        message=f"Slack auth.test succeeded for team {team_id}.",
+        message=f"Slack token is valid for workspace {observed_workspace}.",
         details=details,
     )
 
@@ -1766,6 +1781,23 @@ def _configured_slack_team_id(config_path: Path) -> str | None:
     if not isinstance(slack, dict):
         return None
     return _optional_str(slack.get("team_id")) or _optional_str(slack.get("workspace_id"))
+
+
+def _describe_slack_workspace(
+    *,
+    team_name: str | None,
+    team_id: str | None,
+    url: str | None,
+) -> str:
+    if team_name and team_id:
+        workspace = f"{team_name} ({team_id})"
+    elif team_name:
+        workspace = team_name
+    elif team_id:
+        workspace = team_id
+    else:
+        workspace = "an unknown workspace"
+    return f"{workspace} at {url}" if url else workspace
 
 
 def _blocked_by_config(check_id: str, name: str) -> DoctorCheck:

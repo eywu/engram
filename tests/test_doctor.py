@@ -211,7 +211,15 @@ def test_check_config_loads_uses_engram_loader(tmp_path: Path) -> None:
 
 def test_check_slack_bot_token_validates_team_id(tmp_path: Path) -> None:
     def requester(*_args, **_kwargs) -> HttpResult:
-        return HttpResult(200, {"ok": True, "team_id": "T123", "team": "Example"})
+        return HttpResult(
+            200,
+            {
+                "ok": True,
+                "team_id": "T123",
+                "team": "Example",
+                "url": "https://example.slack.com/",
+            },
+        )
 
     check = check_slack_bot_token(
         _config(tmp_path),
@@ -221,6 +229,58 @@ def test_check_slack_bot_token_validates_team_id(tmp_path: Path) -> None:
 
     assert check.status == CheckStatus.PASS
     assert check.details["team_id"] == "T123"
+    assert check.details["team_name"] == "Example"
+    assert check.details["url"] == "https://example.slack.com/"
+    assert (
+        check.message
+        == "Slack token is valid for workspace Example (T123) at https://example.slack.com/."
+    )
+
+
+def test_check_slack_bot_token_passes_without_expected_team_id(tmp_path: Path) -> None:
+    def requester(*_args, **_kwargs) -> HttpResult:
+        return HttpResult(
+            200,
+            {
+                "ok": True,
+                "team_id": "T123",
+                "team": "Growth Gauge",
+                "url": "https://growthgauge.slack.com/",
+            },
+        )
+
+    check = check_slack_bot_token(_config(tmp_path), requester=requester)
+
+    assert check.status == CheckStatus.PASS
+    assert check.details["expected_team_id"] is None
+    assert check.details["team_id"] == "T123"
+    assert "Growth Gauge" in check.message
+
+
+def test_check_slack_bot_token_fails_on_expected_team_mismatch(tmp_path: Path) -> None:
+    def requester(*_args, **_kwargs) -> HttpResult:
+        return HttpResult(
+            200,
+            {
+                "ok": True,
+                "team_id": "T999",
+                "team": "Other Workspace",
+                "url": "https://other-workspace.slack.com/",
+            },
+        )
+
+    check = check_slack_bot_token(
+        _config(tmp_path),
+        expected_team_id="T123",
+        requester=requester,
+    )
+
+    assert check.status == CheckStatus.FAIL
+    assert check.details["team_id"] == "T999"
+    assert check.details["expected_team_id"] == "T123"
+    assert "Other Workspace" in check.message
+    assert "T999" in check.message
+    assert "T123" in check.message
 
 
 def test_owner_approval_checks_warn_when_missing(tmp_path: Path) -> None:
