@@ -638,7 +638,7 @@ async def update_upgrade_request_dm(
     text: str,
     detail: str | None = None,
 ) -> None:
-    blocks = [
+    blocks: list[dict[str, Any]] = [
         {
             "type": "section",
             "text": {"type": "mrkdwn", "text": text},

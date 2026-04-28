@@ -1052,7 +1052,7 @@ def check_launchd_bridge_plist_drift(
     commit_resolver: Callable[[Path], str | None] | None = None,
 ) -> DoctorCheck:
     installed_path = installed_bridge_plist_path(home)
-    details = {"installed_path": str(installed_path)}
+    details: dict[str, Any] = {"installed_path": str(installed_path)}
     if not installed_path.exists():
         return DoctorCheck(
             id="launchd_bridge_plist",

@@ -293,13 +293,13 @@ def doctor_bridge_plist_issues(installed: dict[str, Any]) -> list[PlistIssue]:
             )
         )
     else:
-        for key, expected in _BRIDGE_KEEPALIVE.items():
+        for key, expected_keep_alive in _BRIDGE_KEEPALIVE.items():
             _check_exact(
                 issues,
                 "deployment_template",
                 f"KeepAlive.{key}",
                 keep_alive.get(key),
-                expected,
+                expected_keep_alive,
             )
 
     env_vars = installed.get("EnvironmentVariables")

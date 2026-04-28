@@ -12,6 +12,7 @@ from rich.prompt import Confirm
 
 from engram import paths
 from engram.manifest import (
+    ChannelManifest,
     ManifestError,
     build_mcp_manifest_change_plan,
     load_manifest,
@@ -61,7 +62,7 @@ async def sync_team_channel_mcp_allow_lists(
     requested_servers = [
         name for name in configured_servers if target_filter is None or name in target_filter
     ]
-    manifests: list[tuple[object, Path]] = []
+    manifests: list[tuple[ChannelManifest, Path]] = []
     missing_pairs = 0
     if not requested_servers:
         return False
@@ -110,10 +111,10 @@ async def sync_team_channel_mcp_allow_lists(
     for server_name in servers_to_sync:
         for idx, (manifest, manifest_path) in enumerate(manifests):
             allowed = list(manifest.mcp_servers.allowed or [])
-            effective_allowed = [
+            effective_allowed_list = [
                 name for name in allowed if name not in manifest.mcp_servers.disallowed
             ]
-            if server_name in effective_allowed:
+            if server_name in effective_allowed_list:
                 continue
 
             channel_label = manifest.label or manifest.channel_id

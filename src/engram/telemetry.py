@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+from structlog.typing import Processor
 
 _CONFIGURED = False
 logger = logging.getLogger("engram.telemetry")
@@ -57,7 +58,7 @@ def configure_logging(
     log_dir = log_dir or (Path.home() / ".engram" / "logs")
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    shared_processors = [
+    shared_processors: list[Processor] = [
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
         structlog.stdlib.ExtraAdder(),

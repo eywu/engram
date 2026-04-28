@@ -4059,7 +4059,9 @@ async def _resolve_footgun_question(
     if confirmed:
         # Preserve the exact reviewed input so typed-confirm confirmations do
         # not accidentally drop a pre-sanitized updated_input.
-        result = PermissionResultAllow(updated_input=q.tool_input)
+        result: PermissionResultAllow | PermissionResultDeny = PermissionResultAllow(
+            updated_input=q.tool_input
+        )
         answer_text = "Confirmed destructive action"
     else:
         result = _resolve_question(q, choice="deny")

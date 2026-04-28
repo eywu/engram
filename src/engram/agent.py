@@ -24,6 +24,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal, cast
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -41,6 +42,13 @@ from claude_agent_sdk import (
     ResultMessage,
     UserMessage,
     tag_session,
+)
+from claude_agent_sdk.types import (
+    HookEvent,
+    McpHttpServerConfig,
+    McpSdkServerConfig,
+    McpSSEServerConfig,
+    McpStdioServerConfig,
 )
 
 from engram import paths
@@ -758,14 +766,27 @@ class Agent:
         manifest = session.manifest
 
         # Defaults — applied when no manifest is available (legacy tests).
-        setting_sources: list[str] = ["user"]
+        setting_sources: list[Literal["user", "project", "local"]] = ["user"]
         max_turns = self._config.max_turns_per_message
-        permission_mode = "default"
+        permission_mode: Literal[
+            "default",
+            "acceptEdits",
+            "plan",
+            "bypassPermissions",
+            "dontAsk",
+            "auto",
+        ] = "default"
         allowed_tools: list[str] = []
         disallowed_tools: list[str] = []
-        skills: list[str] | str | None = "all"
+        skills: list[str] | Literal["all"] | None = "all"
         can_use_tool = None
-        mcp_servers = {}
+        mcp_servers: dict[
+            str,
+            McpStdioServerConfig
+            | McpSSEServerConfig
+            | McpHttpServerConfig
+            | McpSdkServerConfig,
+        ] = {}
         extra_args: dict[str, str | None] = {}
         strict_mcp_config = False
 
@@ -788,7 +809,7 @@ class Agent:
             decision = build_scope_decision(manifest)
             allowed_tools = decision.allowed_tools
             disallowed_tools = decision.disallowed_tools
-            skills = decision.skills
+            skills = cast(list[str] | Literal["all"] | None, decision.skills)
 
             # Runtime scope guard (covers MCPs, which the static fields
             # can't always enumerate).
@@ -1006,40 +1027,60 @@ class Agent:
                 question_metadata_provider=_question_metadata,
             )
 
-        session_kwargs = (
-            {"resume": session.session_id}
-            if resume
-            else {"session_id": session.session_id}
-        )
-
-        options = ClaudeAgentOptions(
-            # Identity & discovery
-            setting_sources=setting_sources,
-            cwd=str(session.cwd) if session.cwd else None,
-            model=self._config.anthropic.model,
-            mcp_servers=mcp_servers,
-            extra_args=extra_args,
-            **session_kwargs,
-            # Runtime limits
-            max_turns=max_turns,
-            permission_mode=permission_mode,
-            # Scope (static — helps SDK skip priming denied entries)
-            allowed_tools=allowed_tools,
-            disallowed_tools=disallowed_tools,
-            skills=skills,
-            # Scope (runtime — final enforcement)
-            can_use_tool=can_use_tool,
-            max_budget_usd=self._max_budget_usd_for_options(),
-            hooks=self._build_hooks(session),
-            stderr=cli_stderr_logger(session.channel_id),
-        )
+        if resume:
+            options = ClaudeAgentOptions(
+                # Identity & discovery
+                setting_sources=setting_sources,
+                cwd=str(session.cwd) if session.cwd else None,
+                model=self._config.anthropic.model,
+                mcp_servers=mcp_servers,
+                extra_args=extra_args,
+                resume=session.session_id,
+                # Runtime limits
+                max_turns=max_turns,
+                permission_mode=permission_mode,
+                # Scope (static — helps SDK skip priming denied entries)
+                allowed_tools=allowed_tools,
+                disallowed_tools=disallowed_tools,
+                skills=skills,
+                # Scope (runtime — final enforcement)
+                can_use_tool=can_use_tool,
+                max_budget_usd=self._max_budget_usd_for_options(),
+                hooks=self._build_hooks(session),
+                stderr=cli_stderr_logger(session.channel_id),
+            )
+        else:
+            options = ClaudeAgentOptions(
+                # Identity & discovery
+                setting_sources=setting_sources,
+                cwd=str(session.cwd) if session.cwd else None,
+                model=self._config.anthropic.model,
+                mcp_servers=mcp_servers,
+                extra_args=extra_args,
+                session_id=session.session_id,
+                # Runtime limits
+                max_turns=max_turns,
+                permission_mode=permission_mode,
+                # Scope (static — helps SDK skip priming denied entries)
+                allowed_tools=allowed_tools,
+                disallowed_tools=disallowed_tools,
+                skills=skills,
+                # Scope (runtime — final enforcement)
+                can_use_tool=can_use_tool,
+                max_budget_usd=self._max_budget_usd_for_options(),
+                hooks=self._build_hooks(session),
+                stderr=cli_stderr_logger(session.channel_id),
+            )
         # SDK 0.1.x exposes --strict-mcp-config through extra_args. Keep a
         # plain attribute so diagnostics and tests can inspect the policy.
         options.strict_mcp_config = strict_mcp_config
         return options
 
-    def _build_hooks(self, session: SessionState) -> dict[str, list[HookMatcher]]:
-        hooks = build_hooks(channel_id=session.channel_id, cost_db=self._cost_db)
+    def _build_hooks(self, session: SessionState) -> dict[HookEvent, list[HookMatcher]]:
+        hooks = cast(
+            dict[HookEvent, list[HookMatcher]],
+            build_hooks(channel_id=session.channel_id, cost_db=self._cost_db),
+        )
         if self._router is None:
             return hooks
 

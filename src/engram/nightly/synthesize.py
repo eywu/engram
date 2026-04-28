@@ -436,7 +436,11 @@ async def _synthesize_channel(
     raw_outputs: list[str] = []
     parsed: dict[str, Any] | None = None
     cost_usd = Decimal("0")
-    prompt_cache = {"status": "miss", "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+    prompt_cache: dict[str, object] = {
+        "status": "miss",
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
     budget_recorded = False
 
     def record_turn(result: ResultMessage | None) -> None:
@@ -444,7 +448,7 @@ async def _synthesize_channel(
         if result is None:
             return
         cost_usd += _usd(getattr(result, "total_cost_usd", None) or 0)
-        prompt_cache = _prompt_cache(result)
+        prompt_cache = cast(dict[str, object], _prompt_cache(result))
         budget.record(NIGHTLY_CHANNEL_ID, NIGHTLY_USER_ID, result)
         budget_recorded = True
 

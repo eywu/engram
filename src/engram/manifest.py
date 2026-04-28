@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import yaml
 from claude_agent_sdk import PermissionMode, SettingSource
@@ -519,7 +519,7 @@ class ChannelManifest(BaseModel):
 
     # ── Scope (exclusion-first; M2-enforced) ─────────────────────
     setting_sources: list[SettingSource] = Field(
-        default_factory=lambda: ["project"],
+        default_factory=lambda: cast(list[SettingSource], ["project"]),
         description=(
             "Which settings layers Claude SDK loads. Owner-DM uses "
             "['user'] for full personal MCP access; team channels use "

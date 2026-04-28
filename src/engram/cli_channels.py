@@ -30,6 +30,7 @@ from rich.table import Table
 
 from engram import paths
 from engram.manifest import (
+    ChannelManifest,
     ChannelMCPChangeStatus,
     ChannelStatus,
     ManifestError,
@@ -133,7 +134,7 @@ def _load_manifest_or_exit(
     channel_id: str,
     *,
     home: Path | None = None,
-) -> tuple[Path, object]:
+) -> tuple[Path, ChannelManifest]:
     manifest_path = paths.channel_manifest_path(channel_id, home)
     if not manifest_path.exists():
         rprint(f"[red]No manifest found for channel '{channel_id}'.[/red]")

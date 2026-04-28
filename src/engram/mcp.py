@@ -374,7 +374,7 @@ def resolve_team_mcp_servers(
     configured_servers: dict[str, dict[str, Any]] | None = None,
     embedder: Any | None = None,
     log_exclusions: bool = False,
-) -> tuple[dict[str, dict[str, Any]], list[str], list[str]]:
+) -> tuple[dict[str, Any], list[str], list[str]]:
     """Resolve a team-channel manifest to an explicit MCP config map.
 
     Team channels are strict by default: only names in `mcp_servers.allowed`
@@ -438,7 +438,7 @@ def resolve_team_mcp_servers(
 
     effective_names = [name for name in allowed_names if name not in disallowed]
 
-    servers: dict[str, dict[str, Any]] = {}
+    servers: dict[str, Any] = {}
     missing: list[str] = []
     for name in effective_names:
         if name == MEMORY_SEARCH_SERVER_NAME:

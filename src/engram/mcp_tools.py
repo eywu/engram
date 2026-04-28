@@ -308,7 +308,7 @@ def memory_tool_metrics() -> dict[str, Any]:
 
 def _clamp_limit(raw_limit: object) -> int:
     try:
-        limit = int(raw_limit)  # type: ignore[arg-type]
+        limit = int(raw_limit)  # type: ignore[call-overload]
     except (TypeError, ValueError):
         limit = 5
     return max(1, min(20, limit))
