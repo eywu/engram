@@ -681,8 +681,10 @@ def test_check_launchd_bridge_plist_drift_warns_on_template_placeholder_env_file
     )
 
     assert check.status == CheckStatus.WARN
-    assert "EnvironmentVariables.ENGRAM_ENV_FILE" in check.message
+    assert "template placeholder" in check.message
+    assert "./scripts/install_launchd.sh" in check.message
     assert check.details["issues"] == ["EnvironmentVariables.ENGRAM_ENV_FILE"]
+    assert check.details["env_file"] == "/REPLACE/WITH/ABSOLUTE/PATH/TO/engram.env"
 
 
 def test_check_launchd_bridge_plist_drift_warns_when_env_file_is_missing(
@@ -698,8 +700,9 @@ def test_check_launchd_bridge_plist_drift_warns_when_env_file_is_missing(
     )
 
     assert check.status == CheckStatus.WARN
-    assert "EnvironmentVariables.ENGRAM_ENV_FILE" in check.message
+    assert str(missing_env_file.resolve()) in check.message
     assert check.details["issues"] == ["EnvironmentVariables.ENGRAM_ENV_FILE"]
+    assert check.details["resolved_env_file"] == str(missing_env_file.resolve())
 
 
 def test_check_launchd_bridge_plist_drift_passes_when_env_file_exists(
@@ -718,6 +721,8 @@ def test_check_launchd_bridge_plist_drift_passes_when_env_file_exists(
 
     assert check.status == CheckStatus.PASS
     assert check.details["template_commit"] == "abc1234"
+    assert check.details["env_file"] == str(env_file)
+    assert check.details["resolved_env_file"] == str(env_file.resolve())
 
 
 def test_check_disk_space_requires_one_gb(tmp_path: Path) -> None:

@@ -1048,7 +1048,8 @@ def check_launchd_bridge_plist_drift(
         )
 
     issues = doctor_bridge_plist_issues(installed)
-    env_file_issue = _launchd_env_file_issue(installed)
+    env_file_issue, env_file_error, env_details = _launchd_env_file_issue(installed)
+    details |= env_details
     if env_file_issue is not None:
         issues.append(env_file_issue)
     if not issues:
@@ -1071,7 +1072,12 @@ def check_launchd_bridge_plist_drift(
         id="launchd_bridge_plist",
         name="launchd bridge plist",
         status=CheckStatus.WARN,
-        message=_launchd_bridge_plist_drift_message(issues, template_commit=commit),
+        message=_launchd_bridge_plist_drift_message(
+            issues,
+            template_commit=commit,
+            env_file_error=env_file_error,
+            env_details=env_details,
+        ),
         details=details,
     )
 
@@ -1320,13 +1326,41 @@ def _launchd_bridge_plist_drift_message(
     issues: list[Any],
     *,
     template_commit: str | None,
+    env_file_error: str | None = None,
+    env_details: dict[str, str] | None = None,
 ) -> str:
+    suffix = f" Canonical template {template_commit}." if template_commit else ""
+    install_hint = (
+        " Reinstall the bridge with `./scripts/install_launchd.sh` and restart it to apply."
+    )
+    if env_file_error == "placeholder":
+        return (
+            "installed plist contains a template placeholder in "
+            "EnvironmentVariables.ENGRAM_ENV_FILE."
+            f"{install_hint}{suffix}"
+        )
+
+    resolved_env_file = (env_details or {}).get("resolved_env_file")
+    if env_file_error == "missing_file" and resolved_env_file is not None:
+        return (
+            "installed plist points EnvironmentVariables.ENGRAM_ENV_FILE to "
+            f"{resolved_env_file}, but that file does not exist."
+            f"{install_hint}{suffix}"
+        )
+
+    if env_file_error == "unreadable_file" and resolved_env_file is not None:
+        return (
+            "installed plist points EnvironmentVariables.ENGRAM_ENV_FILE to "
+            f"{resolved_env_file}, but it is not readable."
+            f"{install_hint}{suffix}"
+        )
+
     soft_limit_issue = next(
         (issue for issue in issues if issue.path == "SoftResourceLimits.NumberOfFiles"),
         None,
     )
     if soft_limit_issue is not None:
-        suffix = (
+        soft_limit_suffix = (
             f" (introduced in GRO-481; canonical template {template_commit})."
             if template_commit
             else " (introduced in GRO-481)."
@@ -1334,13 +1368,12 @@ def _launchd_bridge_plist_drift_message(
         return (
             "installed plist missing or outdated SoftResourceLimits.NumberOfFiles; "
             "restart bridge with corrected plist to apply"
-            f"{suffix}"
+            f"{soft_limit_suffix}"
         )
 
     summarized = ", ".join(issue.path for issue in issues[:3])
     if len(issues) > 3:
         summarized = f"{summarized}, +{len(issues) - 3} more"
-    suffix = f" Canonical template {template_commit}." if template_commit else ""
     return (
         f"installed plist drift detected ({summarized}); "
         "restart bridge with corrected plist to apply."
@@ -1348,17 +1381,23 @@ def _launchd_bridge_plist_drift_message(
     )
 
 
-def _launchd_env_file_issue(installed: dict[str, Any]) -> PlistIssue | None:
+def _launchd_env_file_issue(
+    installed: dict[str, Any],
+) -> tuple[PlistIssue | None, str | None, dict[str, str]]:
     environment = installed.get("EnvironmentVariables")
     env_file = environment.get("ENGRAM_ENV_FILE") if isinstance(environment, dict) else None
-    error, _details = _validate_launchd_env_file(env_file)
+    error, details = _validate_launchd_env_file(env_file)
     if error in {None, "missing"}:
-        return None
-    return PlistIssue(
-        category="env_vars",
-        path="EnvironmentVariables.ENGRAM_ENV_FILE",
-        expected="<readable resolved path>",
-        actual=env_file,
+        return None, error, details
+    return (
+        PlistIssue(
+            category="env_vars",
+            path="EnvironmentVariables.ENGRAM_ENV_FILE",
+            expected="<readable resolved path>",
+            actual=env_file,
+        ),
+        error,
+        details,
     )
 
 
