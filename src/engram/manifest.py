@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import yaml
 from claude_agent_sdk import PermissionMode, SettingSource
@@ -41,6 +41,10 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 from engram import paths
 from engram.config import HITLConfig
 from engram.permissions.authorization import classify_transition
+
+if TYPE_CHECKING:
+    from engram.mcp_manifest_gate import MCPApprovalDisposition
+    from engram.mcp_trust import MCPTrustDecision
 
 log = logging.getLogger(__name__)
 
@@ -137,7 +141,14 @@ _TASK_ASSISTANT_DENY_RULES: tuple[str, ...] = (
     "Glob(**/.env*)",
 )
 
-_TIER_DEFAULTS: dict[PermissionTier, dict[str, tuple[str, ...] | int]] = {
+
+class _TierDefaults(TypedDict):
+    allow_rules: tuple[str, ...]
+    deny_rules: tuple[str, ...]
+    hitl_max_per_day: int
+
+
+_TIER_DEFAULTS: dict[PermissionTier, _TierDefaults] = {
     PermissionTier.TASK_ASSISTANT: {
         "allow_rules": (),
         "deny_rules": _TASK_ASSISTANT_DENY_RULES,
@@ -1842,13 +1853,13 @@ async def apply_channel_mcp_change(
     action: Literal["allow", "deny"],
     owner_alert: Callable[[str], Awaitable[None] | None] | None = None,
     confirm_unknown: Callable[
-        [MCPManifestChangePlan, list[object]],
-        Awaitable[object] | object,
+        [MCPManifestChangePlan, list[MCPTrustDecision]],
+        Awaitable[MCPApprovalDisposition | bool] | MCPApprovalDisposition | bool,
     ]
     | None = None,
     home: Path | None = None,
     inventory: dict[str, dict[str, object]] | None = None,
-    trust_resolver: Callable[..., Awaitable[object]] | None = None,
+    trust_resolver: Callable[..., Awaitable[MCPTrustDecision]] | None = None,
     audit_source: str | None = None,
 ) -> AppliedChannelMCPChange:
     """Apply a channel MCP update, routing new allow-list entries through trust."""
@@ -1887,18 +1898,14 @@ async def apply_channel_mcp_change(
         request_approved_mcp_manifest_change,
     )
 
-    gate_kwargs: dict[str, object] = {
-        "channel_label": change.previous_manifest.label,
-        "owner_alert": owner_alert,
-        "confirm_unknown": confirm_unknown,
-        "home": home,
-        "inventory": inventory,
-    }
-    if trust_resolver is not None:
-        gate_kwargs["trust_resolver"] = trust_resolver
     approval = await request_approved_mcp_manifest_change(
         change.approval_plan,
-        **gate_kwargs,
+        channel_label=change.previous_manifest.label,
+        owner_alert=owner_alert,
+        confirm_unknown=confirm_unknown,
+        home=home,
+        inventory=inventory,
+        trust_resolver=trust_resolver,
     )
     if approval.plan is None:
         status = (
