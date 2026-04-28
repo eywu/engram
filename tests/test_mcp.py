@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -115,7 +115,7 @@ def test_migration_concurrent_invocations_safe(
     _write_json(target_path, target_payload)
     _write_json(legacy_path, legacy_payload)
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ProcessPoolExecutor(max_workers=2) as executor:
         futures = [
             executor.submit(migrate_legacy_claude_mcp_config)
             for _ in range(2)
