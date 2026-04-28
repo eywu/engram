@@ -193,6 +193,7 @@ def insert_summary(
             embedding,
         ),
     )
+    assert cursor.lastrowid is not None
     return int(cursor.lastrowid)
 
 

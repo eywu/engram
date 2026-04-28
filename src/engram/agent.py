@@ -193,8 +193,10 @@ class Agent:
 
         async def _confirm_unknown(_plan, decisions) -> MCPApprovalDisposition:
             nonlocal block_reason
+            assert self._router is not None
+            router = self._router
             owner_dm_channel_id = (
-                self._config.owner_dm_channel_id or self._router.owner_dm_channel_id
+                self._config.owner_dm_channel_id or router.owner_dm_channel_id
             )
             owner_user_id = self._config.owner_user_id
             if not owner_dm_channel_id or not owner_user_id:
@@ -204,7 +206,7 @@ class Agent:
                 )
                 return MCPApprovalDisposition.DENIED
 
-            allowed, reason = self._router.hitl_limiter.check(
+            allowed, reason = router.hitl_limiter.check(
                 session.channel_id,
                 max_per_day=max_per_day,
             )
@@ -247,7 +249,7 @@ class Agent:
                 if q.resolution_choice == "deny":
                     return
                 _previous, updated, _path = persist_approved_mcp_manifest_change(plan)
-                self._router.replace_cached_manifest(updated)
+                router.replace_cached_manifest(updated)
                 if q.resolution_choice == "1":
                     trusted_publishers = [
                         (decision.registry, decision.publisher or "")
@@ -257,7 +259,7 @@ class Agent:
                     try:
                         add_trusted_publishers(
                             trusted_publishers,
-                            home=self._router.home,
+                            home=router.home,
                         )
                     except Exception as exc:
                         q.resolution_status_message = (
@@ -272,21 +274,21 @@ class Agent:
                         )
 
             q.on_resolve = _apply_approved_manifest
-            self._router.hitl.register(q)
-            self._router.hitl_limiter.reserve(session.channel_id)
+            router.hitl.register(q)
+            router.hitl_limiter.reserve(session.channel_id)
             try:
                 await on_new_question(q)
             except Exception:
-                self._router.hitl.resolve(
+                router.hitl.resolve(
                     q.permission_request_id,
                     PermissionResultDeny(message="failed to post question"),
                 )
-                self._router.hitl.cleanup_resolved()
+                router.hitl.cleanup_resolved()
                 block_reason = (
                     "Blocked MCP manifest update: failed to post owner approval request."
                 )
                 return MCPApprovalDisposition.DENIED
-            watch_pending_question(self._router, q)
+            watch_pending_question(router, q)
             block_reason = (
                 "MCP trust approval requested in the owner DM. "
                 "The manifest was not updated; retry after approval."

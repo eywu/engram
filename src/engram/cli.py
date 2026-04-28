@@ -152,6 +152,7 @@ def _print_active_yolo_grants(
     table.add_column("Remaining")
     table.add_column("Restores To")
     for manifest in manifests:
+        assert manifest.yolo_until is not None
         table.add_row(
             manifest.channel_id,
             manifest.label or "—",
@@ -263,6 +264,7 @@ def yolo_extend(
             f"[dim]Using only active yolo channel '{manifest.channel_id}'.[/dim]"
         )
 
+    assert manifest.yolo_until is not None
     remaining = manifest.yolo_until - now
     if remaining + _yolo_extension_delta(normalized_duration) > YOLO_MAX_DURATION:
         rprint("[red]Cannot extend beyond 72h total remaining.[/red]")
