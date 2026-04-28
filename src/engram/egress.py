@@ -20,7 +20,7 @@ from datetime import timedelta
 from engram.agent import AgentTurn
 from engram.footguns import FootgunMatch, match_footgun
 from engram.hitl import PendingQuestion
-from engram.manifest import YOLO_DEFAULT_DURATION_TEXT, PermissionTier
+from engram.manifest import PermissionTier
 
 log = logging.getLogger(__name__)
 
@@ -545,7 +545,7 @@ async def post_yolo_expired_notification(
         f"YOLO expired on {label} — reverted to {pre_yolo_tier.value}. "
         f"Duration used: {duration_text}."
     )
-    extend_command = f"`/engram upgrade {channel_id} yolo --until {YOLO_DEFAULT_DURATION_TEXT}`"
+    extend_command = "`/engram upgrade yolo`"
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": text}},
         {
@@ -553,7 +553,7 @@ async def post_yolo_expired_notification(
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": f"To extend, run {extend_command}.",
+                    "text": f"To extend, run {extend_command} in the channel.",
                 }
             ],
         },

@@ -285,7 +285,10 @@ async def test_lazy_yolo_expiry_demotes_notifies_and_sweep_becomes_noop(
     assert "reverted to trusted" in dm_call["blocks"][0]["text"]["text"]
     assert "Duration used: 24h 0m." in dm_call["blocks"][0]["text"]["text"]
     assert dm_call["blocks"][1]["type"] == "context"
-    assert "/engram upgrade C07TEST123 yolo --until 24h" in dm_call["blocks"][1]["elements"][0]["text"]
+    assert (
+        dm_call["blocks"][1]["elements"][0]["text"]
+        == "To extend, run `/engram upgrade yolo` in the channel."
+    )
 
     reply_call = next(call for call in slack.post_calls if call["channel"] == "C07TEST123")
     assert reply_call["blocks"][0]["text"] == "bot reply"
@@ -328,7 +331,10 @@ async def test_nightly_sweep_demotes_idle_channel_and_posts_dm(
     assert len(slack.post_calls) == 1
     assert slack.post_calls[0]["channel"] == "D07OWNER"
     assert "Duration used: 24h 0m." in slack.post_calls[0]["blocks"][0]["text"]["text"]
-    assert "/engram upgrade C07TEST123 yolo --until 24h" in slack.post_calls[0]["blocks"][1]["elements"][0]["text"]
+    assert (
+        slack.post_calls[0]["blocks"][1]["elements"][0]["text"]
+        == "To extend, run `/engram upgrade yolo` in the channel."
+    )
     assert "trigger=sweep" in caplog.text
 
 
