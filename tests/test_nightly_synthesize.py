@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -465,6 +469,36 @@ def test_default_prompt_template_includes_json_mode_instruction() -> None:
 
     assert "Respond ONLY with valid JSON matching the schema." in prompt_template
     assert "Do not call tools unless absolutely necessary." in prompt_template
+
+
+def test_default_prompt_template_loads_from_site_packages_like_layout(tmp_path: Path) -> None:
+    site_packages = tmp_path / "site-packages"
+    shutil.copytree(
+        Path(__file__).resolve().parents[1] / "src" / "engram",
+        site_packages / "engram",
+    )
+    script = """
+import json
+import engram.nightly.synthesize as synth
+
+print(json.dumps({
+    "module_file": synth.__file__,
+    "prompt_text": synth.DEFAULT_PROMPT_TEMPLATE.read_text(encoding="utf-8"),
+}))
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(site_packages)},
+    )
+    payload = json.loads(result.stdout)
+
+    assert payload["module_file"].startswith(str(site_packages))
+    assert "Respond ONLY with valid JSON matching the schema." in payload["prompt_text"]
 
 
 def test_golden_fixture_outputs_match_schema() -> None:

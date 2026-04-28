@@ -12,6 +12,8 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
+from importlib.resources import files
+from importlib.resources.abc import Traversable
 from pathlib import Path
 from string import Template
 from typing import Any, Protocol
@@ -54,12 +56,8 @@ NIGHTLY_CHANNEL_ID = "__nightly__"
 NIGHTLY_USER_ID = "__nightly__"
 MAX_TURN_BUDGET_USD = 5.00
 DEFAULT_OUTPUT_ROOT = Path.home() / ".engram" / "nightly"
-DEFAULT_PROMPT_TEMPLATE = (
-    Path(__file__).resolve().parents[3]
-    / "scripts"
-    / "prompts"
-    / "nightly-synthesis-prompt.md"
-)
+PromptTemplatePath = Path | Traversable
+DEFAULT_PROMPT_TEMPLATE = files("engram.templates.prompts").joinpath("nightly-synthesis.md")
 
 _USD_QUANT = Decimal("0.000001")
 _MIN_CHANNEL_ESTIMATE_USD = Decimal("0.01")
@@ -127,7 +125,7 @@ async def synthesize(
     *,
     config_path: Path | None = None,
     output_root: Path = DEFAULT_OUTPUT_ROOT,
-    prompt_template_path: Path = DEFAULT_PROMPT_TEMPLATE,
+    prompt_template_path: PromptTemplatePath = DEFAULT_PROMPT_TEMPLATE,
     weekly: bool = False,
     config: NightlyConfig | None = None,
     contexts_dir: Path | None = None,
@@ -163,7 +161,7 @@ async def synthesize(
     hitl_config = HITLConfig(enabled=False)
 
     ledger = budget or _nightly_budget(config_path)
-    prompt_template = prompt_template_path.expanduser().read_text(encoding="utf-8")
+    prompt_template = _read_prompt_template(prompt_template_path)
 
     log.info(
         "nightly.synthesis_start",
@@ -913,6 +911,12 @@ def _estimate_rate_for_model(model: str) -> Decimal:
         if alias in normalized:
             return rate
     return _MODEL_ESTIMATE_USD_PER_1K_TOKENS["sonnet"]
+
+
+def _read_prompt_template(prompt_template_path: PromptTemplatePath) -> str:
+    if isinstance(prompt_template_path, Path):
+        return prompt_template_path.expanduser().read_text(encoding="utf-8")
+    return prompt_template_path.read_text(encoding="utf-8")
 
 
 def _load_config_raw(config_path: Path) -> dict[str, Any]:
