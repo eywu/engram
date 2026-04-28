@@ -728,6 +728,22 @@ def test_check_launchd_nightly_env_file_warns_when_missing(tmp_path: Path) -> No
     assert "EnvironmentVariables.ENGRAM_ENV_FILE" in check.message
 
 
+def test_check_launchd_nightly_env_file_passes_when_plist_not_installed(
+    tmp_path: Path,
+) -> None:
+    # GRO-572: when the nightly plist itself is absent (user intentionally
+    # skipped --install-nightly), this check must short-circuit to PASS so
+    # we don't double-warn alongside `launchd_nightly`. Note: NO plist
+    # written by the fixture.
+    check = check_launchd_nightly_env_file(home=tmp_path)
+
+    assert check.status == CheckStatus.PASS
+    assert "not installed" in check.message
+    assert check.details["skipped"] == "plist_not_installed"
+    # installed_path detail should still surface for diagnostics
+    assert "com.engram.v3.nightly.plist" in check.details["installed_path"]
+
+
 def test_check_launchd_nightly_env_file_warns_on_template_placeholder(tmp_path: Path) -> None:
     _write_nightly_plist(
         tmp_path,
@@ -1283,8 +1299,14 @@ def test_doctor_cli_json_warns_when_nightly_launchd_job_is_missing(
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["summary"]["failed"] == 0
-    assert payload["summary"]["warnings"] == 2
+    # GRO-572: when nightly is intentionally absent, we emit exactly one
+    # WARN (from `launchd_nightly`), not two. The env-file check
+    # short-circuits to PASS because there's no plist to inspect.
+    assert payload["summary"]["warnings"] == 1
     checks_by_id = {check["id"]: check for check in payload["checks"]}
     assert checks_by_id["launchd_bridge"]["status"] == "pass"
     assert checks_by_id["launchd_nightly"]["status"] == "warn"
-    assert checks_by_id["launchd_nightly_env_file"]["status"] == "warn"
+    assert checks_by_id["launchd_nightly_env_file"]["status"] == "pass"
+    assert checks_by_id["launchd_nightly_env_file"]["details"]["skipped"] == (
+        "plist_not_installed"
+    )
