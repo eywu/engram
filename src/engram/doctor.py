@@ -164,6 +164,7 @@ def run_doctor(config_path: Path | None = None) -> DoctorReport:
             "launchd_nightly",
             "launchd nightly job",
             "com.engram.v3.nightly",
+            optional=True,
         ),
         check_launchd_nightly_env_file(),
         check_fd_pressure(log_dir),
@@ -956,6 +957,7 @@ def check_launchd_job(
     name: str,
     label: str,
     *,
+    optional: bool = False,
     launchctl_list: Callable[[], str] | None = None,
 ) -> DoctorCheck:
     list_jobs = launchctl_list or _launchctl_list
@@ -983,8 +985,13 @@ def check_launchd_job(
         return DoctorCheck(
             id=check_id,
             name=name,
-            status=CheckStatus.FAIL,
-            message=f"{label} is not installed; load the launchd plist.",
+            status=CheckStatus.WARN if optional else CheckStatus.FAIL,
+            message=(
+                f"{label} is not installed; run `./scripts/install_launchd.sh --install-nightly` "
+                "if you want nightly self-improvement."
+                if optional
+                else f"{label} is not installed; load the launchd plist."
+            ),
             details={"label": label, "state": "not_installed"},
         )
     pid, status_code = row
