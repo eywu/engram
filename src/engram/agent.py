@@ -165,12 +165,14 @@ class Agent:
             session.channel_id,
             self._router.home,
         )
+        inventory = self._load_manifest_inventory()
         try:
             plan = detect_mcp_allow_list_additions(
                 tool_name,
                 tool_input,
                 manifest_path=manifest_path,
                 cwd=session.cwd,
+                inventory=inventory,
             )
         except ManifestError as exc:
             return PermissionResultDeny(
@@ -178,8 +180,6 @@ class Agent:
             )
         if plan is None:
             return None
-
-        inventory = self._load_manifest_inventory()
         block_reason: str | None = None
 
         async def _confirm_unknown(_plan, decisions) -> MCPApprovalDisposition:

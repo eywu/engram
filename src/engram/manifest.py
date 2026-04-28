@@ -28,7 +28,7 @@ import os
 import re
 import tempfile
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -193,7 +193,17 @@ class YoloDemotion:
 
 @dataclass(frozen=True)
 class MCPManifestChangePlan:
-    """Staged manifest edit that adds new entries to ``mcp_servers.allowed``."""
+    """Staged manifest edit that adds new entries to ``mcp_servers.allowed``.
+
+    ``addition_inventory_hashes`` snapshots the per-server inventory config
+    (from ``~/.claude.json``) at plan creation, keyed by server name. The
+    persist gate verifies these hashes against current-on-disk inventory in
+    the stale-merge branch so owner approval can't accept a different
+    package config than what was reviewed (GRO-544). Empty mapping (or a
+    name with empty-string value) opts out of enforcement — used for
+    legacy plan shapes and for names not yet present in the inventory at
+    plan time.
+    """
 
     manifest_path: Path
     current_manifest: ChannelManifest
@@ -201,6 +211,7 @@ class MCPManifestChangePlan:
     staged_text: str
     baseline_sha256: str
     additions: list[str]
+    addition_inventory_hashes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1009,14 +1020,87 @@ class ManifestError(Exception):
     """Raised when a manifest file is missing, malformed, or invalid."""
 
 
+def _snapshot_inventory_hashes(
+    additions: list[str],
+    inventory: dict[str, dict[str, object]] | None,
+) -> dict[str, str]:
+    """Snapshot per-server inventory hashes for the additions in a plan.
+
+    Returns ``{}`` when ``inventory`` is None (caller opted out of snapshot,
+    e.g. validation-time paths with no inventory access). Otherwise returns
+    a hash for every name; missing-from-inventory names get an empty string
+    so the persist gate skips enforcement on them — they were referenced
+    before being installed, and gating that case would be a regression for
+    the existing onboarding flow.
+    """
+    if inventory is None:
+        return {}
+    # Local import: ``mcp`` imports from ``manifest`` so we defer here to
+    # break the cycle.
+    from engram.mcp import hash_inventory_config
+
+    snapshot: dict[str, str] = {}
+    for name in dict.fromkeys(additions):
+        snapshot[name] = hash_inventory_config(inventory.get(name))
+    return snapshot
+
+
+def _verify_addition_inventory_snapshot(plan: MCPManifestChangePlan) -> None:
+    """Reject stale-merge persist when a snapshotted inventory entry drifted.
+
+    Owner approval is bound to the per-server inventory config the owner
+    reviewed (GRO-544). If a concurrent writer changed the config between
+    plan creation and persist, the snapshot hash and current hash differ,
+    and we raise ManifestError so the agent layer can surface a fresh
+    approval request instead of silently persisting an unreviewed config.
+
+    Names with empty snapshot hash (and plans missing the snapshot dict
+    entirely) are exempt: that's the legacy/no-snapshot path or a name
+    that wasn't in the inventory at plan time. Preserves backward-compat
+    behavior for those code paths.
+    """
+    snapshot = plan.addition_inventory_hashes
+    if not snapshot:
+        return
+    # Local import to avoid the manifest ↔ mcp cycle.
+    from engram.mcp import hash_inventory_config, load_claude_mcp_servers
+
+    inventory = load_claude_mcp_servers()
+    drifted: list[str] = []
+    for name, expected_hash in snapshot.items():
+        if not expected_hash:
+            # No snapshot recorded for this name (not in inventory at plan
+            # time). Skip enforcement.
+            continue
+        current_hash = hash_inventory_config(inventory.get(name))
+        if current_hash != expected_hash:
+            drifted.append(name)
+    if drifted:
+        log.warning(
+            "manifest.mcp_inventory_snapshot_drifted channel_id=%s path=%s drifted=%s",
+            plan.current_manifest.channel_id,
+            plan.manifest_path,
+            drifted,
+        )
+        raise ManifestError(
+            "Concurrent change detected — approval superseded; please retry. "
+            f"(drifted servers: {', '.join(drifted)})"
+        )
+
+
 def detect_mcp_allow_list_additions(
     tool_name: str,
     tool_input: dict[str, object],
     *,
     manifest_path: Path,
     cwd: Path | None = None,
+    inventory: dict[str, dict[str, object]] | None = None,
 ) -> MCPManifestChangePlan | None:
-    """Return a staged manifest diff when a tool adds new allowed MCP servers."""
+    """Return a staged manifest diff when a tool adds new allowed MCP servers.
+
+    When ``inventory`` is provided, the returned plan snapshots per-server
+    inventory hashes for stale-merge enforcement (GRO-544).
+    """
     target_path = _tool_target_path(tool_input, cwd)
     if target_path is None or target_path != manifest_path.resolve():
         return None
@@ -1039,14 +1123,21 @@ def detect_mcp_allow_list_additions(
         staged_text=staged_text,
         baseline_sha256=_sha256_text(current_text),
         additions=additions,
+        addition_inventory_hashes=_snapshot_inventory_hashes(additions, inventory),
     )
 
 
 def build_mcp_manifest_change_plan(
     manifest_path: Path,
     staged_manifest: ChannelManifest,
+    *,
+    inventory: dict[str, dict[str, object]] | None = None,
 ) -> MCPManifestChangePlan | None:
-    """Build a staged MCP allow-list change plan from a proposed manifest."""
+    """Build a staged MCP allow-list change plan from a proposed manifest.
+
+    When ``inventory`` is provided, the returned plan snapshots per-server
+    inventory hashes for stale-merge enforcement (GRO-544).
+    """
     current_text = manifest_path.read_text(encoding="utf-8")
     current_manifest = load_manifest(manifest_path)
     additions = _mcp_allow_list_additions(current_manifest, staged_manifest)
@@ -1059,6 +1150,7 @@ def build_mcp_manifest_change_plan(
         staged_text=_manifest_yaml(staged_manifest),
         baseline_sha256=_sha256_text(current_text),
         additions=additions,
+        addition_inventory_hashes=_snapshot_inventory_hashes(additions, inventory),
     )
 
 
@@ -1077,6 +1169,7 @@ def persist_approved_mcp_manifest_change(
     if _sha256_text(current_text) == plan.baseline_sha256:
         updated_manifest = plan.staged_manifest
     else:
+        _verify_addition_inventory_snapshot(plan)
         merged_allowed = list(
             dict.fromkeys(
                 [
@@ -1685,6 +1778,7 @@ def compute_channel_mcp_change(
     *,
     action: Literal["allow", "deny"],
     home: Path | None = None,
+    inventory: dict[str, dict[str, object]] | None = None,
 ) -> ChannelMCPChange:
     """Compute a channel MCP allow/deny update without persisting it."""
     normalized_name = normalize_mcp_server_name(server_name)
@@ -1724,7 +1818,13 @@ def compute_channel_mcp_change(
         manifest_path=manifest_path,
         normalized_name=normalized_name,
         approval_plan=(
-            None if proposed == manifest else build_mcp_manifest_change_plan(manifest_path, proposed)
+            None
+            if proposed == manifest
+            else build_mcp_manifest_change_plan(
+                manifest_path,
+                proposed,
+                inventory=inventory,
+            )
         ),
     )
 
@@ -1751,6 +1851,7 @@ async def apply_channel_mcp_change(
         server_name,
         action=action,
         home=home,
+        inventory=inventory,
     )
     if change.proposed_manifest == change.previous_manifest:
         return AppliedChannelMCPChange(
