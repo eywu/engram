@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import logging
 import time
 import uuid
@@ -47,6 +48,33 @@ def derive_session_id(channel_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"engram-v3/{channel_id}"))
 
 
+def archive_session_transcript(
+    session_id: str,
+    cwd: Path | str | None,
+    *,
+    now: datetime.datetime | None = None,
+) -> Path | None:
+    """Archive a Claude CLI JSONL transcript if it exists."""
+    from engram.agent import _claude_cli_jsonl_for
+
+    transcript_path = _claude_cli_jsonl_for(session_id, cwd)
+    if not transcript_path.exists():
+        return None
+
+    current_time = now or datetime.datetime.now(datetime.UTC)
+    timestamp = current_time.strftime("%Y%m%dT%H%M%SZ")
+    archived_path = transcript_path.with_name(
+        f"{transcript_path.name}.archived-{timestamp}"
+    )
+    if archived_path.exists():
+        suffix = 1
+        while archived_path.with_name(f"{archived_path.name}.{suffix}").exists():
+            suffix += 1
+        archived_path = archived_path.with_name(f"{archived_path.name}.{suffix}")
+    transcript_path.replace(archived_path)
+    return archived_path
+
+
 @dataclass
 class SessionState:
     """Per-channel state.
@@ -64,6 +92,7 @@ class SessionState:
     agent_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     agent_session_initialized: bool = False
     agent_session_tagged: bool = False
+    session_just_started: bool = False
     agent_last_active_at: float = field(default_factory=time.monotonic)
     turn_count: int = 0
     current_user_id: str | None = None
@@ -282,6 +311,41 @@ class Router:
 
         log.info("router.session_invalidated channel_id=%s", channel_id)
         return True
+
+    async def start_new_conversation(self, channel_id: str) -> Path | None:
+        """Soft-reset one channel's SDK conversation without touching memory.
+
+        Keeps the cached SessionState and manifest intact, but drops the live
+        ClaudeSDKClient, archives the deterministic CLI transcript, and makes
+        the next turn connect with ``resume=False``.
+        """
+        session = self._sessions.get(channel_id)
+        if session is None:
+            session = await self.get(channel_id, is_dm=channel_id.startswith("D"))
+
+        async with session.agent_lock:
+            if session.agent_client is not None:
+                await session.agent_client.disconnect()
+                session.agent_client = None
+                log.info(
+                    "router.agent_client_closed_new_conversation session=%s",
+                    session.label(),
+                )
+            archived_path = archive_session_transcript(
+                session.session_id,
+                session.cwd,
+            )
+            session.agent_session_initialized = False
+            session.agent_session_tagged = False
+            session.session_just_started = True
+            session.disabled_mcp_servers.clear()
+
+        log.info(
+            "router.session_new_conversation channel_id=%s archived=%s",
+            channel_id,
+            archived_path,
+        )
+        return archived_path
 
     def session_count(self) -> int:
         return len(self._sessions)

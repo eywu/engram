@@ -13,14 +13,19 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
+from typing import Any
 
 from engram.agent import AgentTurn
 from engram.footguns import FootgunMatch, match_footgun
 from engram.hitl import PendingQuestion
 from engram.manifest import PermissionTier
+from engram.mcp import resolve_team_mcp_servers
+from engram.router import SessionState
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +64,9 @@ async def post_reply(
     *,
     thread_ts: str | None = None,
     session_label: str = "",
+    session: SessionState | None = None,
+    model: str | None = None,
+    memory_db_path: Path | None = None,
 ) -> EgressResult:
     """Post an agent turn back to Slack.
 
@@ -66,6 +74,16 @@ async def post_reply(
     CommonMark emitted by the model renders cleanly in Slack clients.
     """
     text = turn.text or "(empty reply)"
+    if session is not None and session.session_just_started:
+        text = (
+            await build_fresh_session_greeting(
+                session,
+                model=model,
+                memory_db_path=memory_db_path,
+            )
+            + "\n\n"
+            + text
+        )
     footer = ""
     if turn.cost_usd is not None:
         footer = f"\n\ncost: ${turn.cost_usd:.4f} · {turn.duration_ms or 0}ms"
@@ -105,7 +123,143 @@ async def post_reply(
         turn.cost_usd,
         turn.duration_ms,
     )
+    if session is not None and session.session_just_started:
+        session.session_just_started = False
     return EgressResult(posted_message_ts=posted_ts, chunks_posted=n)
+
+
+async def build_fresh_session_greeting(
+    session: SessionState,
+    *,
+    model: str | None = None,
+    memory_db_path: Path | None = None,
+) -> str:
+    manifest = session.manifest
+    identity = manifest.identity.value if manifest is not None else "default"
+    tier = (
+        manifest.tier_effective().value
+        if manifest is not None
+        else PermissionTier.TASK_ASSISTANT.value
+    )
+    memory_count = memory_entry_count(
+        session.channel_id,
+        memory_db_path=memory_db_path,
+    )
+    return (
+        "👋 Fresh session loaded. "
+        f"Model: {model or 'default'} • "
+        f"Identity: {identity} • "
+        f"MCPs: {await _mcp_summary(session)} • "
+        f"Memory: {memory_count:,} entries searchable • "
+        f"Tier: {tier}"
+    )
+
+
+async def build_new_session_public_notice(
+    session: SessionState,
+    *,
+    memory_db_path: Path | None = None,
+) -> str:
+    manifest = session.manifest
+    tier = (
+        manifest.tier_effective().value
+        if manifest is not None
+        else PermissionTier.TASK_ASSISTANT.value
+    )
+    memory_count = memory_entry_count(
+        session.channel_id,
+        memory_db_path=memory_db_path,
+    )
+    return (
+        "🔄 Started a fresh conversation. "
+        f"Tier: {tier} • "
+        f"Memory: {memory_count:,} entries available • "
+        f"MCP: {await _mcp_summary(session)}"
+    )
+
+
+def memory_entry_count(
+    channel_id: str,
+    *,
+    memory_db_path: Path | None = None,
+) -> int:
+    db_path = memory_db_path or (Path.home() / ".engram" / "memory.db")
+    if not db_path.exists():
+        return 0
+    try:
+        with sqlite3.connect(db_path) as conn:
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "memory_segments" in tables:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM memory_segments WHERE channel_id=?",
+                    (channel_id,),
+                ).fetchone()
+                return int(row[0] or 0) if row else 0
+            total = 0
+            for table in ("transcripts", "summaries"):
+                if table not in tables:
+                    continue
+                row = conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE channel_id=?",
+                    (channel_id,),
+                ).fetchone()
+                total += int(row[0] or 0) if row else 0
+            return total
+    except sqlite3.Error:
+        log.warning("egress.memory_count_failed channel=%s", channel_id, exc_info=True)
+        return 0
+
+
+async def _mcp_summary(session: SessionState) -> str:
+    status_summary = await _mcp_status_summary(session.agent_client)
+    if status_summary:
+        return status_summary
+    if session.manifest is None:
+        return "none"
+    servers, _allowed, _missing = resolve_team_mcp_servers(session.manifest)
+    names = list(servers)
+    return ", ".join(names) if names else "none"
+
+
+async def _mcp_status_summary(client: Any) -> str | None:
+    get_mcp_status = getattr(client, "get_mcp_status", None)
+    if not callable(get_mcp_status):
+        return None
+    try:
+        status = await get_mcp_status()
+    except Exception:
+        log.debug("egress.mcp_status_for_greeting_failed", exc_info=True)
+        return None
+
+    servers = status.get("mcpServers") if isinstance(status, dict) else None
+    if not isinstance(servers, list):
+        return None
+    parts: list[str] = []
+    for server in servers:
+        if not isinstance(server, dict):
+            continue
+        name = server.get("name")
+        if not name:
+            continue
+        count = _mcp_tool_count(server)
+        parts.append(f"{name} ({count} tool{'s' if count != 1 else ''})")
+    return ", ".join(parts) if parts else "none"
+
+
+def _mcp_tool_count(server: dict[str, Any]) -> int:
+    for key in ("toolCount", "tool_count"):
+        value = server.get(key)
+        if isinstance(value, int):
+            return value
+    tools = server.get("tools")
+    if isinstance(tools, list):
+        return len(tools)
+    return 0
 
 
 def _notification_fallback(body: str, max_len: int = 120) -> str:

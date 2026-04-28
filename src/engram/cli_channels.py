@@ -6,6 +6,7 @@ Sub-commands:
   engram channels approve <id>      — flip PENDING → ACTIVE
   engram channels deny <id>         — flip any → DENIED (silently ignored)
   engram channels reset <id>        — back to PENDING (owner must re-approve)
+  engram channels new <id>          — start a fresh SDK conversation
   engram channels mcp ...           — manage per-channel MCP allow/deny state
 
 The CLI is the human-friendly front-end for the `status` field in
@@ -16,6 +17,7 @@ next restart, or when a channel hasn't been resolved yet this run.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 from pathlib import Path
@@ -44,6 +46,7 @@ from engram.manifest import (
 )
 from engram.mcp import render_channel_mcp_access
 from engram.mcp_manifest_gate import MCPApprovalDisposition
+from engram.router import archive_session_transcript, derive_session_id
 
 app = typer.Typer(
     name="channels",
@@ -358,6 +361,54 @@ def reset(
 ) -> None:
     """Reset a channel to PENDING; requires re-approval before bot responds."""
     _flip_status(channel_id, ChannelStatus.PENDING)
+
+
+@app.command("new")
+def new(
+    channel_id: str = typer.Argument(..., help="Slack channel ID."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip confirmation.",
+    ),
+) -> None:
+    """Start a fresh SDK conversation while preserving manifest and memory."""
+    _manifest_path, manifest = _load_manifest_or_exit(channel_id)
+    if not yes and not Confirm.ask(
+        f"Start a new conversation in '{channel_id}'?",
+        default=False,
+    ):
+        rprint("[dim]Canceled.[/dim]")
+        return
+
+    request_path = paths.new_session_request_path(channel_id)
+    request_path.parent.mkdir(parents=True, exist_ok=True)
+    request_path.write_text(
+        json.dumps(
+            {
+                "channel_id": channel_id,
+                "requested_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    archived = archive_session_transcript(
+        derive_session_id(channel_id),
+        paths.project_root(),
+    )
+    rprint(
+        f"[green]✓[/] [bold]{channel_id}[/bold]: fresh conversation requested "
+        f"(tier: {manifest.tier_effective().value})."
+    )
+    if archived is not None:
+        rprint(f"[dim]Archived transcript: {archived}[/dim]")
+    rprint(
+        "[dim]The running bridge will drop any live SDK client before the next "
+        "message in this channel.[/dim]"
+    )
 
 
 @app.command("upgrade")

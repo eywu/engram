@@ -277,6 +277,23 @@ def test_reset_flips_to_pending(cli, tmp_path: Path):
     assert m.status == ChannelStatus.PENDING
 
 
+def test_new_requests_fresh_conversation(cli, tmp_path: Path):
+    _provision(tmp_path, "D07OWNER", IdentityTemplate.OWNER_DM_FULL)
+
+    result = cli.invoke(app, ["new", "D07OWNER", "--yes"])
+
+    assert result.exit_code == 0
+    assert "fresh conversation requested" in result.output
+    request_path = (
+        tmp_path
+        / ".engram"
+        / "state"
+        / "new-session-requests"
+        / "D07OWNER.json"
+    )
+    assert json.loads(request_path.read_text(encoding="utf-8"))["channel_id"] == "D07OWNER"
+
+
 def test_upgrade_sets_trusted_tier(cli, tmp_path: Path):
     from engram.bootstrap import provision_channel as pc
 

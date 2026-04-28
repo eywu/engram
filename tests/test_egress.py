@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from datetime import UTC, datetime
 
 import pytest
@@ -22,6 +23,7 @@ from engram.egress import (
 from engram.footguns import match_footgun
 from engram.hitl import PendingQuestion
 from engram.manifest import ChannelManifest, IdentityTemplate, PermissionTier
+from engram.router import SessionState
 
 
 class FakeSlackClient:
@@ -37,6 +39,16 @@ class FakeSlackClient:
     async def chat_update(self, **kwargs):
         self.update_calls.append(kwargs)
         return {"ok": True}
+
+
+class FakeMCPClient:
+    async def get_mcp_status(self):
+        return {
+            "mcpServers": [
+                {"name": "camoufox", "tools": ["browse"]},
+                {"name": "claude_desktop_settings", "toolCount": 4},
+            ]
+        }
 
 
 def make_question(
@@ -139,6 +151,63 @@ async def test_reply_renders_markdown_block():
         }
     ]
     assert call["text"] == "hello bold there"
+
+
+@pytest.mark.asyncio
+async def test_reply_prepends_fresh_session_greeting_once(tmp_path):
+    db_path = tmp_path / "memory.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE transcripts (channel_id TEXT)")
+        conn.executemany(
+            "INSERT INTO transcripts(channel_id) VALUES (?)",
+            [("C07TEST123",), ("C07TEST123",), ("C_OTHER",)],
+        )
+    slack = FakeSlackClient()
+    session = SessionState(
+        channel_id="C07TEST123",
+        manifest=ChannelManifest(
+            channel_id="C07TEST123",
+            identity=IdentityTemplate.OWNER_DM_FULL,
+            permission_tier=PermissionTier.OWNER_SCOPED,
+        ),
+    )
+    session.agent_client = FakeMCPClient()
+    session.session_just_started = True
+    turn = AgentTurn(
+        text="actual response",
+        cost_usd=None,
+        duration_ms=None,
+        num_turns=1,
+        is_error=False,
+    )
+
+    await post_reply(
+        slack,
+        "C07TEST123",
+        turn,
+        session=session,
+        model="claude-opus-test",
+        memory_db_path=db_path,
+    )
+    await post_reply(
+        slack,
+        "C07TEST123",
+        turn,
+        session=session,
+        model="claude-opus-test",
+        memory_db_path=db_path,
+    )
+
+    first_text = slack.post_calls[0]["blocks"][0]["text"]
+    second_text = slack.post_calls[1]["blocks"][0]["text"]
+    assert first_text.startswith("👋 Fresh session loaded.")
+    assert "Model: claude-opus-test" in first_text
+    assert "Identity: owner-dm-full" in first_text
+    assert "MCPs: camoufox (1 tool), claude_desktop_settings (4 tools)" in first_text
+    assert "Memory: 2 entries searchable" in first_text
+    assert "Tier: trusted" in first_text
+    assert second_text == "actual response"
+    assert session.session_just_started is False
 
 
 @pytest.mark.asyncio

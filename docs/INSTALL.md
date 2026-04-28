@@ -266,6 +266,7 @@ and the channel dashboard without needing Slack app-manifest changes.
 | `/engram mcp list` | `engram channels mcp list <channel-id>` | Shows the effective MCPs for one channel plus declared allow/deny state. |
 | `/engram mcp allow <server>` | `engram channels mcp allow <channel-id> <server>` | First-class replacement for hand-editing `mcp_servers.allowed`. |
 | `/engram mcp deny <server>` | `engram channels mcp deny <channel-id> <server>` | Adds to `mcp_servers.disallowed`; safe for immediate lock-downs. |
+| `/engram new` | `engram channels new <channel-id> [--yes]` | Starts a fresh SDK conversation for the channel. Memory, tier, and YOLO grants are preserved; MCP and project config reload on the next message. |
 | `/engram upgrade <safe\|trusted\|yolo>` | `engram channels upgrade <channel-id> <tier> [--until 24h\|30d\|permanent]` | Upgrade or downgrade a channel tier directly from the bridge host. |
 | `/engram yolo extend <channel> <duration>` | `engram yolo extend --channel <channel-id> <6h\|24h\|72h>` | Omitting `--channel` auto-targets the only active YOLO grant. |
 | `/engram yolo list` | `engram yolo list` | Lists every active YOLO grant with remaining time and restore tier. |
@@ -281,6 +282,7 @@ Examples:
 engram channels mcp list C07TEAM123
 engram channels mcp allow C07TEAM123 camoufox
 engram channels mcp deny C07TEAM123 camoufox
+engram channels new C07TEAM123 --yes
 engram channels upgrade C07TEAM123 trusted
 engram channels exclude C07TEAM123
 engram channels include C07TEAM123
@@ -427,7 +429,10 @@ a card does not behave as expected.
 
 If a newly added MCP is visible in Claude Code but not in Slack, see
 [mcp.md](mcp.md) for the registration vs. channel-manifest model and the
-`mcp.excluded_by_manifest` troubleshooting path.
+`mcp.excluded_by_manifest` troubleshooting path. If you edited MCP or
+project config and need the running channel to reload it without bouncing the
+bridge, run `/engram new` in that channel or
+`engram channels new <channel-id> --yes` on the host.
 
 ### `engram setup` reports tokens with the wrong prefix
 

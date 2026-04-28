@@ -21,7 +21,12 @@ from engram.manifest import (
     IdentityTemplate,
     ScopeList,
 )
-from engram.router import Router, SessionState, derive_session_id
+from engram.router import (
+    Router,
+    SessionState,
+    archive_session_transcript,
+    derive_session_id,
+)
 
 
 def _cfg() -> EngramConfig:
@@ -462,6 +467,64 @@ async def test_existing_transcript_after_state_reset_resumes_from_disk(
         if record["type"] == "user"
     ]
     assert user_prompts == ["first", "second"]
+
+
+def test_archive_session_transcript_renames_existing_jsonl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = derive_session_id("C07TEST123")
+    transcript_path = _claude_cli_jsonl_for(session_id, cwd)
+    transcript_path.parent.mkdir(parents=True)
+    transcript_path.write_text('{"type":"user"}\n', encoding="utf-8")
+
+    archived = archive_session_transcript(session_id, cwd)
+
+    assert archived is not None
+    assert archived.name.startswith(f"{session_id}.jsonl.archived-")
+    assert archived.read_text(encoding="utf-8") == '{"type":"user"}\n'
+    assert not transcript_path.exists()
+
+
+def test_archive_session_transcript_noops_when_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+
+    assert archive_session_transcript(derive_session_id("C07TEST123"), tmp_path) is None
+
+
+@pytest.mark.asyncio
+async def test_start_new_conversation_disconnects_archives_and_disables_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    router = Router(shared_cwd=cwd)
+    session = await router.get("C07TEST123")
+    client = _FakeClient(ClaudeAgentOptions())
+    session.agent_client = client
+    session.agent_session_initialized = True
+    transcript_path = _claude_cli_jsonl_for(session.session_id, cwd)
+    transcript_path.parent.mkdir(parents=True)
+    transcript_path.write_text('{"type":"user"}\n', encoding="utf-8")
+
+    archived = await router.start_new_conversation("C07TEST123")
+
+    assert client.disconnected is True
+    assert session.agent_client is None
+    assert session.agent_session_initialized is False
+    assert session.agent_session_tagged is False
+    assert session.session_just_started is True
+    assert archived is not None
+    assert archived.exists()
+    assert not transcript_path.exists()
 
 
 @pytest.mark.asyncio
