@@ -69,4 +69,5 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "requires_api_key: integration tests that call Anthropic directly and are skipped in CI",
+    "requires_build: wheel build/install smoke tests that are opt-in locally",
 ]
