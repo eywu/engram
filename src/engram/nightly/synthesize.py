@@ -16,13 +16,14 @@ from importlib.resources import files
 from importlib.resources.abc import Traversable
 from pathlib import Path
 from string import Template
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import yaml
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    McpServerConfig,
     ResultMessage,
 )
 from dotenv import load_dotenv
@@ -366,7 +367,7 @@ def build_nightly_options(
             "WebSearch",
         ],
         skills=[],
-        mcp_servers=mcp_servers,
+        mcp_servers=cast(dict[str, McpServerConfig], mcp_servers),
         extra_args={"strict-mcp-config": None},
         max_budget_usd=MAX_TURN_BUDGET_USD,
         env=child_env,
