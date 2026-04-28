@@ -90,6 +90,39 @@ def _write_bridge_log(
     return path
 
 
+def _dump_plist(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        plistlib.dump(payload, handle, sort_keys=False)
+
+
+def _write_nightly_plist(home: Path, *, env_file: str | None = None) -> Path:
+    installed_path = home / "Library" / "LaunchAgents" / "com.engram.v3.nightly.plist"
+    payload: dict[str, object] = {
+        "Label": "com.engram.v3.nightly",
+        "EnvironmentVariables": {
+            "HOME": str(home),
+            "LANG": "en_US.UTF-8",
+        },
+    }
+    if env_file is not None:
+        payload["EnvironmentVariables"]["ENGRAM_ENV_FILE"] = env_file
+    _dump_plist(installed_path, payload)
+    return installed_path
+
+
+def _write_bridge_plist(home: Path, *, env_file: str) -> Path:
+    installed_path = home / "Library" / "LaunchAgents" / "com.engram.bridge.plist"
+    payload = render_bridge_plist(
+        repo_root=Path.cwd(),
+        uv_bin=Path("/tmp/uv"),
+        env_file=Path(env_file),
+        home=home,
+    )
+    _dump_plist(installed_path, payload)
+    return installed_path
+
+
 def test_check_uv_on_path_reports_version() -> None:
     check = check_uv_on_path(
         which=lambda name: "/usr/local/bin/uv" if name == "uv" else None,
@@ -566,25 +599,145 @@ def test_check_launchd_nightly_job_not_installed_warns_when_optional() -> None:
 
 
 def test_check_launchd_nightly_env_file_warns_when_missing(tmp_path: Path) -> None:
-    installed_path = tmp_path / "Library" / "LaunchAgents" / "com.engram.v3.nightly.plist"
-    installed_path.parent.mkdir(parents=True)
-    with installed_path.open("wb") as handle:
-        plistlib.dump(
-            {
-                "Label": "com.engram.v3.nightly",
-                "EnvironmentVariables": {
-                    "HOME": str(tmp_path),
-                    "LANG": "en_US.UTF-8",
-                },
-            },
-            handle,
-            sort_keys=False,
-        )
+    _write_nightly_plist(tmp_path)
 
     check = check_launchd_nightly_env_file(home=tmp_path)
 
     assert check.status == CheckStatus.WARN
     assert "EnvironmentVariables.ENGRAM_ENV_FILE" in check.message
+
+
+def test_check_launchd_nightly_env_file_warns_on_template_placeholder(tmp_path: Path) -> None:
+    _write_nightly_plist(
+        tmp_path,
+        env_file="/REPLACE/WITH/ABSOLUTE/PATH/TO/engram.env",
+    )
+
+    check = check_launchd_nightly_env_file(home=tmp_path)
+
+    assert check.status == CheckStatus.WARN
+    assert "template placeholder" in check.message
+    assert "./scripts/install_launchd.sh --install-nightly" in check.message
+
+
+def test_check_launchd_nightly_env_file_warns_when_resolved_file_is_missing(tmp_path: Path) -> None:
+    missing_env_file = tmp_path / ".engram" / "missing.env"
+    _write_nightly_plist(tmp_path, env_file=str(missing_env_file))
+
+    check = check_launchd_nightly_env_file(home=tmp_path)
+
+    assert check.status == CheckStatus.WARN
+    assert str(missing_env_file.resolve()) in check.message
+    assert check.details["resolved_env_file"] == str(missing_env_file.resolve())
+
+
+def test_check_launchd_nightly_env_file_passes_when_resolved_file_exists(tmp_path: Path) -> None:
+    env_file = tmp_path / ".engram" / "engram.env"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_file.write_text("ANTHROPIC_API_KEY=sk-ant-test\n", encoding="utf-8")
+    _write_nightly_plist(tmp_path, env_file=str(env_file))
+
+    check = check_launchd_nightly_env_file(home=tmp_path)
+
+    assert check.status == CheckStatus.PASS
+    assert check.details["env_file"] == str(env_file)
+    assert check.details["resolved_env_file"] == str(env_file.resolve())
+
+
+def test_check_launchd_nightly_env_file_warns_on_tilde_path(tmp_path: Path) -> None:
+    # GRO-569: launchd does NOT expand `~` in EnvironmentVariables.
+    # A hand-edited plist with `~/foo` would FAIL launchd at startup.
+    _write_nightly_plist(tmp_path, env_file="~/.engram/engram.env")
+
+    check = check_launchd_nightly_env_file(home=tmp_path)
+
+    assert check.status == CheckStatus.WARN
+    assert "not an absolute path" in check.message
+    assert "launchd does not expand" in check.message
+    assert check.details["env_file"] == "~/.engram/engram.env"
+    assert "resolved_env_file" not in check.details
+
+
+def test_check_launchd_nightly_env_file_warns_on_relative_path(tmp_path: Path) -> None:
+    # GRO-569: launchd does NOT expand relative paths in EnvironmentVariables.
+    _write_nightly_plist(tmp_path, env_file="engram.env")
+
+    check = check_launchd_nightly_env_file(home=tmp_path)
+
+    assert check.status == CheckStatus.WARN
+    assert "not an absolute path" in check.message
+    assert "'engram.env'" in check.message
+
+
+def test_check_launchd_nightly_env_file_warns_on_symlink_loop(tmp_path: Path) -> None:
+    # GRO-569: A symlink loop must not crash doctor. On Py 3.14+,
+    # Path.resolve(strict=False) returns the unresolved path so we fall
+    # through to missing_file. On older Pythons it raises RuntimeError
+    # which we catch as resolution_failed. Either WARN path is acceptable.
+    loop_a = tmp_path / "loop_a"
+    loop_b = tmp_path / "loop_b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    _write_nightly_plist(tmp_path, env_file=str(loop_a))
+
+    # Must not crash with an unhandled exception.
+    check = check_launchd_nightly_env_file(home=tmp_path)
+
+    assert check.status == CheckStatus.WARN
+    # Either resolution_failed (older Python) or missing_file (Py 3.14+) is fine
+    assert ("resolving it failed" in check.message) or ("does not exist" in check.message)
+    assert check.details["env_file"] == str(loop_a)
+
+
+def test_check_launchd_nightly_env_file_warns_on_resolution_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # GRO-569 blocker 2: Path.resolve() must be wrapped in try/except so an
+    # OSError or RuntimeError surfaces as a WARN instead of crashing doctor.
+    env_file = tmp_path / ".engram" / "engram.env"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_file.write_text("ANTHROPIC_API_KEY=sk-ant-test\n", encoding="utf-8")
+    _write_nightly_plist(tmp_path, env_file=str(env_file))
+
+    original_resolve = Path.resolve
+
+    def boom(self: Path, *args: object, **kwargs: object) -> Path:
+        # Match the call site signature: only fail on resolution of
+        # the configured env_file, not the plist path or other internals.
+        if str(self) == str(env_file):
+            raise OSError("simulated resolution failure")
+        return original_resolve(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "resolve", boom)
+
+    check = check_launchd_nightly_env_file(home=tmp_path)
+
+    assert check.status == CheckStatus.WARN
+    assert "resolving it failed" in check.message
+    assert check.details["env_file"] == str(env_file)
+    assert check.details.get("error_class") == "OSError"
+
+
+def test_check_launchd_nightly_env_file_warns_when_resolved_file_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    # GRO-569 polish ask from iter 1 reject: unreadable_file branch was untested.
+    env_file = tmp_path / ".engram" / "engram.env"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_file.write_text("ANTHROPIC_API_KEY=sk-ant-test\n", encoding="utf-8")
+    env_file.chmod(0o000)
+    try:
+        _write_nightly_plist(tmp_path, env_file=str(env_file))
+        check = check_launchd_nightly_env_file(home=tmp_path)
+        # On systems where root can read 000 files (or chmod doesn't take effect),
+        # this would PASS; we tolerate either outcome but assert the WARN path is
+        # well-formed when it does fire.
+        if check.status == CheckStatus.WARN:
+            assert "not readable" in check.message
+            assert str(env_file.resolve()) in check.message
+    finally:
+        # Restore permissions so pytest cleanup can delete the file.
+        env_file.chmod(0o600)
 
 
 def test_check_launchd_bridge_plist_drift_warns_on_missing_soft_resource_limits(
@@ -621,6 +774,65 @@ def test_check_launchd_bridge_plist_drift_warns_on_missing_soft_resource_limits(
     assert "SoftResourceLimits.NumberOfFiles" in check.message
     assert check.details["template_commit"] == "abc1234"
     assert "SoftResourceLimits.NumberOfFiles" in check.details["issues"]
+
+
+def test_check_launchd_bridge_plist_drift_warns_on_template_placeholder_env_file(
+    tmp_path: Path,
+) -> None:
+    _write_bridge_plist(
+        tmp_path,
+        env_file="/REPLACE/WITH/ABSOLUTE/PATH/TO/engram.env",
+    )
+
+    check = check_launchd_bridge_plist_drift(
+        repo_root=Path.cwd(),
+        home=tmp_path,
+        commit_resolver=lambda _repo_root: "abc1234",
+    )
+
+    assert check.status == CheckStatus.WARN
+    assert "template placeholder" in check.message
+    assert "./scripts/install_launchd.sh" in check.message
+    assert check.details["issues"] == ["EnvironmentVariables.ENGRAM_ENV_FILE"]
+    assert check.details["env_file"] == "/REPLACE/WITH/ABSOLUTE/PATH/TO/engram.env"
+
+
+def test_check_launchd_bridge_plist_drift_warns_when_env_file_is_missing(
+    tmp_path: Path,
+) -> None:
+    missing_env_file = tmp_path / ".engram" / "missing.env"
+    _write_bridge_plist(tmp_path, env_file=str(missing_env_file))
+
+    check = check_launchd_bridge_plist_drift(
+        repo_root=Path.cwd(),
+        home=tmp_path,
+        commit_resolver=lambda _repo_root: "abc1234",
+    )
+
+    assert check.status == CheckStatus.WARN
+    assert str(missing_env_file.resolve()) in check.message
+    assert check.details["issues"] == ["EnvironmentVariables.ENGRAM_ENV_FILE"]
+    assert check.details["resolved_env_file"] == str(missing_env_file.resolve())
+
+
+def test_check_launchd_bridge_plist_drift_passes_when_env_file_exists(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / ".engram" / "engram.env"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_file.write_text("ANTHROPIC_API_KEY=sk-ant-test\n", encoding="utf-8")
+    _write_bridge_plist(tmp_path, env_file=str(env_file))
+
+    check = check_launchd_bridge_plist_drift(
+        repo_root=Path.cwd(),
+        home=tmp_path,
+        commit_resolver=lambda _repo_root: "abc1234",
+    )
+
+    assert check.status == CheckStatus.PASS
+    assert check.details["template_commit"] == "abc1234"
+    assert check.details["env_file"] == str(env_file)
+    assert check.details["resolved_env_file"] == str(env_file.resolve())
 
 
 def test_check_disk_space_requires_one_gb(tmp_path: Path) -> None:

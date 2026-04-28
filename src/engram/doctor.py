@@ -22,6 +22,7 @@ from rich.table import Table
 
 from engram.config import EngramConfig
 from engram.launchd import (
+    PlistIssue,
     bridge_template_commit,
     doctor_bridge_plist_issues,
     find_repo_root,
@@ -49,6 +50,8 @@ SLACK_SLASH_COMMAND_MISSING_PATTERNS = (
 )
 SLACK_SLASH_COMMAND_LOG_WINDOW = datetime.timedelta(hours=24)
 MCP_EXCLUSION_LOG_WINDOW = datetime.timedelta(hours=24)
+_ENV_FILE_PLACEHOLDER_SEGMENT = "/REPLACE/WITH/"
+_INSTALL_NIGHTLY_COMMAND = "./scripts/install_launchd.sh --install-nightly"
 
 
 class CheckStatus(StrEnum):
@@ -1052,6 +1055,10 @@ def check_launchd_bridge_plist_drift(
         )
 
     issues = doctor_bridge_plist_issues(installed)
+    env_file_issue, env_file_error, env_details = _launchd_env_file_issue(installed)
+    details |= env_details
+    if env_file_issue is not None:
+        issues.append(env_file_issue)
     if not issues:
         commit = (commit_resolver or bridge_template_commit)(root)
         if commit:
@@ -1072,7 +1079,12 @@ def check_launchd_bridge_plist_drift(
         id="launchd_bridge_plist",
         name="launchd bridge plist",
         status=CheckStatus.WARN,
-        message=_launchd_bridge_plist_drift_message(issues, template_commit=commit),
+        message=_launchd_bridge_plist_drift_message(
+            issues,
+            template_commit=commit,
+            env_file_error=env_file_error,
+            env_details=env_details,
+        ),
         details=details,
     )
 
@@ -1105,13 +1117,82 @@ def check_launchd_nightly_env_file(*, home: Path | None = None) -> DoctorCheck:
 
     environment = installed.get("EnvironmentVariables")
     env_file = environment.get("ENGRAM_ENV_FILE") if isinstance(environment, dict) else None
-    if isinstance(env_file, str) and env_file.strip():
+    env_file_error, env_details = _validate_launchd_env_file(env_file)
+    if env_file_error is None:
         return DoctorCheck(
             id="launchd_nightly_env_file",
             name="launchd nightly env file",
             status=CheckStatus.PASS,
             message=f"{installed_path} includes EnvironmentVariables.ENGRAM_ENV_FILE.",
-            details=details | {"env_file": env_file},
+            details=details | env_details,
+        )
+
+    if env_file_error == "placeholder":
+        return DoctorCheck(
+            id="launchd_nightly_env_file",
+            name="launchd nightly env file",
+            status=CheckStatus.WARN,
+            message=(
+                f"{installed_path} still contains a template placeholder in "
+                "EnvironmentVariables.ENGRAM_ENV_FILE; reinstall it with "
+                f"`{_INSTALL_NIGHTLY_COMMAND}`."
+            ),
+            details=details | env_details,
+        )
+
+    if env_file_error == "missing_file":
+        return DoctorCheck(
+            id="launchd_nightly_env_file",
+            name="launchd nightly env file",
+            status=CheckStatus.WARN,
+            message=(
+                f"{installed_path} points EnvironmentVariables.ENGRAM_ENV_FILE to "
+                f"{env_details['resolved_env_file']}, but that file does not exist; "
+                f"reinstall it with `{_INSTALL_NIGHTLY_COMMAND}`."
+            ),
+            details=details | env_details,
+        )
+
+    if env_file_error == "unreadable_file":
+        return DoctorCheck(
+            id="launchd_nightly_env_file",
+            name="launchd nightly env file",
+            status=CheckStatus.WARN,
+            message=(
+                f"{installed_path} points EnvironmentVariables.ENGRAM_ENV_FILE to "
+                f"{env_details['resolved_env_file']}, but it is not readable; "
+                f"reinstall it with `{_INSTALL_NIGHTLY_COMMAND}`."
+            ),
+            details=details | env_details,
+        )
+
+    if env_file_error == "not_absolute":
+        return DoctorCheck(
+            id="launchd_nightly_env_file",
+            name="launchd nightly env file",
+            status=CheckStatus.WARN,
+            message=(
+                f"{installed_path} sets EnvironmentVariables.ENGRAM_ENV_FILE to "
+                f"{env_details['env_file']!r}, which is not an absolute path. "
+                "launchd does not expand `~` or relative paths in EnvironmentVariables; "
+                f"reinstall it with `{_INSTALL_NIGHTLY_COMMAND}` to write an absolute path."
+            ),
+            details=details | env_details,
+        )
+
+    if env_file_error == "resolution_failed":
+        return DoctorCheck(
+            id="launchd_nightly_env_file",
+            name="launchd nightly env file",
+            status=CheckStatus.WARN,
+            message=(
+                f"{installed_path} points EnvironmentVariables.ENGRAM_ENV_FILE to "
+                f"{env_details['env_file']!r}, but resolving it failed "
+                f"({env_details.get('error_class', 'OSError')}). "
+                "This usually indicates a symlink loop or filesystem error; "
+                f"reinstall it with `{_INSTALL_NIGHTLY_COMMAND}`."
+            ),
+            details=details | env_details,
         )
 
     return DoctorCheck(
@@ -1120,7 +1201,7 @@ def check_launchd_nightly_env_file(*, home: Path | None = None) -> DoctorCheck:
         status=CheckStatus.WARN,
         message=(
             f"{installed_path} is missing EnvironmentVariables.ENGRAM_ENV_FILE; "
-            "reinstall it with `./scripts/install_launchd.sh --install-nightly`."
+            f"reinstall it with `{_INSTALL_NIGHTLY_COMMAND}`."
         ),
         details=details,
     )
@@ -1281,13 +1362,59 @@ def _launchd_bridge_plist_drift_message(
     issues: list[Any],
     *,
     template_commit: str | None,
+    env_file_error: str | None = None,
+    env_details: dict[str, str] | None = None,
 ) -> str:
+    suffix = f" Canonical template {template_commit}." if template_commit else ""
+    install_hint = (
+        " Reinstall the bridge with `./scripts/install_launchd.sh` and restart it to apply."
+    )
+    if env_file_error == "placeholder":
+        return (
+            "installed plist contains a template placeholder in "
+            "EnvironmentVariables.ENGRAM_ENV_FILE."
+            f"{install_hint}{suffix}"
+        )
+
+    resolved_env_file = (env_details or {}).get("resolved_env_file")
+    if env_file_error == "missing_file" and resolved_env_file is not None:
+        return (
+            "installed plist points EnvironmentVariables.ENGRAM_ENV_FILE to "
+            f"{resolved_env_file}, but that file does not exist."
+            f"{install_hint}{suffix}"
+        )
+
+    if env_file_error == "unreadable_file" and resolved_env_file is not None:
+        return (
+            "installed plist points EnvironmentVariables.ENGRAM_ENV_FILE to "
+            f"{resolved_env_file}, but it is not readable."
+            f"{install_hint}{suffix}"
+        )
+
+    raw_env_file = (env_details or {}).get("env_file")
+    if env_file_error == "not_absolute" and raw_env_file is not None:
+        return (
+            "installed plist sets EnvironmentVariables.ENGRAM_ENV_FILE to "
+            f"{raw_env_file!r}, which is not an absolute path. launchd does "
+            "not expand `~` or relative paths in EnvironmentVariables."
+            f"{install_hint}{suffix}"
+        )
+
+    if env_file_error == "resolution_failed" and raw_env_file is not None:
+        error_class = (env_details or {}).get("error_class", "OSError")
+        return (
+            "installed plist points EnvironmentVariables.ENGRAM_ENV_FILE to "
+            f"{raw_env_file!r}, but resolving it failed ({error_class}). "
+            "This usually indicates a symlink loop or filesystem error."
+            f"{install_hint}{suffix}"
+        )
+
     soft_limit_issue = next(
         (issue for issue in issues if issue.path == "SoftResourceLimits.NumberOfFiles"),
         None,
     )
     if soft_limit_issue is not None:
-        suffix = (
+        soft_limit_suffix = (
             f" (introduced in GRO-481; canonical template {template_commit})."
             if template_commit
             else " (introduced in GRO-481)."
@@ -1295,18 +1422,78 @@ def _launchd_bridge_plist_drift_message(
         return (
             "installed plist missing or outdated SoftResourceLimits.NumberOfFiles; "
             "restart bridge with corrected plist to apply"
-            f"{suffix}"
+            f"{soft_limit_suffix}"
         )
 
     summarized = ", ".join(issue.path for issue in issues[:3])
     if len(issues) > 3:
         summarized = f"{summarized}, +{len(issues) - 3} more"
-    suffix = f" Canonical template {template_commit}." if template_commit else ""
     return (
         f"installed plist drift detected ({summarized}); "
         "restart bridge with corrected plist to apply."
         f"{suffix}"
     )
+
+
+def _launchd_env_file_issue(
+    installed: dict[str, Any],
+) -> tuple[PlistIssue | None, str | None, dict[str, str]]:
+    environment = installed.get("EnvironmentVariables")
+    env_file = environment.get("ENGRAM_ENV_FILE") if isinstance(environment, dict) else None
+    error, details = _validate_launchd_env_file(env_file)
+    if error in {None, "missing"}:
+        return None, error, details
+    return (
+        PlistIssue(
+            category="env_vars",
+            path="EnvironmentVariables.ENGRAM_ENV_FILE",
+            expected="<readable resolved path>",
+            actual=env_file,
+        ),
+        error,
+        details,
+    )
+
+
+def _validate_launchd_env_file(env_file: Any) -> tuple[str | None, dict[str, str]]:
+    if not isinstance(env_file, str):
+        return "missing", {}
+
+    value = env_file.strip()
+    if not value:
+        return "missing", {}
+
+    details = {"env_file": value}
+    if _ENV_FILE_PLACEHOLDER_SEGMENT in value:
+        return "placeholder", details
+
+    # GRO-569 blocker 1: launchd does NOT expand `~` or relative paths in
+    # EnvironmentVariables values. The story title is literally
+    # "validate ENGRAM_ENV_FILE is resolved + exists" — a hand-edited plist
+    # with a relative path or `~/foo` will FAIL launchd at startup, so doctor
+    # must catch it before resolve() silently expands it from cwd/$HOME.
+    if value.startswith("~") or not Path(value).is_absolute():
+        return "not_absolute", details
+
+    # GRO-569 blocker 2: Path.resolve() raises RuntimeError on symlink loops
+    # and OSError on filesystem errors. Without try/except, doctor crashes
+    # with a stack trace and non-zero exit instead of producing a WARN.
+    try:
+        resolved = Path(value).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        details["error_class"] = type(exc).__name__
+        return "resolution_failed", details
+
+    details["resolved_env_file"] = str(resolved)
+    if not resolved.exists():
+        return "missing_file", details
+
+    try:
+        with resolved.open("rb"):
+            pass
+    except OSError:
+        return "unreadable_file", details
+    return None, details
 
 
 def _mcp_server_command(server_config: dict[str, Any] | None) -> str | None:
