@@ -135,6 +135,12 @@ def run_doctor(config_path: Path | None = None) -> DoctorReport:
         config.paths.contexts_dir if config is not None else path.parent / "contexts"
     )
     log_dir = config.paths.log_dir if config is not None else path.parent / "logs"
+    nightly_job = check_launchd_job(
+        "launchd_nightly",
+        "launchd nightly job",
+        "com.engram.v3.nightly",
+        optional=True,
+    )
 
     checks = [
         check_uv_on_path(),
@@ -163,13 +169,8 @@ def run_doctor(config_path: Path | None = None) -> DoctorReport:
             "com.engram.bridge",
         ),
         check_launchd_bridge_plist_drift(),
-        check_launchd_job(
-            "launchd_nightly",
-            "launchd nightly job",
-            "com.engram.v3.nightly",
-            optional=True,
-        ),
-        check_launchd_nightly_env_file(),
+        nightly_job,
+        check_launchd_nightly_env_file(nightly_job=nightly_job),
         check_fd_pressure(log_dir),
         check_disk_space(path.parent),
         check_log_dir_writable(log_dir),
@@ -1119,17 +1120,60 @@ def check_launchd_bridge_plist_drift(
     )
 
 
-def check_launchd_nightly_env_file(*, home: Path | None = None) -> DoctorCheck:
-    installed_path = (home or Path.home()) / "Library" / "LaunchAgents" / "com.engram.v3.nightly.plist"
+def _nightly_job_is_not_installed(check: DoctorCheck | None) -> bool:
+    return (
+        check is not None
+        and check.id == "launchd_nightly"
+        and check.details.get("state") == "not_installed"
+    )
+
+
+def check_launchd_nightly_env_file(
+    *,
+    home: Path | None = None,
+    nightly_job: DoctorCheck | None = None,
+    launchctl_list: Callable[[], str] | None = None,
+) -> DoctorCheck:
+    installed_path = (
+        (home or Path.home())
+        / "Library"
+        / "LaunchAgents"
+        / "com.engram.v3.nightly.plist"
+    )
     details = {"installed_path": str(installed_path)}
+    skip_message = (
+        f"{installed_path} is not installed; skipping "
+        "EnvironmentVariables.ENGRAM_ENV_FILE validation."
+    )
     if not installed_path.exists():
+        if _nightly_job_is_not_installed(nightly_job):
+            return DoctorCheck(
+                id="launchd_nightly_env_file",
+                name="launchd nightly env file",
+                status=CheckStatus.PASS,
+                message=skip_message,
+                details=details,
+            )
+        if nightly_job is None:
+            try:
+                listing = (launchctl_list or _launchctl_list)()
+            except Exception:
+                listing = None
+            if listing is not None and _find_launchd_row(listing, "com.engram.v3.nightly") is None:
+                return DoctorCheck(
+                    id="launchd_nightly_env_file",
+                    name="launchd nightly env file",
+                    status=CheckStatus.PASS,
+                    message=skip_message,
+                    details=details,
+                )
         return DoctorCheck(
             id="launchd_nightly_env_file",
             name="launchd nightly env file",
-            status=CheckStatus.PASS,
+            status=CheckStatus.WARN,
             message=(
-                f"{installed_path} is not installed; skipping "
-                "EnvironmentVariables.ENGRAM_ENV_FILE validation."
+                f"{installed_path} is missing; "
+                f"reinstall it with `{_INSTALL_NIGHTLY_COMMAND}`."
             ),
             details=details,
         )

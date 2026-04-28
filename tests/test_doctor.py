@@ -722,10 +722,25 @@ def test_check_launchd_nightly_job_not_installed_warns_when_optional() -> None:
 def test_check_launchd_nightly_env_file_passes_when_nightly_plist_is_not_installed(
     tmp_path: Path,
 ) -> None:
-    check = check_launchd_nightly_env_file(home=tmp_path)
+    check = check_launchd_nightly_env_file(
+        home=tmp_path,
+        launchctl_list=lambda: "PID\tStatus\tLabel\n123\t0\tcom.engram.bridge\n",
+    )
 
     assert check.status == CheckStatus.PASS
     assert "skipping" in check.message
+
+
+def test_check_launchd_nightly_env_file_warns_when_job_loaded_but_plist_missing(
+    tmp_path: Path,
+) -> None:
+    check = check_launchd_nightly_env_file(
+        home=tmp_path,
+        launchctl_list=lambda: "PID\tStatus\tLabel\n456\t0\tcom.engram.v3.nightly\n",
+    )
+
+    assert check.status == CheckStatus.WARN
+    assert "is missing" in check.message
 
 
 def test_check_launchd_nightly_env_file_warns_when_missing(tmp_path: Path) -> None:
