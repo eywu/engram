@@ -67,6 +67,8 @@ class PendingQuestion:
     prompt_body_markdown: str | None = None
     deny_button_label: str = "Deny"
     resolution_choice: str | None = None
+    resolution_status_message: str | None = None
+    applied_successfully: bool | None = None
 
 
 class HITLRegistry:

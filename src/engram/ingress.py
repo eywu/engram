@@ -1668,18 +1668,34 @@ async def handle_mcp_command(
                 approval_plan,
                 audit_source="channel_mcp_allow",
             )
+            await router.invalidate(source_channel_id)
+            router.replace_cached_manifest(updated)
             if q.resolution_choice == "1":
                 trusted_publishers = [
                     (decision.registry, decision.publisher or "")
                     for decision in decisions
                     if decision.publisher
                 ]
-                add_trusted_publishers(
-                    trusted_publishers,
-                    home=router.home,
-                )
-            await router.invalidate(source_channel_id)
-            router.replace_cached_manifest(updated)
+                try:
+                    add_trusted_publishers(
+                        trusted_publishers,
+                        home=router.home,
+                    )
+                except Exception as exc:
+                    publishers = ", ".join(
+                        publisher for _registry, publisher in trusted_publishers
+                    )
+                    q.resolution_status_message = (
+                        "✅ MCP added; ⚠️ failed to add publisher to trust list - "
+                        f"re-run with `/engram trust add {publishers}`"
+                    )
+                    log.warning(
+                        "mcp.publisher_trust_add_failed_after_manifest_persist "
+                        "permission_request_id=%s publishers=%r: %s",
+                        q.permission_request_id,
+                        trusted_publishers,
+                        exc,
+                    )
 
         q.on_resolve = _apply_approved_manifest
         router.hitl.register(q)
@@ -3672,6 +3688,8 @@ async def _resolve_block_action(
             if q.on_resolve is not None:
                 try:
                     await q.on_resolve(result)
+                    if q.resolution_status_message is not None:
+                        answer_text = q.resolution_status_message
                 except Exception as exc:
                     applied_successfully = False
                     log.exception(
@@ -3680,6 +3698,7 @@ async def _resolve_block_action(
                         choice_key,
                     )
                     answer_text = f"Approval failed to apply: {exc}"
+            q.applied_successfully = applied_successfully
         await update_question_resolved(
             q,
             answer_text,

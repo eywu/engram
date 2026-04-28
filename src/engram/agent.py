@@ -245,10 +245,26 @@ class Agent:
                         for decision in decisions
                         if decision.publisher
                     ]
-                    add_trusted_publishers(
-                        trusted_publishers,
-                        home=self._router.home,
-                    )
+                    try:
+                        add_trusted_publishers(
+                            trusted_publishers,
+                            home=self._router.home,
+                        )
+                    except Exception as exc:
+                        publishers = ", ".join(
+                            publisher for _registry, publisher in trusted_publishers
+                        )
+                        q.resolution_status_message = (
+                            "✅ MCP added; ⚠️ failed to add publisher to trust list - "
+                            f"re-run with `/engram trust add {publishers}`"
+                        )
+                        log.warning(
+                            "mcp.publisher_trust_add_failed_after_manifest_persist "
+                            "permission_request_id=%s publishers=%r: %s",
+                            q.permission_request_id,
+                            trusted_publishers,
+                            exc,
+                        )
 
             q.on_resolve = _apply_approved_manifest
             self._router.hitl.register(q)
