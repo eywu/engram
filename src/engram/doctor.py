@@ -22,6 +22,7 @@ from rich.table import Table
 
 from engram.config import EngramConfig
 from engram.launchd import (
+    PlistIssue,
     bridge_template_commit,
     doctor_bridge_plist_issues,
     find_repo_root,
@@ -49,6 +50,8 @@ SLACK_SLASH_COMMAND_MISSING_PATTERNS = (
 )
 SLACK_SLASH_COMMAND_LOG_WINDOW = datetime.timedelta(hours=24)
 MCP_EXCLUSION_LOG_WINDOW = datetime.timedelta(hours=24)
+_ENV_FILE_PLACEHOLDER_SEGMENT = "/REPLACE/WITH/"
+_INSTALL_NIGHTLY_COMMAND = "./scripts/install_launchd.sh --install-nightly"
 
 
 class CheckStatus(StrEnum):
@@ -1045,6 +1048,9 @@ def check_launchd_bridge_plist_drift(
         )
 
     issues = doctor_bridge_plist_issues(installed)
+    env_file_issue = _launchd_env_file_issue(installed)
+    if env_file_issue is not None:
+        issues.append(env_file_issue)
     if not issues:
         commit = (commit_resolver or bridge_template_commit)(root)
         if commit:
@@ -1098,13 +1104,53 @@ def check_launchd_nightly_env_file(*, home: Path | None = None) -> DoctorCheck:
 
     environment = installed.get("EnvironmentVariables")
     env_file = environment.get("ENGRAM_ENV_FILE") if isinstance(environment, dict) else None
-    if isinstance(env_file, str) and env_file.strip():
+    env_file_error, env_details = _validate_launchd_env_file(env_file)
+    if env_file_error is None:
         return DoctorCheck(
             id="launchd_nightly_env_file",
             name="launchd nightly env file",
             status=CheckStatus.PASS,
             message=f"{installed_path} includes EnvironmentVariables.ENGRAM_ENV_FILE.",
-            details=details | {"env_file": env_file},
+            details=details | env_details,
+        )
+
+    if env_file_error == "placeholder":
+        return DoctorCheck(
+            id="launchd_nightly_env_file",
+            name="launchd nightly env file",
+            status=CheckStatus.WARN,
+            message=(
+                f"{installed_path} still contains a template placeholder in "
+                "EnvironmentVariables.ENGRAM_ENV_FILE; reinstall it with "
+                f"`{_INSTALL_NIGHTLY_COMMAND}`."
+            ),
+            details=details | env_details,
+        )
+
+    if env_file_error == "missing_file":
+        return DoctorCheck(
+            id="launchd_nightly_env_file",
+            name="launchd nightly env file",
+            status=CheckStatus.WARN,
+            message=(
+                f"{installed_path} points EnvironmentVariables.ENGRAM_ENV_FILE to "
+                f"{env_details['resolved_env_file']}, but that file does not exist; "
+                f"reinstall it with `{_INSTALL_NIGHTLY_COMMAND}`."
+            ),
+            details=details | env_details,
+        )
+
+    if env_file_error == "unreadable_file":
+        return DoctorCheck(
+            id="launchd_nightly_env_file",
+            name="launchd nightly env file",
+            status=CheckStatus.WARN,
+            message=(
+                f"{installed_path} points EnvironmentVariables.ENGRAM_ENV_FILE to "
+                f"{env_details['resolved_env_file']}, but it is not readable; "
+                f"reinstall it with `{_INSTALL_NIGHTLY_COMMAND}`."
+            ),
+            details=details | env_details,
         )
 
     return DoctorCheck(
@@ -1113,7 +1159,7 @@ def check_launchd_nightly_env_file(*, home: Path | None = None) -> DoctorCheck:
         status=CheckStatus.WARN,
         message=(
             f"{installed_path} is missing EnvironmentVariables.ENGRAM_ENV_FILE; "
-            "reinstall it with `./scripts/install_launchd.sh --install-nightly`."
+            f"reinstall it with `{_INSTALL_NIGHTLY_COMMAND}`."
         ),
         details=details,
     )
@@ -1300,6 +1346,45 @@ def _launchd_bridge_plist_drift_message(
         "restart bridge with corrected plist to apply."
         f"{suffix}"
     )
+
+
+def _launchd_env_file_issue(installed: dict[str, Any]) -> PlistIssue | None:
+    environment = installed.get("EnvironmentVariables")
+    env_file = environment.get("ENGRAM_ENV_FILE") if isinstance(environment, dict) else None
+    error, _details = _validate_launchd_env_file(env_file)
+    if error in {None, "missing"}:
+        return None
+    return PlistIssue(
+        category="env_vars",
+        path="EnvironmentVariables.ENGRAM_ENV_FILE",
+        expected="<readable resolved path>",
+        actual=env_file,
+    )
+
+
+def _validate_launchd_env_file(env_file: Any) -> tuple[str | None, dict[str, str]]:
+    if not isinstance(env_file, str):
+        return "missing", {}
+
+    value = env_file.strip()
+    if not value:
+        return "missing", {}
+
+    details = {"env_file": value}
+    if _ENV_FILE_PLACEHOLDER_SEGMENT in value:
+        return "placeholder", details
+
+    resolved = Path(value).expanduser().resolve()
+    details["resolved_env_file"] = str(resolved)
+    if not resolved.exists():
+        return "missing_file", details
+
+    try:
+        with resolved.open("rb"):
+            pass
+    except OSError:
+        return "unreadable_file", details
+    return None, details
 
 
 def _mcp_server_command(server_config: dict[str, Any] | None) -> str | None:
