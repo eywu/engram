@@ -1159,6 +1159,35 @@ def check_launchd_nightly_env_file(*, home: Path | None = None) -> DoctorCheck:
             details=details | env_details,
         )
 
+    if env_file_error == "not_absolute":
+        return DoctorCheck(
+            id="launchd_nightly_env_file",
+            name="launchd nightly env file",
+            status=CheckStatus.WARN,
+            message=(
+                f"{installed_path} sets EnvironmentVariables.ENGRAM_ENV_FILE to "
+                f"{env_details['env_file']!r}, which is not an absolute path. "
+                "launchd does not expand `~` or relative paths in EnvironmentVariables; "
+                f"reinstall it with `{_INSTALL_NIGHTLY_COMMAND}` to write an absolute path."
+            ),
+            details=details | env_details,
+        )
+
+    if env_file_error == "resolution_failed":
+        return DoctorCheck(
+            id="launchd_nightly_env_file",
+            name="launchd nightly env file",
+            status=CheckStatus.WARN,
+            message=(
+                f"{installed_path} points EnvironmentVariables.ENGRAM_ENV_FILE to "
+                f"{env_details['env_file']!r}, but resolving it failed "
+                f"({env_details.get('error_class', 'OSError')}). "
+                "This usually indicates a symlink loop or filesystem error; "
+                f"reinstall it with `{_INSTALL_NIGHTLY_COMMAND}`."
+            ),
+            details=details | env_details,
+        )
+
     return DoctorCheck(
         id="launchd_nightly_env_file",
         name="launchd nightly env file",
@@ -1355,6 +1384,24 @@ def _launchd_bridge_plist_drift_message(
             f"{install_hint}{suffix}"
         )
 
+    raw_env_file = (env_details or {}).get("env_file")
+    if env_file_error == "not_absolute" and raw_env_file is not None:
+        return (
+            "installed plist sets EnvironmentVariables.ENGRAM_ENV_FILE to "
+            f"{raw_env_file!r}, which is not an absolute path. launchd does "
+            "not expand `~` or relative paths in EnvironmentVariables."
+            f"{install_hint}{suffix}"
+        )
+
+    if env_file_error == "resolution_failed" and raw_env_file is not None:
+        error_class = (env_details or {}).get("error_class", "OSError")
+        return (
+            "installed plist points EnvironmentVariables.ENGRAM_ENV_FILE to "
+            f"{raw_env_file!r}, but resolving it failed ({error_class}). "
+            "This usually indicates a symlink loop or filesystem error."
+            f"{install_hint}{suffix}"
+        )
+
     soft_limit_issue = next(
         (issue for issue in issues if issue.path == "SoftResourceLimits.NumberOfFiles"),
         None,
@@ -1413,7 +1460,23 @@ def _validate_launchd_env_file(env_file: Any) -> tuple[str | None, dict[str, str
     if _ENV_FILE_PLACEHOLDER_SEGMENT in value:
         return "placeholder", details
 
-    resolved = Path(value).expanduser().resolve()
+    # GRO-569 blocker 1: launchd does NOT expand `~` or relative paths in
+    # EnvironmentVariables values. The story title is literally
+    # "validate ENGRAM_ENV_FILE is resolved + exists" — a hand-edited plist
+    # with a relative path or `~/foo` will FAIL launchd at startup, so doctor
+    # must catch it before resolve() silently expands it from cwd/$HOME.
+    if value.startswith("~") or not Path(value).is_absolute():
+        return "not_absolute", details
+
+    # GRO-569 blocker 2: Path.resolve() raises RuntimeError on symlink loops
+    # and OSError on filesystem errors. Without try/except, doctor crashes
+    # with a stack trace and non-zero exit instead of producing a WARN.
+    try:
+        resolved = Path(value).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        details["error_class"] = type(exc).__name__
+        return "resolution_failed", details
+
     details["resolved_env_file"] = str(resolved)
     if not resolved.exists():
         return "missing_file", details
