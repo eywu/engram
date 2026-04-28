@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from engram.mcp import (
     detect_new_user_mcp_servers,
     legacy_claude_mcp_config_path,
     load_claude_mcp_servers,
+    migrate_legacy_claude_mcp_config,
     resolve_team_mcp_servers,
     write_mcp_inventory_state,
 )
@@ -40,7 +42,7 @@ def test_load_claude_mcp_servers_reads_claude_code_inventory(
     assert load_claude_mcp_servers() == expected
 
 
-def test_load_claude_mcp_servers_migrates_legacy_inventory_with_backups(
+def test_migrate_legacy_claude_mcp_config_merges_inventory_with_backups(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -63,8 +65,13 @@ def test_load_claude_mcp_servers_migrates_legacy_inventory_with_backups(
     _write_json(target_path, target_payload)
     _write_json(legacy_path, legacy_payload)
 
+    assert load_claude_mcp_servers() == {"linear": {"command": "linear-new"}}
+    assert legacy_path.exists()
+
     with caplog.at_level("WARNING", logger="engram.mcp"):
-        servers = load_claude_mcp_servers()
+        migrate_legacy_claude_mcp_config()
+
+    servers = load_claude_mcp_servers()
 
     assert servers == {
         "linear": {"command": "linear-new"},
@@ -85,6 +92,54 @@ def test_load_claude_mcp_servers_migrates_legacy_inventory_with_backups(
         record.getMessage().startswith("mcp.legacy_config_migrated")
         for record in caplog.records
     )
+
+
+def test_migration_concurrent_invocations_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    target_path = claude_mcp_config_path()
+    legacy_path = legacy_claude_mcp_config_path()
+    target_payload = {
+        "theme": "dark",
+        "mcpServers": {
+            "linear": {"command": "linear-new"},
+        },
+    }
+    legacy_payload = {
+        "mcpServers": {
+            "github": {"command": "github-mcp"},
+        },
+    }
+    _write_json(target_path, target_payload)
+    _write_json(legacy_path, legacy_payload)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(migrate_legacy_claude_mcp_config)
+            for _ in range(2)
+        ]
+        for future in futures:
+            future.result()
+
+    assert load_claude_mcp_servers() == {
+        "linear": {"command": "linear-new"},
+        "github": {"command": "github-mcp"},
+    }
+    assert not legacy_path.exists()
+    assert sorted(path.name for path in target_path.parent.glob(".claude.json.bak*")) == [
+        ".claude.json.bak"
+    ]
+    assert sorted(path.name for path in legacy_path.parent.glob("mcp.json.bak*")) == [
+        "mcp.json.bak"
+    ]
+    assert json.loads(
+        target_path.with_name(f"{target_path.name}.bak").read_text(encoding="utf-8")
+    ) == target_payload
+    assert json.loads(
+        legacy_path.with_name(f"{legacy_path.name}.bak").read_text(encoding="utf-8")
+    ) == legacy_payload
 
 
 def test_resolve_team_mcp_servers_filters_claude_code_inventory_by_allow_list(

@@ -28,6 +28,7 @@ from engram.egress import post_question, update_question_timeout
 from engram.embeddings import EmbeddingQueue, GeminiEmbedder
 from engram.hitl import PendingQuestion
 from engram.ingress import register_listeners
+from engram.mcp import migrate_legacy_claude_mcp_config
 from engram.mcp_onboarding import maybe_prompt_for_new_mcp_servers
 from engram.router import Router
 from engram.runtime import (
@@ -182,6 +183,8 @@ async def run() -> int:
     template_vars = await _discover_template_vars(
         app, config.owner_dm_channel_id, log
     )
+
+    migrate_legacy_claude_mcp_config()
 
     router = Router(
         shared_cwd=project_root_path,

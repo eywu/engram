@@ -31,7 +31,7 @@ from engram.manifest import (
     set_channel_permission_tier,
     validate_upgrade_duration,
 )
-from engram.mcp import resolve_team_mcp_servers
+from engram.mcp import migrate_legacy_claude_mcp_config, resolve_team_mcp_servers
 from engram.mcp_tools import (
     MEMORY_SEARCH_FULL_TOOL_NAMES,
     MEMORY_SEARCH_SERVER_NAME,
@@ -354,6 +354,7 @@ def doctor(
     """Run pre-flight checks for local dependencies, config, tokens, and launchd."""
     from engram.doctor import render_report, run_doctor
 
+    migrate_legacy_claude_mcp_config()
     report = run_doctor()
     if json_output:
         typer.echo(json.dumps(report.to_json(), sort_keys=True))
@@ -517,6 +518,7 @@ def scope_audit(
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Show manifest scope posture for every provisioned channel."""
+    migrate_legacy_claude_mcp_config()
     rows = _manifest_audit_rows(engram_home())
     if json_output:
         typer.echo(json.dumps(rows, sort_keys=True))
@@ -548,6 +550,7 @@ def setup() -> None:
     """Interactive setup wizard for first-time configuration."""
     from engram.setup_wizard import run_wizard
 
+    migrate_legacy_claude_mcp_config()
     run_wizard()
 
 

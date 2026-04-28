@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import fcntl
 import hashlib
 import json
 import logging
@@ -19,6 +20,7 @@ from engram.mcp_tools import (
 
 log = logging.getLogger(__name__)
 MCP_INVENTORY_STATE_FILE = "mcp_inventory_state.json"
+MCP_MIGRATION_LOCK_FILE = ".migrate-mcp.lock"
 
 
 @dataclass(frozen=True)
@@ -114,8 +116,23 @@ def _next_backup_path(path: Path) -> Path:
         suffix += 1
 
 
-def _migrate_legacy_claude_mcp_config() -> None:
+def _mcp_migration_lock_path() -> Path:
+    return paths.state_dir() / MCP_MIGRATION_LOCK_FILE
+
+
+def migrate_legacy_claude_mcp_config() -> None:
     """One-time merge from deprecated ~/.claude/mcp.json into ~/.claude.json."""
+    lock_path = _mcp_migration_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            _migrate_legacy_claude_mcp_config_locked()
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _migrate_legacy_claude_mcp_config_locked() -> None:
     target_path = claude_mcp_config_path()
     legacy_path = legacy_claude_mcp_config_path()
     if not legacy_path.exists():
@@ -203,10 +220,6 @@ def load_claude_mcp_servers(
     Malformed or absent config is treated as an empty inventory. The caller
     decides whether missing manifest references should warn or fail.
     """
-    default_path = claude_mcp_config_path()
-    if config_path is None or config_path == default_path:
-        _migrate_legacy_claude_mcp_config()
-
     path = config_path or claude_mcp_config_path()
     data = _load_mcp_config_root(path)
     return _extract_mcp_servers(data, path=path)
