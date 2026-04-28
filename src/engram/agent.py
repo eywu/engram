@@ -77,6 +77,7 @@ from engram.mcp_tools import (
 from engram.mcp_trust import (
     add_trusted_publishers,
     render_owner_approval_markdown,
+    render_trust_add_recovery_message,
     resolve_mcp_server_trust,
 )
 from engram.memory_hooks import make_memory_hooks_with_embeddings
@@ -251,12 +252,8 @@ class Agent:
                             home=self._router.home,
                         )
                     except Exception as exc:
-                        publishers = ", ".join(
-                            publisher for _registry, publisher in trusted_publishers
-                        )
                         q.resolution_status_message = (
-                            "✅ MCP added; ⚠️ failed to add publisher to trust list - "
-                            f"re-run with `/engram trust add {publishers}`"
+                            render_trust_add_recovery_message(trusted_publishers)
                         )
                         log.warning(
                             "mcp.publisher_trust_add_failed_after_manifest_persist "

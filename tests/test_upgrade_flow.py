@@ -28,7 +28,7 @@ from engram.manifest import (
     set_channel_mcp_server_access,
 )
 from engram.mcp_trust import MCPTrustDecision, MCPTrustTier
-from engram.paths import channel_manifest_path
+from engram.paths import channel_manifest_path, state_dir
 from engram.router import Router
 
 
@@ -414,6 +414,98 @@ async def test_non_owner_cannot_grant_mcp_access_via_slash_command(
                 "Ask owner to run `/engram mcp allow camoufox`."
             ),
         }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_owner_can_add_trusted_publisher_via_slash_command(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="D07OWNER",
+        source_channel_name=None,
+        user_id="U07OWNER",
+        command_text="trust add camoufox-labs",
+    )
+
+    assert result == {"ok": True, "action": "trust add", "changed": True}
+    overlay = (state_dir(home) / "trusted_publishers.yaml").read_text(encoding="utf-8")
+    assert "npm:" in overlay
+    assert "pypi:" in overlay
+    assert "camoufox-labs" in overlay
+    assert slack.ephemeral_calls == [
+        {
+            "channel": "D07OWNER",
+            "user": "U07OWNER",
+            "text": "Trusted publishers updated: npm:camoufox-labs, pypi:camoufox-labs",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_trust_add_is_idempotent_for_already_trusted_publisher(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+    config = make_config()
+
+    first = await handle_engram_command(
+        router=router,
+        config=config,
+        slack_client=slack,
+        source_channel_id="D07OWNER",
+        source_channel_name=None,
+        user_id="U07OWNER",
+        command_text="trust add pypi:camoufox-labs",
+    )
+    second = await handle_engram_command(
+        router=router,
+        config=config,
+        slack_client=slack,
+        source_channel_id="D07OWNER",
+        source_channel_name=None,
+        user_id="U07OWNER",
+        command_text="trust add pypi:camoufox-labs",
+    )
+
+    assert first == {"ok": True, "action": "trust add", "changed": True}
+    assert second == {"ok": True, "action": "trust add", "changed": False}
+    assert slack.ephemeral_calls[-1]["text"] == (
+        "Publishers already trusted: pypi:camoufox-labs"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_owner_cannot_add_trusted_publisher_via_slash_command(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07OTHER",
+        command_text="trust add pypi:camoufox-labs",
+    )
+
+    assert result == {"ok": False, "error": "not owner"}
+    assert not (state_dir(home) / "trusted_publishers.yaml").exists()
+    assert slack.ephemeral_calls == [
+        {"channel": "C07TEAM", "user": "U07OTHER", "text": "Owner-only."}
     ]
 
 
