@@ -410,6 +410,32 @@ def resolve_team_mcp_servers(
                 },
             )
 
+        # GRO-539: also surface manifest exclusions for the synthesized
+        # engram-memory server. It is not present in the inventory loop
+        # above (Engram synthesizes it on demand via
+        # make_memory_search_server), so without this branch a manifest
+        # that filters it out would be silently dropped from the SDK
+        # subprocess argv with no observability. Skip when engram-memory
+        # is already in `configured` to avoid double-logging
+        # (defense-in-depth against future changes that put engram-memory
+        # into ~/.claude.json).
+        if MEMORY_SEARCH_SERVER_NAME not in configured:
+            memory_reason: str | None = None
+            if MEMORY_SEARCH_SERVER_NAME in disallowed:
+                memory_reason = "in_disallowed"
+            elif MEMORY_SEARCH_SERVER_NAME not in allowed:
+                memory_reason = "not_in_allowed"
+            if memory_reason is not None:
+                log.info(
+                    "mcp.excluded_by_manifest",
+                    extra={
+                        "channel_id": manifest.channel_id,
+                        "mcp_name": MEMORY_SEARCH_SERVER_NAME,
+                        "reason": memory_reason,
+                        "available_in_inventory": True,
+                    },
+                )
+
     effective_names = [name for name in allowed_names if name not in disallowed]
 
     servers: dict[str, dict[str, Any]] = {}

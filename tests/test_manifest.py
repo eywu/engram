@@ -130,7 +130,9 @@ def test_resolve_team_mcp_servers_logs_not_in_allowed(caplog) -> None:
         log_exclusions=True,
     )
 
-    record = _single_log(caplog.records, "mcp.excluded_by_manifest")
+    record = _single_log_for_mcp(
+        caplog.records, "mcp.excluded_by_manifest", "camoufox"
+    )
     assert record.channel_id == "C07TEST123"
     assert record.mcp_name == "camoufox"
     assert record.reason == "not_in_allowed"
@@ -157,11 +159,104 @@ def test_resolve_team_mcp_servers_logs_in_disallowed(caplog) -> None:
         log_exclusions=True,
     )
 
-    record = _single_log(caplog.records, "mcp.excluded_by_manifest")
+    record = _single_log_for_mcp(
+        caplog.records, "mcp.excluded_by_manifest", "camoufox"
+    )
     assert record.channel_id == "C07TEST123"
     assert record.mcp_name == "camoufox"
     assert record.reason == "in_disallowed"
     assert record.available_in_inventory is True
+
+
+def test_resolve_team_mcp_servers_logs_engram_memory_not_in_allowed(caplog) -> None:
+    """GRO-539: synthesized engram-memory server fires exclusion event when omitted from allow-list."""
+    caplog.set_level(logging.INFO, logger="engram.mcp")
+    manifest = ChannelManifest(
+        channel_id="C07TEAMNOMEM",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        mcp_servers=ScopeList(allowed=["linear"]),
+    )
+
+    resolve_team_mcp_servers(
+        manifest,
+        configured_servers={
+            "linear": {"type": "http", "url": "https://linear.example/mcp"},
+        },
+        log_exclusions=True,
+    )
+
+    matches = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "mcp.excluded_by_manifest"
+        and getattr(r, "mcp_name", None) == "engram-memory"
+    ]
+    assert len(matches) == 1
+    record = matches[0]
+    assert record.channel_id == "C07TEAMNOMEM"
+    assert record.reason == "not_in_allowed"
+    assert record.available_in_inventory is True
+
+
+def test_resolve_team_mcp_servers_logs_engram_memory_in_disallowed(caplog) -> None:
+    """GRO-539: synthesized engram-memory server fires exclusion event when explicitly disallowed."""
+    caplog.set_level(logging.INFO, logger="engram.mcp")
+    manifest = ChannelManifest(
+        channel_id="C07TEAMDIS",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        mcp_servers=ScopeList(
+            allowed=["linear", "engram-memory"],
+            disallowed=["engram-memory"],
+        ),
+    )
+
+    resolve_team_mcp_servers(
+        manifest,
+        configured_servers={
+            "linear": {"type": "http", "url": "https://linear.example/mcp"},
+        },
+        log_exclusions=True,
+    )
+
+    matches = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "mcp.excluded_by_manifest"
+        and getattr(r, "mcp_name", None) == "engram-memory"
+    ]
+    assert len(matches) == 1
+    record = matches[0]
+    assert record.channel_id == "C07TEAMDIS"
+    assert record.reason == "in_disallowed"
+    assert record.available_in_inventory is True
+
+
+def test_resolve_team_mcp_servers_engram_memory_in_allow_list_no_exclusion_log(caplog) -> None:
+    """GRO-539: when engram-memory is in allow-list and not disallowed, no exclusion event for it."""
+    caplog.set_level(logging.INFO, logger="engram.mcp")
+    manifest = ChannelManifest(
+        channel_id="C07TEAMOK",
+        identity=IdentityTemplate.TASK_ASSISTANT,
+        mcp_servers=ScopeList(allowed=["engram-memory"]),
+    )
+
+    resolve_team_mcp_servers(
+        manifest,
+        configured_servers={
+            "linear": {"type": "http", "url": "https://linear.example/mcp"},
+        },
+        log_exclusions=True,
+    )
+
+    memory_matches = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "mcp.excluded_by_manifest"
+        and getattr(r, "mcp_name", None) == "engram-memory"
+    ]
+    assert memory_matches == [], (
+        "engram-memory is in allow-list — should not log exclusion"
+    )
 
 
 # ── Validation ──────────────────────────────────────────────────────────
@@ -315,6 +410,25 @@ def test_manifest_loads_hitl_section(tmp_path: Path):
 def _single_log(records, event: str):
     matches = [record for record in records if record.getMessage() == event]
     assert len(matches) == 1
+    return matches[0]
+
+
+def _single_log_for_mcp(records, event: str, mcp_name: str):
+    """Return the unique log record matching event AND mcp_name.
+
+    Needed because resolve_team_mcp_servers may now log multiple
+    `mcp.excluded_by_manifest` events per call (one per excluded server,
+    including the synthesized engram-memory — see GRO-539).
+    """
+    matches = [
+        record
+        for record in records
+        if record.getMessage() == event
+        and getattr(record, "mcp_name", None) == mcp_name
+    ]
+    assert len(matches) == 1, (
+        f"expected 1 {event} record for mcp_name={mcp_name!r}, got {len(matches)}"
+    )
     return matches[0]
 
 

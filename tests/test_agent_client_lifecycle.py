@@ -411,12 +411,29 @@ async def test_manifest_mcp_exclusion_logs_once_per_client_spawn(
         record
         for record in caplog.records
         if record.getMessage() == "mcp.excluded_by_manifest"
+        and getattr(record, "mcp_name", None) == "camoufox"
     ]
     assert len(clients) == 1
-    assert len(records) == 1
+    assert len(records) == 1, (
+        "camoufox exclusion should log exactly once per client spawn, "
+        "not per turn"
+    )
     assert records[0].channel_id == "C07TEST123"
     assert records[0].mcp_name == "camoufox"
     assert records[0].reason == "not_in_allowed"
+
+    # GRO-539: synthesized engram-memory exclusion is also logged when not in
+    # the allow-list. Assert the same once-per-spawn invariant.
+    memory_records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "mcp.excluded_by_manifest"
+        and getattr(record, "mcp_name", None) == "engram-memory"
+    ]
+    assert len(memory_records) == 1, (
+        "engram-memory exclusion should log exactly once per client spawn"
+    )
+    assert memory_records[0].reason == "not_in_allowed"
 
 
 @pytest.mark.asyncio
