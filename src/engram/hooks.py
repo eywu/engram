@@ -1,13 +1,20 @@
 """Claude Agent SDK hooks used for Engram audit logging."""
+
 from __future__ import annotations
 
 import datetime
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import structlog
-from claude_agent_sdk import HookInput, HookJSONOutput, HookMatcher
+from claude_agent_sdk import (
+    HookContext,
+    HookInput,
+    HookJSONOutput,
+    HookMatcher,
+    SubagentStopHookInput,
+)
 
 from engram.costs import CostDatabase
 
@@ -23,7 +30,7 @@ def build_hooks(
     async def pre_tool_use(
         hook_input: HookInput,
         tool_use_id: str | None,
-        _context: dict[str, Any],
+        _context: HookContext,
     ) -> HookJSONOutput:
         log.info(
             "hook.pre_tool_use",
@@ -37,7 +44,7 @@ def build_hooks(
     async def post_tool_use_failure(
         hook_input: HookInput,
         tool_use_id: str | None,
-        _context: dict[str, Any],
+        _context: HookContext,
     ) -> HookJSONOutput:
         log.error(
             "hook.post_tool_use_failure",
@@ -52,7 +59,7 @@ def build_hooks(
     async def notification(
         hook_input: HookInput,
         _tool_use_id: str | None,
-        _context: dict[str, Any],
+        _context: HookContext,
     ) -> HookJSONOutput:
         log.info(
             "hook.notification",
@@ -64,9 +71,9 @@ def build_hooks(
         return {"continue_": True, "suppressOutput": True}
 
     async def subagent_stop(
-        hook_input: HookInput,
+        hook_input: SubagentStopHookInput,
         _tool_use_id: str | None,
-        _context: dict[str, Any],
+        _context: HookContext,
     ) -> HookJSONOutput:
         transcript_path = hook_input.get("agent_transcript_path")
         cost_usd = _extract_transcript_cost(transcript_path)
@@ -89,13 +96,18 @@ def build_hooks(
             )
         return {"continue_": True, "suppressOutput": True}
 
+    async def subagent_stop_adapter(
+        hook_input: HookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> HookJSONOutput:
+        return await subagent_stop(cast(SubagentStopHookInput, hook_input), tool_use_id, context)
+
     return {
         "PreToolUse": [HookMatcher(matcher=None, hooks=[pre_tool_use])],
-        "PostToolUseFailure": [
-            HookMatcher(matcher=None, hooks=[post_tool_use_failure])
-        ],
+        "PostToolUseFailure": [HookMatcher(matcher=None, hooks=[post_tool_use_failure])],
         "Notification": [HookMatcher(matcher=None, hooks=[notification])],
-        "SubagentStop": [HookMatcher(matcher=None, hooks=[subagent_stop])],
+        "SubagentStop": [HookMatcher(matcher=None, hooks=[subagent_stop_adapter])],
     }
 
 

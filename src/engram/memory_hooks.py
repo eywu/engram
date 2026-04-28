@@ -6,7 +6,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk import HookInput, HookJSONOutput, HookMatcher, get_session_messages
+from claude_agent_sdk import (
+    HookContext,
+    HookInput,
+    HookJSONOutput,
+    HookMatcher,
+    get_session_messages,
+)
 
 from engram.embeddings import EmbeddingQueue
 from engram.memory import (
@@ -45,7 +51,7 @@ def make_memory_hooks_with_embeddings(
     async def stop_hook(
         hook_input: HookInput,
         _tool_use_id: str | None,
-        _context: dict[str, Any],
+        _context: HookContext,
     ) -> HookJSONOutput:
         try:
             await _handle_stop_hook(router, hook_input, embedding_queue=embedding_queue)
@@ -60,7 +66,7 @@ def make_memory_hooks_with_embeddings(
     async def precompact_hook(
         hook_input: HookInput,
         _tool_use_id: str | None,
-        _context: dict[str, Any],
+        _context: HookContext,
     ) -> HookJSONOutput:
         try:
             _handle_precompact_hook(hook_input)

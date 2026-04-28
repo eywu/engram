@@ -16,7 +16,7 @@ from importlib.resources import files
 from importlib.resources.abc import Traversable
 from pathlib import Path
 from string import Template
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import yaml
 from claude_agent_sdk import (
@@ -24,6 +24,12 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ResultMessage,
+)
+from claude_agent_sdk.types import (
+    McpHttpServerConfig,
+    McpSdkServerConfig,
+    McpSSEServerConfig,
+    McpStdioServerConfig,
 )
 from dotenv import load_dotenv
 from pydantic import ValidationError
@@ -366,7 +372,16 @@ def build_nightly_options(
             "WebSearch",
         ],
         skills=[],
-        mcp_servers=mcp_servers,
+        mcp_servers=cast(
+            dict[
+                str,
+                McpSdkServerConfig
+                | McpStdioServerConfig
+                | McpSSEServerConfig
+                | McpHttpServerConfig,
+            ],
+            mcp_servers,
+        ),
         extra_args={"strict-mcp-config": None},
         max_budget_usd=MAX_TURN_BUDGET_USD,
         env=child_env,
