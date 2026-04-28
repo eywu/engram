@@ -102,11 +102,22 @@ def test_list_after_provisioning(cli, tmp_path: Path):
     assert "excluded" in result.output
 
 
-def test_list_json_has_versioned_stable_schema(cli, tmp_path: Path):
+def test_list_json_has_versioned_stable_schema(
+    cli, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     from engram.bootstrap import provision_channel as pc
 
     home = tmp_path / ".engram"
-    fixed_now = datetime.now(UTC).replace(microsecond=0)
+    fixed_now = datetime(2026, 4, 24, 18, 0, tzinfo=UTC)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return fixed_now.replace(tzinfo=None)
+            return fixed_now.astimezone(tz)
+
+    monkeypatch.setattr("engram.manifest.datetime", FrozenDateTime)
     pc(
         "D07OWNER",
         identity=IdentityTemplate.OWNER_DM_FULL,
