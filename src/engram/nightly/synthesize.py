@@ -810,8 +810,11 @@ def _log_parse_fail_final(
     prompt_template: str,
 ) -> None:
     result = turn.result if turn is not None else None
-    prompt_tokens, _ = _prompt_tokens_and_model(result)
-    if prompt_tokens == 0 and first_turn is not None and first_turn is not turn:
+    if result is None:
+        prompt_tokens = 0
+    else:
+        prompt_tokens, _ = _prompt_tokens_and_model(result)
+    if result is None and first_turn is not None and first_turn is not turn:
         prompt_tokens, _ = _prompt_tokens_and_model(first_turn.result)
     message_count = getattr(result, "message_count", None) if result is not None else None
     if message_count is None and turn is not None:

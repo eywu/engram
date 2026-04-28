@@ -29,6 +29,7 @@ from engram.nightly.synthesize import (
     AnthropicRuntime,
     PlannedChannel,
     SynthesisOutputError,
+    _run_claude_turn,
     build_nightly_options,
     parse_synthesis_output,
     synthesize,
@@ -195,6 +196,45 @@ class _RetryWithoutResultMessageClient:
         yield AssistantMessage(content=[_TextBlock(self.retry_response)], model="")
 
 
+class _RetryZeroPromptTokensClient:
+    def __init__(self, options: ClaudeAgentOptions, retry_response: str):
+        self.options = options
+        self.retry_response = retry_response
+        self.connected = False
+        self.disconnected = False
+        self.receive_count = 0
+
+    async def connect(self) -> None:
+        self.connected = True
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
+
+    async def query(self, prompt: str, session_id: str = "default") -> None:
+        del prompt, session_id
+
+    async def receive_messages(self):
+        if self.receive_count == 0:
+            self.receive_count += 1
+            yield AssistantMessage(content=[_TextBlock("not json")], model="claude-haiku-4-5")
+            yield _result(
+                input_tokens=200,
+                model_usage={"claude-haiku-4-5": {"input_tokens": 200}},
+            )
+            return
+
+        self.receive_count += 1
+        yield AssistantMessage(
+            content=[_TextBlock(self.retry_response)],
+            model="claude-haiku-4-5",
+        )
+        yield _result(
+            stop_reason="max_turns_exhausted",
+            input_tokens=0,
+            model_usage={"claude-haiku-4-5": {"input_tokens": 0}},
+        )
+
+
 class _ClientFactory:
     def __init__(
         self,
@@ -219,6 +259,7 @@ def _result(
     cache_read: int = 0,
     input_tokens: int = 100,
     model_usage: dict[str, Any] | None = None,
+    structured_output: Any = None,
     stop_reason: str | None = "end_turn",
     message_count: int | None = None,
 ) -> ResultMessage:
@@ -237,6 +278,7 @@ def _result(
             "cache_creation_input_tokens": 0 if cache_read else 7,
             "cache_read_input_tokens": cache_read,
         },
+        structured_output=structured_output,
         model_usage=(
             {"claude-test-model": {"input_tokens": input_tokens}}
             if model_usage is None
@@ -506,6 +548,20 @@ async def test_receive_messages_continues_past_tool_use_until_final_json(
 
 
 @pytest.mark.asyncio
+async def test_run_claude_turn_recovers_structured_output_when_assistant_text_is_empty() -> None:
+    structured_output = json.loads(_synthesis_json("C07STRUCTURED"))
+    client = _FakeClient(
+        ClaudeAgentOptions(model="sonnet"),
+        [("", _result(structured_output=structured_output))],
+    )
+
+    turn = await _run_claude_turn(client, "prompt", session_id="session-test")
+
+    assert turn.raw_output == json.dumps(structured_output)
+    assert parse_synthesis_output(turn.raw_output)["channel_id"] == "C07STRUCTURED"
+
+
+@pytest.mark.asyncio
 async def test_retry_failure_logs_both_raw_outputs_and_aborts(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -580,6 +636,35 @@ async def test_retry_failure_logs_assistant_model_and_observed_message_count_whe
     assert record.prompt_tokens == 0
     assert record.model_actual == "claude-sonnet-4-6"
     assert record.model_configured == "configured-model"
+
+
+@pytest.mark.asyncio
+async def test_retry_failure_does_not_attribute_first_attempt_tokens_when_retry_reports_zero(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="engram.nightly.synthesize")
+    harvest = _write_harvest(tmp_path, [_channel("C07ZEROTOKENS")])
+    second_raw = json.dumps({"schema_version": 1, "date": "2026-04-22"})
+
+    def factory(options: ClaudeAgentOptions) -> _RetryZeroPromptTokensClient:
+        return _RetryZeroPromptTokensClient(options, second_raw)
+
+    with pytest.raises(SynthesisOutputError):
+        await synthesize(
+            harvest,
+            output_root=tmp_path / "nightly",
+            config=NightlyConfig(),
+            contexts_dir=tmp_path / "contexts",
+            anthropic_runtime=AnthropicRuntime(api_key=None, model="configured-model"),
+            budget=_FakeBudget(),
+            client_factory=factory,
+        )
+
+    record = _single_log(caplog.records, "nightly.parse_fail_final")
+    assert record.channel_id == "C07ZEROTOKENS"
+    assert record.stop_reason == "max_turns_exhausted"
+    assert record.prompt_tokens == 0
 
 
 @pytest.mark.asyncio
