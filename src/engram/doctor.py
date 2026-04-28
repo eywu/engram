@@ -1126,10 +1126,10 @@ def check_launchd_nightly_env_file(*, home: Path | None = None) -> DoctorCheck:
         return DoctorCheck(
             id="launchd_nightly_env_file",
             name="launchd nightly env file",
-            status=CheckStatus.WARN,
+            status=CheckStatus.PASS,
             message=(
-                f"{installed_path} is missing; run `./scripts/install_launchd.sh --install-nightly` "
-                "to install the current nightly plist."
+                f"{installed_path} is not installed; skipping "
+                "EnvironmentVariables.ENGRAM_ENV_FILE validation."
             ),
             details=details,
         )

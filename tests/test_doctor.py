@@ -719,6 +719,15 @@ def test_check_launchd_nightly_job_not_installed_warns_when_optional() -> None:
     assert "./scripts/install_launchd.sh --install-nightly" in check.message
 
 
+def test_check_launchd_nightly_env_file_passes_when_nightly_plist_is_not_installed(
+    tmp_path: Path,
+) -> None:
+    check = check_launchd_nightly_env_file(home=tmp_path)
+
+    assert check.status == CheckStatus.PASS
+    assert "skipping" in check.message
+
+
 def test_check_launchd_nightly_env_file_warns_when_missing(tmp_path: Path) -> None:
     _write_nightly_plist(tmp_path)
 
@@ -1283,8 +1292,129 @@ def test_doctor_cli_json_warns_when_nightly_launchd_job_is_missing(
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["summary"]["failed"] == 0
-    assert payload["summary"]["warnings"] == 2
+    assert payload["summary"]["warnings"] == 1
     checks_by_id = {check["id"]: check for check in payload["checks"]}
     assert checks_by_id["launchd_bridge"]["status"] == "pass"
     assert checks_by_id["launchd_nightly"]["status"] == "warn"
+    assert checks_by_id["launchd_nightly_env_file"]["status"] == "pass"
+
+
+def test_doctor_cli_json_warns_when_nightly_env_file_is_missing(
+    tmp_path: Path,
+    clean_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-test")
+    home = tmp_path / ".engram"
+    logs = home / "logs"
+    logs.mkdir(parents=True)
+    config_path = home / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "slack": {
+                    "bot_token": "xoxb-test",
+                    "app_token": "xapp-test",
+                    "team_id": "T123",
+                },
+                "owner_dm_channel_id": "D07OWNER",
+                "owner_user_id": "U07OWNER",
+                "anthropic": {
+                    "api_key": "sk-ant-test",
+                    "model": "claude-test-model",
+                },
+                "paths": {
+                    "state_dir": str(home / "state"),
+                    "contexts_dir": str(home / "contexts"),
+                    "log_dir": str(logs),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+
+    monkeypatch.setattr(
+        "engram.doctor.shutil.which",
+        lambda name: f"/tmp/{name}" if name in {"uv", "claude"} else None,
+    )
+    monkeypatch.setattr("engram.doctor._run_version", lambda path: f"{Path(path).name} 1.0.0")
+    monkeypatch.setattr(
+        "engram.doctor._launchctl_list",
+        lambda: (
+            "PID\tStatus\tLabel\n"
+            "123\t0\tcom.engram.bridge\n"
+            "456\t0\tcom.engram.v3.nightly\n"
+        ),
+    )
+    monkeypatch.setattr(
+        "engram.doctor.shutil.disk_usage",
+        lambda _path: (2_000_000_000, 0, 1_500_000_000),
+    )
+    monkeypatch.setattr(
+        "engram.doctor.fd_usage_snapshot",
+        lambda: {"in_use": 42, "soft_limit": 256, "hard_limit": 1024},
+    )
+    monkeypatch.setattr("engram.doctor.read_latest_fd_snapshot", lambda _path: None)
+    _write_bridge_log(
+        logs,
+        log_date=datetime.datetime.now(datetime.UTC).date(),
+        rows=[
+            {
+                "timestamp": datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
+                "event": "ingress.slash_command_received",
+                "slash_command": "/engram",
+            },
+            {
+                "timestamp": datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
+                "event": "ingress.slash_command_received",
+                "slash_command": "/exclude-from-nightly",
+            },
+            {
+                "timestamp": datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
+                "event": "ingress.slash_command_received",
+                "slash_command": "/include-in-nightly",
+            },
+        ],
+    )
+
+    def post_json(url: str, **_kwargs) -> HttpResult:
+        if "slack.com" in url:
+            return HttpResult(200, {"ok": True, "team_id": "T123"})
+        return HttpResult(200, {"ok": True})
+
+    def get_json(url: str, **_kwargs) -> HttpResult:
+        if url == "https://api.anthropic.com/v1/models":
+            return HttpResult(200, {"data": [{"id": "claude-test-model"}]})
+        raise AssertionError(f"unexpected GET url: {url}")
+
+    monkeypatch.setattr("engram.doctor._post_json", post_json)
+    monkeypatch.setattr("engram.doctor._get_json", get_json)
+
+    env_file = write_bridge_env_file(
+        anthropic_key="sk-ant-test",
+        gemini_key="gemini-test",
+        home=tmp_path,
+    )
+    installed_plist = tmp_path / "Library" / "LaunchAgents" / "com.engram.bridge.plist"
+    installed_plist.parent.mkdir(parents=True, exist_ok=True)
+    payload = render_bridge_plist(
+        repo_root=Path.cwd(),
+        uv_bin=Path("/tmp/uv"),
+        env_file=env_file,
+        home=tmp_path,
+    )
+    with installed_plist.open("wb") as handle:
+        plistlib.dump(payload, handle, sort_keys=False)
+    _write_nightly_plist(tmp_path)
+
+    result = CliRunner().invoke(app, ["doctor", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["summary"]["failed"] == 0
+    assert payload["summary"]["warnings"] == 1
+    checks_by_id = {check["id"]: check for check in payload["checks"]}
+    assert checks_by_id["launchd_nightly"]["status"] == "pass"
     assert checks_by_id["launchd_nightly_env_file"]["status"] == "warn"
