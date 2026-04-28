@@ -467,7 +467,8 @@ async def _synthesize_channel(
                     run_date=run_date,
                     error=retry_exc.detail,
                     raw_outputs=raw_outputs,
-                    turn=retry_turn if retry_turn.result is not None else first_turn,
+                    turn=retry_turn,
+                    first_turn=first_turn,
                     prompt_template=prompt_template,
                 )
                 raise
@@ -805,15 +806,20 @@ def _log_parse_fail_final(
     error: str,
     raw_outputs: list[str],
     turn: ClaudeTurnResult | None,
+    first_turn: ClaudeTurnResult | None,
     prompt_template: str,
 ) -> None:
     result = turn.result if turn is not None else None
-    prompt_tokens, model_actual = _prompt_tokens_and_model(result)
+    prompt_tokens, _ = _prompt_tokens_and_model(result)
+    if prompt_tokens == 0 and first_turn is not None and first_turn is not turn:
+        prompt_tokens, _ = _prompt_tokens_and_model(first_turn.result)
     message_count = getattr(result, "message_count", None) if result is not None else None
     if message_count is None and turn is not None:
         message_count = turn.message_count
-    if model_actual is None and turn is not None and turn.assistant_models:
-        model_actual = ",".join(turn.assistant_models)
+    model_actual = _observed_model_actual(turn)
+    first_attempt_stop_reason = None
+    if first_turn is not None and first_turn is not turn and first_turn.result is not None:
+        first_attempt_stop_reason = getattr(first_turn.result, "stop_reason", None)
     log.error(
         "nightly.parse_fail_final",
         extra={
@@ -826,12 +832,23 @@ def _log_parse_fail_final(
             "raw_output_initial": raw_outputs[0] if raw_outputs else "",
             "raw_output_retry": raw_outputs[1] if len(raw_outputs) > 1 else "",
             "stop_reason": getattr(result, "stop_reason", None) if result is not None else None,
+            "first_attempt_stop_reason": first_attempt_stop_reason,
             "message_count": message_count,
             "prompt_tokens": prompt_tokens,
             "prompt_preview": prompt_template[:2000],
-            "model_actual": model_actual or plan.model,
+            "model_actual": model_actual,
+            "model_configured": plan.model,
         },
     )
+
+
+def _observed_model_actual(turn: ClaudeTurnResult | None) -> str | None:
+    if turn is None:
+        return None
+    _, model_actual = _prompt_tokens_and_model(turn.result)
+    if model_actual is None and turn.assistant_models:
+        model_actual = ",".join(turn.assistant_models)
+    return model_actual
 
 
 def _prompt_tokens_and_model(result: ResultMessage | None) -> tuple[int, str | None]:
@@ -846,7 +863,7 @@ def _prompt_tokens_and_model(result: ResultMessage | None) -> tuple[int, str | N
     if isinstance(model_usage, dict) and model_usage:
         model_keys = [str(key) for key in model_usage if key]
         if model_keys:
-            model_actual = ",".join(sorted(model_keys))
+            model_actual = ",".join(model_keys)
 
         if prompt_tokens == 0:
             for value in model_usage.values():

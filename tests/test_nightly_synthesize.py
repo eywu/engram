@@ -162,6 +162,39 @@ class _AssistantModelFallbackClient:
         )
 
 
+class _RetryWithoutResultMessageClient:
+    def __init__(self, options: ClaudeAgentOptions, retry_response: str):
+        self.options = options
+        self.retry_response = retry_response
+        self.connected = False
+        self.disconnected = False
+        self.receive_count = 0
+
+    async def connect(self) -> None:
+        self.connected = True
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
+
+    async def query(self, prompt: str, session_id: str = "default") -> None:
+        del prompt, session_id
+
+    async def receive_messages(self):
+        if self.receive_count == 0:
+            self.receive_count += 1
+            yield AssistantMessage(content=[_TextBlock("not json")], model="claude-haiku-4-5")
+            yield _result(
+                stop_reason="max_turns_exhausted",
+                input_tokens=123,
+                model_usage={"claude-haiku-4-5": {"input_tokens": 123}},
+                message_count=3,
+            )
+            return
+
+        self.receive_count += 1
+        yield AssistantMessage(content=[_TextBlock(self.retry_response)], model="")
+
+
 class _ClientFactory:
     def __init__(
         self,
@@ -484,8 +517,8 @@ async def test_retry_failure_logs_both_raw_outputs_and_aborts(
         stop_reason="max_turns_exhausted",
         input_tokens=321,
         model_usage={
-            "claude-haiku-4-5": {"input_tokens": 111},
             "claude-sonnet-4-6": {"input_tokens": 210},
+            "claude-haiku-4-5": {"input_tokens": 111},
         },
         message_count=4,
     )
@@ -510,10 +543,12 @@ async def test_retry_failure_logs_both_raw_outputs_and_aborts(
     assert record.raw_output_initial == "not json"
     assert record.raw_output_retry == second_raw
     assert record.stop_reason == "max_turns_exhausted"
+    assert record.first_attempt_stop_reason == "end_turn"
     assert record.message_count == 4
     assert record.prompt_tokens == 321
     assert record.prompt_preview == DEFAULT_PROMPT_TEMPLATE.read_text(encoding="utf-8")[:2000]
-    assert record.model_actual == "claude-haiku-4-5,claude-sonnet-4-6"
+    assert record.model_actual == "claude-sonnet-4-6,claude-haiku-4-5"
+    assert record.model_configured == "sonnet"
 
 
 @pytest.mark.asyncio
@@ -544,6 +579,42 @@ async def test_retry_failure_logs_assistant_model_and_observed_message_count_whe
     assert record.message_count == 2
     assert record.prompt_tokens == 0
     assert record.model_actual == "claude-sonnet-4-6"
+    assert record.model_configured == "configured-model"
+
+
+@pytest.mark.asyncio
+async def test_retry_failure_keeps_retry_attempt_ownership_when_retry_has_no_result_message(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="engram.nightly.synthesize")
+    harvest = _write_harvest(tmp_path, [_channel("C07NORESULT")])
+    second_raw = json.dumps({"schema_version": 1, "date": "2026-04-22"})
+
+    def factory(options: ClaudeAgentOptions) -> _RetryWithoutResultMessageClient:
+        return _RetryWithoutResultMessageClient(options, second_raw)
+
+    with pytest.raises(SynthesisOutputError):
+        await synthesize(
+            harvest,
+            output_root=tmp_path / "nightly",
+            config=NightlyConfig(),
+            contexts_dir=tmp_path / "contexts",
+            anthropic_runtime=AnthropicRuntime(api_key=None, model="configured-model"),
+            budget=_FakeBudget(),
+            client_factory=factory,
+        )
+
+    record = _single_log(caplog.records, "nightly.parse_fail_final")
+    assert record.channel_id == "C07NORESULT"
+    assert record.raw_outputs == ["not json", second_raw]
+    assert record.raw_output_retry == second_raw
+    assert record.stop_reason is None
+    assert record.first_attempt_stop_reason == "max_turns_exhausted"
+    assert record.message_count == 1
+    assert record.prompt_tokens == 123
+    assert record.model_actual is None
+    assert record.model_configured == "configured-model"
 
 
 @pytest.mark.asyncio
@@ -554,8 +625,8 @@ async def test_retry_failure_writes_raw_outputs_to_nightly_jsonl(tmp_path: Path)
         stop_reason="max_turns_exhausted",
         input_tokens=432,
         model_usage={
-            "claude-haiku-4-5": {"input_tokens": 200},
             "claude-sonnet-4-6": {"input_tokens": 232},
+            "claude-haiku-4-5": {"input_tokens": 200},
         },
         message_count=6,
     )
@@ -592,10 +663,12 @@ async def test_retry_failure_writes_raw_outputs_to_nightly_jsonl(tmp_path: Path)
     assert record["raw_output_retry"] == second_raw
     assert record["error"]
     assert record["stop_reason"] == "max_turns_exhausted"
+    assert record["first_attempt_stop_reason"] == "end_turn"
     assert record["message_count"] == 6
     assert record["prompt_tokens"] == 432
     assert record["prompt_preview"] == DEFAULT_PROMPT_TEMPLATE.read_text(encoding="utf-8")[:2000]
-    assert record["model_actual"] == "claude-haiku-4-5,claude-sonnet-4-6"
+    assert record["model_actual"] == "claude-sonnet-4-6,claude-haiku-4-5"
+    assert record["model_configured"] == "sonnet"
 
 
 @pytest.mark.asyncio
