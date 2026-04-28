@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from engram.bootstrap import provision_channel
 from engram.manifest import (
@@ -21,6 +22,8 @@ from engram.setup_wizard import (
     SLACK_APP_MANIFEST,
     _step_launchd_sync,
     _step_mcp_inventory,
+    _step_slack,
+    _write_config,
     run_wizard,
 )
 
@@ -81,6 +84,76 @@ def test_run_wizard_prints_slash_command_verification_hint(monkeypatch) -> None:
     rendered = "\n".join(output)
     assert "Verify slash commands: type `/engram` in any channel" in rendered
     assert "api.slack.com/apps and reinstall the app." in rendered
+
+
+def test_step_slack_captures_workspace_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    answers = iter(["xoxb-test", "xapp-test"])
+    monkeypatch.setattr(
+        "engram.setup_wizard.Prompt.ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+    output: list[str] = []
+    monkeypatch.setattr(
+        "engram.setup_wizard.rprint",
+        lambda *args, **_kwargs: output.append(" ".join(map(str, args))),
+    )
+
+    def requester(url: str, **kwargs) -> tuple[int, dict[str, object]]:
+        assert url == "https://slack.com/api/auth.test"
+        assert kwargs["headers"]["Authorization"] == "Bearer xoxb-test"
+        return (
+            200,
+            {
+                "ok": True,
+                "team_id": "T02G507JU",
+                "team": "Growth Gauge",
+                "url": "https://growthgauge.slack.com/",
+            },
+        )
+
+    slack = _step_slack(requester=requester)
+
+    assert slack == {
+        "bot_token": "xoxb-test",
+        "app_token": "xapp-test",
+        "team_id": "T02G507JU",
+        "team_name": "Growth Gauge",
+        "workspace_url": "https://growthgauge.slack.com/",
+    }
+    rendered = "\n".join(output)
+    assert "Connected to" in rendered
+    assert "Growth Gauge" in rendered
+    assert "T02G507JU" in rendered
+    assert "https://growthgauge.slack.com/" in rendered
+
+
+def test_write_config_persists_slack_workspace_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("engram.setup_wizard.DEFAULT_CONFIG_PATH", config_path)
+
+    _write_config(
+        slack={
+            "bot_token": "xoxb-test",
+            "app_token": "xapp-test",
+            "team_id": "T02G507JU",
+            "team_name": "Growth Gauge",
+            "workspace_url": "https://growthgauge.slack.com/",
+        },
+        anthropic_key="sk-ant-test",
+        gemini_key=None,
+    )
+
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert payload["slack"] == {
+        "bot_token": "xoxb-test",
+        "app_token": "xapp-test",
+        "team_id": "T02G507JU",
+        "team_name": "Growth Gauge",
+        "workspace_url": "https://growthgauge.slack.com/",
+    }
 
 
 def test_step_mcp_inventory_reads_claude_json(

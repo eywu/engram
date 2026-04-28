@@ -25,6 +25,9 @@ class SlackConfig:
     bot_token: str
     app_token: str
     signing_secret: str | None = None  # not required for Socket Mode
+    team_id: str | None = None
+    team_name: str | None = None
+    workspace_url: str | None = None
 
 
 @dataclass
@@ -263,6 +266,13 @@ class EngramConfig:
                 "ENGRAM_SLACK_SIGNING_SECRET",
                 "SLACK_SIGNING_SECRET",
             ),
+            team_id=_resolve_optional(
+                _optional_string(slack_raw.get("team_id")),
+                "ENGRAM_SLACK_TEAM_ID",
+                "SLACK_TEAM_ID",
+            ),
+            team_name=_optional_string(slack_raw.get("team_name")),
+            workspace_url=_optional_string(slack_raw.get("workspace_url")),
         )
 
         anth_raw = raw.get("anthropic", {})

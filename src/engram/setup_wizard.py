@@ -12,11 +12,16 @@ Walks the user through first-time configuration:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import sys
+import urllib.error
+import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from textwrap import dedent
+from typing import Any
 
 import yaml
 from rich import print as rprint
@@ -45,6 +50,7 @@ from engram.mcp_onboarding import sync_team_channel_mcp_allow_lists
 from engram.mcp_trust import resolve_mcp_server_trust
 
 console = Console()
+SLACK_AUTH_TEST_URL = "https://slack.com/api/auth.test"
 
 SLACK_APP_MANIFEST = dedent(
     """\
@@ -160,7 +166,9 @@ def _step_claude_cli() -> None:
             sys.exit(1)
 
 
-def _step_slack() -> dict[str, str]:
+def _step_slack(
+    requester: Callable[..., tuple[int, dict[str, Any]]] | None = None,
+) -> dict[str, str]:
     rprint("[bold]Step 2 — Slack App[/bold]")
     rprint("Engram needs its own Slack app (Socket Mode + Bot User).")
     rprint()
@@ -189,7 +197,17 @@ def _step_slack() -> dict[str, str]:
     ).strip()
     if not app_token.startswith("xapp-"):
         rprint("  [yellow]⚠[/yellow] expected prefix 'xapp-' — double-check this token.")
-    return {"bot_token": bot_token, "app_token": app_token}
+    workspace = _validate_slack_workspace(bot_token, requester=requester)
+    team_name = workspace.get("team_name")
+    team_id = workspace["team_id"]
+    workspace_url = workspace.get("workspace_url")
+    if team_name:
+        rprint(f"  [green]✓[/green] Connected to [bold]{team_name}[/bold] ({team_id})")
+    else:
+        rprint(f"  [green]✓[/green] Connected to workspace {team_id}")
+    if workspace_url:
+        rprint(f"    Workspace URL: {workspace_url}")
+    return {"bot_token": bot_token, "app_token": app_token} | workspace
 
 
 def _write_manifest_tempfile() -> Path:
@@ -296,11 +314,16 @@ def _write_config(
     rprint("[bold]Step 6 — Write Config[/bold]")
     DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+    slack_config: dict[str, str] = {
+        "bot_token": slack["bot_token"],
+        "app_token": slack["app_token"],
+    }
+    for key in ("team_id", "team_name", "workspace_url"):
+        if value := slack.get(key):
+            slack_config[key] = value
+
     config: dict = {
-        "slack": {
-            "bot_token": slack["bot_token"],
-            "app_token": slack["app_token"],
-        },
+        "slack": slack_config,
         "anthropic": {
             "api_key": anthropic_key,
             "model": "claude-sonnet-4-6",
@@ -322,6 +345,89 @@ def _write_config(
     # Tight permissions — secrets live here.
     DEFAULT_CONFIG_PATH.chmod(0o600)
     rprint(f"  [green]✓[/green] wrote {DEFAULT_CONFIG_PATH} (mode 600)")
+
+
+def _validate_slack_workspace(
+    bot_token: str,
+    *,
+    requester: Callable[..., tuple[int, dict[str, Any]]] | None = None,
+) -> dict[str, str]:
+    request = requester or _post_json
+    try:
+        status_code, payload = request(
+            SLACK_AUTH_TEST_URL,
+            headers={
+                "Authorization": f"Bearer {bot_token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            payload={},
+        )
+    except Exception as exc:
+        rprint(
+            "  [red]✗[/red] Slack auth.test failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        sys.exit(1)
+
+    if status_code != 200:
+        slack_error = _optional_string(payload.get("error"))
+        suffix = f" ({slack_error})" if slack_error else ""
+        rprint(f"  [red]✗[/red] Slack auth.test returned HTTP {status_code}{suffix}.")
+        sys.exit(1)
+    if not payload.get("ok"):
+        error = _optional_string(payload.get("error")) or "unknown_error"
+        rprint(f"  [red]✗[/red] Slack bot token rejected by auth.test: {error}.")
+        sys.exit(1)
+
+    team_id = _optional_string(payload.get("team_id"))
+    if not team_id:
+        rprint("  [red]✗[/red] Slack auth.test succeeded but did not return a team_id.")
+        sys.exit(1)
+
+    workspace = {"team_id": team_id}
+    if team_name := _optional_string(payload.get("team")):
+        workspace["team_name"] = team_name
+    if workspace_url := _optional_string(payload.get("url")):
+        workspace["workspace_url"] = workspace_url
+    return workspace
+
+
+def _post_json(
+    url: str,
+    *,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float = 3.0,
+) -> tuple[int, dict[str, Any]]:
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            text = response.read().decode("utf-8", errors="replace")
+            return response.status, _parse_json_payload(text)
+    except urllib.error.HTTPError as exc:
+        text = exc.read().decode("utf-8", errors="replace")
+        return exc.code, _parse_json_payload(text)
+
+
+def _parse_json_payload(text: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _step_launchd_sync(*, anthropic_key: str, gemini_key: str | None) -> None:

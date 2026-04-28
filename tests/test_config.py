@@ -57,7 +57,13 @@ def test_load_from_yaml(tmp_path, clean_env):
     path = _write_yaml(
         tmp_path,
         {
-            "slack": {"bot_token": "xoxb-file", "app_token": "xapp-file"},
+            "slack": {
+                "bot_token": "xoxb-file",
+                "app_token": "xapp-file",
+                "team_id": "T02G507JU",
+                "team_name": "Growth Gauge",
+                "workspace_url": "https://growthgauge.slack.com/",
+            },
             "anthropic": {"api_key": "sk-ant-file", "model": "claude-sonnet-4-6"},
             "allowed_channels": ["C123"],
             "max_turns_per_message": 5,
@@ -76,6 +82,9 @@ def test_load_from_yaml(tmp_path, clean_env):
     cfg = EngramConfig.load(path)
     assert cfg.slack.bot_token == "xoxb-file"
     assert cfg.slack.app_token == "xapp-file"
+    assert cfg.slack.team_id == "T02G507JU"
+    assert cfg.slack.team_name == "Growth Gauge"
+    assert cfg.slack.workspace_url == "https://growthgauge.slack.com/"
     assert cfg.anthropic.api_key == "sk-ant-file"
     assert cfg.anthropic.model == "claude-sonnet-4-6"
     assert cfg.allowed_channels == ["C123"]
