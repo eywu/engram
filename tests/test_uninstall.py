@@ -139,6 +139,8 @@ def test_uninstall_keep_data_skips_data_prompt_only(
     monkeypatch.setattr("engram.uninstall.os.getuid", lambda: 501)
 
     commands: list[list[str]] = []
+    deleted_homes: list[Path] = []
+    unlinked_plists: list[Path] = []
 
     def fake_run(
         args: Sequence[str],
@@ -149,6 +151,12 @@ def test_uninstall_keep_data_skips_data_prompt_only(
         return subprocess.CompletedProcess(args=command, returncode=0)
 
     monkeypatch.setattr("engram.uninstall.subprocess.run", fake_run)
+    monkeypatch.setattr("engram.uninstall.shutil.rmtree", lambda path: deleted_homes.append(path))
+
+    def fake_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        unlinked_plists.append(path)
+
+    monkeypatch.setattr(Path, "unlink", fake_unlink)
 
     result = CliRunner().invoke(app, ["uninstall", "--keep-data"], input="y\nn\nn\n")
 
@@ -160,8 +168,8 @@ def test_uninstall_keep_data_skips_data_prompt_only(
         ["launchctl", "bootout", "gui/501/com.engram.v3.nightly"],
     ]
     assert home.exists()
-    assert not bridge_plist.exists()
-    assert not nightly_plist.exists()
+    assert unlinked_plists == [bridge_plist, nightly_plist]
+    assert deleted_homes == []
 
 
 def test_uninstall_purge_still_respects_dry_run(
