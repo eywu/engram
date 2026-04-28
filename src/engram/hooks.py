@@ -1,4 +1,5 @@
 """Claude Agent SDK hooks used for Engram audit logging."""
+
 from __future__ import annotations
 
 import datetime
@@ -92,7 +93,7 @@ def build_hooks(
                 agent_type=hook_input.get("agent_type"),
                 transcript_path=transcript_path,
                 cost_usd=cost_usd,
-        )
+            )
         return {"continue_": True, "suppressOutput": True}
 
     async def subagent_stop_adapter(
@@ -104,9 +105,7 @@ def build_hooks(
 
     return {
         "PreToolUse": [HookMatcher(matcher=None, hooks=[pre_tool_use])],
-        "PostToolUseFailure": [
-            HookMatcher(matcher=None, hooks=[post_tool_use_failure])
-        ],
+        "PostToolUseFailure": [HookMatcher(matcher=None, hooks=[post_tool_use_failure])],
         "Notification": [HookMatcher(matcher=None, hooks=[notification])],
         "SubagentStop": [HookMatcher(matcher=None, hooks=[subagent_stop_adapter])],
     }
