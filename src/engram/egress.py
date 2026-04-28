@@ -25,6 +25,7 @@ from engram.footguns import FootgunMatch, match_footgun
 from engram.hitl import PendingQuestion
 from engram.manifest import PermissionTier
 from engram.mcp import resolve_team_mcp_servers
+from engram.mcp_health import _extract_servers
 from engram.router import SessionState
 
 log = logging.getLogger(__name__)
@@ -236,13 +237,8 @@ async def _mcp_status_summary(client: Any) -> str | None:
         log.debug("egress.mcp_status_for_greeting_failed", exc_info=True)
         return None
 
-    servers = status.get("mcpServers") if isinstance(status, dict) else None
-    if not isinstance(servers, list):
-        return None
     parts: list[str] = []
-    for server in servers:
-        if not isinstance(server, dict):
-            continue
+    for server in _extract_servers(status):
         name = server.get("name")
         if not name:
             continue

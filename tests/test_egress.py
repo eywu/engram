@@ -5,6 +5,7 @@ import json
 import logging
 import sqlite3
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from slack_sdk.errors import SlackApiError
@@ -42,7 +43,21 @@ class FakeSlackClient:
 
 
 class FakeMCPClient:
+    def __init__(self, status: Any | None = None) -> None:
+        self.status = status or {
+            "mcpServers": [
+                {"name": "camoufox", "tools": ["browse"]},
+                {"name": "claude_desktop_settings", "toolCount": 4},
+            ]
+        }
+
     async def get_mcp_status(self):
+        return self.status
+
+
+class FakeMCPStatusResponse:
+    def model_dump(self, mode: str = "python") -> dict[str, Any]:
+        assert mode == "python"
         return {
             "mcpServers": [
                 {"name": "camoufox", "tools": ["browse"]},
@@ -154,7 +169,19 @@ async def test_reply_renders_markdown_block():
 
 
 @pytest.mark.asyncio
-async def test_reply_prepends_fresh_session_greeting_once(tmp_path):
+@pytest.mark.parametrize(
+    "mcp_status",
+    [
+        {
+            "mcpServers": [
+                {"name": "camoufox", "tools": ["browse"]},
+                {"name": "claude_desktop_settings", "toolCount": 4},
+            ]
+        },
+        FakeMCPStatusResponse(),
+    ],
+)
+async def test_reply_prepends_fresh_session_greeting_once(tmp_path, mcp_status):
     db_path = tmp_path / "memory.db"
     with sqlite3.connect(db_path) as conn:
         conn.execute("CREATE TABLE transcripts (channel_id TEXT)")
@@ -171,7 +198,7 @@ async def test_reply_prepends_fresh_session_greeting_once(tmp_path):
             permission_tier=PermissionTier.OWNER_SCOPED,
         ),
     )
-    session.agent_client = FakeMCPClient()
+    session.agent_client = FakeMCPClient(mcp_status)
     session.session_just_started = True
     turn = AgentTurn(
         text="actual response",
