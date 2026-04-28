@@ -290,6 +290,7 @@ def status(
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Show bridge health, live channels, memory counts, and rate limits."""
+    migrate_legacy_claude_mcp_config()
     snapshot = _build_status_snapshot()
     if json_output:
         typer.echo(json.dumps(snapshot, sort_keys=True))

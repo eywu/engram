@@ -20,6 +20,7 @@ from engram.manifest import (
     load_manifest,
     persist_approved_mcp_manifest_change,
 )
+from engram.mcp import claude_mcp_config_path, legacy_claude_mcp_config_path
 
 
 @pytest.fixture
@@ -36,6 +37,43 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     ):
         monkeypatch.delenv(key, raising=False)
     return tmp_path / ".engram"
+
+
+def test_status_migrates_legacy_mcp_inventory(isolated_home: Path):
+    target_path = claude_mcp_config_path()
+    legacy_path = legacy_claude_mcp_config_path()
+    target_payload = {
+        "theme": "dark",
+        "mcpServers": {
+            "linear": {"command": "linear-new"},
+        },
+    }
+    legacy_payload = {
+        "mcpServers": {
+            "github": {"command": "github-mcp"},
+        },
+    }
+    target_path.write_text(json.dumps(target_payload), encoding="utf-8")
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["status", "--json"])
+
+    assert result.exit_code == 0
+    assert not legacy_path.exists()
+    assert json.loads(target_path.read_text(encoding="utf-8")) == {
+        "theme": "dark",
+        "mcpServers": {
+            "linear": {"command": "linear-new"},
+            "github": {"command": "github-mcp"},
+        },
+    }
+    assert json.loads(
+        target_path.with_name(f"{target_path.name}.bak").read_text(encoding="utf-8")
+    ) == target_payload
+    assert json.loads(
+        legacy_path.with_name(f"{legacy_path.name}.bak").read_text(encoding="utf-8")
+    ) == legacy_payload
 
 
 def test_status_json_includes_channel_mcp_policy(isolated_home: Path):
