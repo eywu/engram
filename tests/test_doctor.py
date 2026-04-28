@@ -283,6 +283,67 @@ def test_check_slack_bot_token_fails_on_expected_team_mismatch(tmp_path: Path) -
     assert "config expects T123" in check.message
 
 
+def test_check_slack_bot_token_fails_when_expected_set_but_team_id_missing(
+    tmp_path: Path,
+) -> None:
+    # GRO-475 blocker 3: when expected_team_id is configured, missing team_id
+    # in the auth.test response must HARD-FAIL (not WARN). Spec preserves
+    # "if team_id is configured, must hard-fail when auth.test can't return one."
+    def requester(*_args, **_kwargs) -> HttpResult:
+        return HttpResult(
+            200,
+            {
+                "ok": True,
+                # No team_id field returned — unusual, but possible.
+                "team": "Example",
+                "url": "https://example.slack.com/",
+            },
+        )
+
+    check = check_slack_bot_token(
+        _config(tmp_path),
+        expected_team_id="T123",
+        requester=requester,
+    )
+
+    assert check.status == CheckStatus.FAIL
+    assert "expected workspace (T123) cannot be verified" in check.message
+    assert "did not return a team_id" in check.message
+
+
+def test_configured_slack_team_id_yaml_wins_over_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # GRO-475 blocker 1: precedence must match EngramConfig._resolve_optional
+    # (YAML-first, env-fallback). The previous implementation was env-first,
+    # YAML-fallback — a stale env var could override a correctly-set workspace
+    # in config.yaml.
+    from engram.doctor import _configured_slack_team_id
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "slack:\n  team_id: T_FROM_YAML\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ENGRAM_SLACK_TEAM_ID", "T_FROM_ENV")
+    monkeypatch.setenv("SLACK_TEAM_ID", "T_FROM_LEGACY_ENV")
+
+    assert _configured_slack_team_id(config_path) == "T_FROM_YAML"
+
+
+def test_configured_slack_team_id_env_fallback_when_yaml_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # GRO-475: env vars are still honored when YAML has no team_id.
+    from engram.doctor import _configured_slack_team_id
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("slack: {}\n", encoding="utf-8")
+    monkeypatch.setenv("ENGRAM_SLACK_TEAM_ID", "T_FROM_ENV")
+
+    assert _configured_slack_team_id(config_path) == "T_FROM_ENV"
+
+
 def test_owner_approval_checks_warn_when_missing(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
 

@@ -199,12 +199,14 @@ def _step_slack(
         rprint("  [yellow]⚠[/yellow] expected prefix 'xapp-' — double-check this token.")
     workspace = _validate_slack_workspace(bot_token, requester=requester)
     team_name = workspace.get("team_name")
-    team_id = workspace["team_id"]
+    team_id = workspace.get("team_id")
     workspace_url = workspace.get("workspace_url")
-    if team_name:
+    if team_id and team_name:
         rprint(f"  [green]✓[/green] Connected to [bold]{team_name}[/bold] ({team_id})")
-    else:
+    elif team_id:
         rprint(f"  [green]✓[/green] Connected to workspace {team_id}")
+    # else: _validate_slack_workspace already printed a yellow warning
+    # explaining that workspace metadata could not be captured.
     if workspace_url:
         rprint(f"    Workspace URL: {workspace_url}")
     return {"bot_token": bot_token, "app_token": app_token} | workspace
@@ -352,6 +354,16 @@ def _validate_slack_workspace(
     *,
     requester: Callable[..., tuple[int, dict[str, Any]]] | None = None,
 ) -> dict[str, str]:
+    """Best-effort enrichment of Slack workspace metadata at setup time.
+
+    GRO-475 blocker 2: a transient Slack failure (HTTP error, timeout, 503,
+    or missing team_id) must NOT terminate the wizard. The point of capturing
+    team_id at setup is opportunistic enrichment so doctor can verify later —
+    if Slack is temporarily unavailable, the user should still be able to
+    finish setup. Only hard-exit if Slack explicitly rejects the bot token
+    (`ok=false` with a clear auth error like invalid_auth / token_revoked /
+    not_authed), since that means the token will never work.
+    """
     request = requester or _post_json
     try:
         status_code, payload = request(
@@ -363,26 +375,58 @@ def _validate_slack_workspace(
             payload={},
         )
     except Exception as exc:
+        # Transient transport failure — warn and continue. Doctor will
+        # verify on next run when Slack is reachable again.
         rprint(
-            "  [red]✗[/red] Slack auth.test failed: "
-            f"{type(exc).__name__}: {exc}"
+            "  [yellow]⚠[/yellow] Slack auth.test could not be reached "
+            f"({type(exc).__name__}: {exc}). Continuing without workspace "
+            "metadata; run `engram doctor` after setup completes to verify."
         )
-        sys.exit(1)
+        return {}
 
     if status_code != 200:
         slack_error = _optional_string(payload.get("error"))
         suffix = f" ({slack_error})" if slack_error else ""
-        rprint(f"  [red]✗[/red] Slack auth.test returned HTTP {status_code}{suffix}.")
-        sys.exit(1)
+        rprint(
+            f"  [yellow]⚠[/yellow] Slack auth.test returned HTTP {status_code}{suffix}; "
+            "continuing without workspace metadata. Run `engram doctor` after setup "
+            "completes to verify."
+        )
+        return {}
+
     if not payload.get("ok"):
         error = _optional_string(payload.get("error")) or "unknown_error"
-        rprint(f"  [red]✗[/red] Slack bot token rejected by auth.test: {error}.")
-        sys.exit(1)
+        # These errors mean the token will never work — hard-exit so the
+        # user fixes it before continuing setup.
+        auth_hard_fail = {
+            "invalid_auth",
+            "token_revoked",
+            "token_expired",
+            "not_authed",
+            "account_inactive",
+        }
+        if error in auth_hard_fail:
+            rprint(f"  [red]✗[/red] Slack bot token rejected by auth.test: {error}.")
+            sys.exit(1)
+        # Other ok=false reasons (rate_limited, fatal_error, internal_error)
+        # are transient — warn and continue.
+        rprint(
+            f"  [yellow]⚠[/yellow] Slack auth.test returned ok=false ({error}); "
+            "this looks transient. Continuing without workspace metadata. "
+            "Run `engram doctor` after setup completes to verify."
+        )
+        return {}
 
     team_id = _optional_string(payload.get("team_id"))
     if not team_id:
-        rprint("  [red]✗[/red] Slack auth.test succeeded but did not return a team_id.")
-        sys.exit(1)
+        # auth.test succeeded but no team_id — unusual, but not fatal.
+        # The token works, doctor will verify the rest later.
+        rprint(
+            "  [yellow]⚠[/yellow] Slack auth.test succeeded but did not "
+            "return a team_id; continuing without workspace metadata. "
+            "Run `engram doctor` after setup completes to verify."
+        )
+        return {}
 
     workspace = {"team_id": team_id}
     if team_name := _optional_string(payload.get("team")):

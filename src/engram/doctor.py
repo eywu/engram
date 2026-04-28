@@ -551,6 +551,32 @@ def check_slack_bot_token(
         team_id=team_id,
         url=url,
     )
+    # GRO-475 blocker 3: when expected_team_id is configured, hard-fail if
+    # auth.test returned a different team_id OR no team_id at all. Spec
+    # explicitly preserves "if team_id is configured, must hard-fail when
+    # auth.test can't return one." The previous order returned WARN on
+    # missing team_id even when expected_team_id was set, masking a real
+    # config drift.
+    if expected_team_id and team_id != expected_team_id:
+        if team_id:
+            message = (
+                f"Slack token is valid for workspace {observed_workspace}, "
+                f"but auth.test returned team_id {team_id} while config expects "
+                f"{expected_team_id}."
+            )
+        else:
+            message = (
+                f"Slack auth.test succeeded for {observed_workspace}, "
+                f"but the expected workspace ({expected_team_id}) cannot be "
+                "verified because auth.test did not return a team_id."
+            )
+        return DoctorCheck(
+            id="slack_bot_token",
+            name="Slack bot token",
+            status=CheckStatus.FAIL,
+            message=message,
+            details=details,
+        )
     if not team_id:
         return DoctorCheck(
             id="slack_bot_token",
@@ -559,18 +585,6 @@ def check_slack_bot_token(
             message=(
                 f"Slack auth.test succeeded for {observed_workspace} "
                 "but did not return a team_id."
-            ),
-            details=details,
-        )
-    if expected_team_id and team_id != expected_team_id:
-        return DoctorCheck(
-            id="slack_bot_token",
-            name="Slack bot token",
-            status=CheckStatus.FAIL,
-            message=(
-                f"Slack token is valid for workspace {observed_workspace}, "
-                f"but auth.test returned team_id {team_id} while config expects "
-                f"{expected_team_id}."
             ),
             details=details,
         )
@@ -1769,19 +1783,29 @@ def _recent_engram_log_paths(
 
 
 def _configured_slack_team_id(config_path: Path) -> str | None:
+    """Resolve the configured Slack team_id with the same precedence as
+    EngramConfig.from_yaml: YAML wins, env vars fall back. GRO-475 blocker:
+    the original implementation had env-first, YAML-fallback (asymmetric to
+    _resolve_optional), which meant a stale env var could override a
+    correctly-set workspace in config.yaml.
+    """
+    yaml_team_id: str | None = None
+    if config_path.exists():
+        try:
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            raw = {}
+        slack = raw.get("slack") if isinstance(raw, dict) else None
+        if isinstance(slack, dict):
+            yaml_team_id = _optional_str(slack.get("team_id")) or _optional_str(
+                slack.get("workspace_id")
+            )
+    if yaml_team_id:
+        return yaml_team_id
     for env_key in ("ENGRAM_SLACK_TEAM_ID", "SLACK_TEAM_ID"):
         if value := os.environ.get(env_key):
             return value
-    if not config_path.exists():
-        return None
-    try:
-        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return None
-    slack = raw.get("slack") if isinstance(raw, dict) else None
-    if not isinstance(slack, dict):
-        return None
-    return _optional_str(slack.get("team_id")) or _optional_str(slack.get("workspace_id"))
+    return None
 
 
 def _describe_slack_workspace(

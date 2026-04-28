@@ -127,6 +127,110 @@ def test_step_slack_captures_workspace_metadata(monkeypatch: pytest.MonkeyPatch)
     assert "https://growthgauge.slack.com/" in rendered
 
 
+def test_step_slack_continues_on_transient_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # GRO-475 blocker 2: a transient transport failure during setup must NOT
+    # terminate the wizard. The user should be able to finish setup and let
+    # doctor verify on next run when Slack is reachable again.
+    answers = iter(["xoxb-test", "xapp-test"])
+    monkeypatch.setattr(
+        "engram.setup_wizard.Prompt.ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+    output: list[str] = []
+    monkeypatch.setattr(
+        "engram.setup_wizard.rprint",
+        lambda *args, **_kwargs: output.append(" ".join(map(str, args))),
+    )
+
+    def requester(*_args, **_kwargs) -> tuple[int, dict[str, object]]:
+        raise ConnectionError("simulated network blip")
+
+    slack = _step_slack(requester=requester)
+
+    assert slack == {"bot_token": "xoxb-test", "app_token": "xapp-test"}
+    rendered = "\n".join(output)
+    assert "could not be reached" in rendered
+    assert "engram doctor" in rendered
+
+
+def test_step_slack_continues_on_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    # GRO-475: 503 / non-200 HTTP from Slack must NOT terminate the wizard.
+    answers = iter(["xoxb-test", "xapp-test"])
+    monkeypatch.setattr(
+        "engram.setup_wizard.Prompt.ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+    output: list[str] = []
+    monkeypatch.setattr(
+        "engram.setup_wizard.rprint",
+        lambda *args, **_kwargs: output.append(" ".join(map(str, args))),
+    )
+
+    def requester(*_args, **_kwargs) -> tuple[int, dict[str, object]]:
+        return 503, {}
+
+    slack = _step_slack(requester=requester)
+
+    assert slack == {"bot_token": "xoxb-test", "app_token": "xapp-test"}
+    rendered = "\n".join(output)
+    assert "HTTP 503" in rendered
+    assert "engram doctor" in rendered
+
+
+def test_step_slack_hard_exits_on_invalid_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    # GRO-475: ok=false with explicit auth-rejection error must hard-exit so
+    # the user fixes the token before continuing setup.
+    answers = iter(["xoxb-test", "xapp-test"])
+    monkeypatch.setattr(
+        "engram.setup_wizard.Prompt.ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+    output: list[str] = []
+    monkeypatch.setattr(
+        "engram.setup_wizard.rprint",
+        lambda *args, **_kwargs: output.append(" ".join(map(str, args))),
+    )
+
+    def requester(*_args, **_kwargs) -> tuple[int, dict[str, object]]:
+        return 200, {"ok": False, "error": "invalid_auth"}
+
+    with pytest.raises(SystemExit):
+        _step_slack(requester=requester)
+
+    rendered = "\n".join(output)
+    assert "rejected by auth.test" in rendered
+    assert "invalid_auth" in rendered
+
+
+def test_step_slack_continues_on_transient_ok_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # GRO-475: ok=false with a transient error (rate_limited, fatal_error)
+    # must NOT terminate the wizard — only token-revocation errors do.
+    answers = iter(["xoxb-test", "xapp-test"])
+    monkeypatch.setattr(
+        "engram.setup_wizard.Prompt.ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+    output: list[str] = []
+    monkeypatch.setattr(
+        "engram.setup_wizard.rprint",
+        lambda *args, **_kwargs: output.append(" ".join(map(str, args))),
+    )
+
+    def requester(*_args, **_kwargs) -> tuple[int, dict[str, object]]:
+        return 200, {"ok": False, "error": "rate_limited"}
+
+    slack = _step_slack(requester=requester)
+
+    assert slack == {"bot_token": "xoxb-test", "app_token": "xapp-test"}
+    rendered = "\n".join(output)
+    assert "transient" in rendered
+    assert "rate_limited" in rendered
+
+
 def test_write_config_persists_slack_workspace_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
