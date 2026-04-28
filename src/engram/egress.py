@@ -237,14 +237,18 @@ async def _mcp_status_summary(client: Any) -> str | None:
         log.debug("egress.mcp_status_for_greeting_failed", exc_info=True)
         return None
 
+    servers = _extract_servers(status)
+    if not servers:
+        return None
+
     parts: list[str] = []
-    for server in _extract_servers(status):
+    for server in servers:
         name = server.get("name")
         if not name:
             continue
         count = _mcp_tool_count(server)
         parts.append(f"{name} ({count} tool{'s' if count != 1 else ''})")
-    return ", ".join(parts) if parts else "none"
+    return ", ".join(parts) if parts else None
 
 
 def _mcp_tool_count(server: dict[str, Any]) -> int:

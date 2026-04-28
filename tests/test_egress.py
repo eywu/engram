@@ -238,6 +238,48 @@ async def test_reply_prepends_fresh_session_greeting_once(tmp_path, mcp_status):
 
 
 @pytest.mark.asyncio
+async def test_fresh_session_greeting_falls_back_to_manifest_for_empty_mcp_status(
+    tmp_path, monkeypatch
+):
+    def fake_resolve_team_mcp_servers(manifest):
+        return {"linear": {}, "gmail": {}}, ["linear", "gmail"], []
+
+    monkeypatch.setattr(
+        "engram.egress.resolve_team_mcp_servers",
+        fake_resolve_team_mcp_servers,
+    )
+    slack = FakeSlackClient()
+    session = SessionState(
+        channel_id="C07TEST123",
+        manifest=ChannelManifest(
+            channel_id="C07TEST123",
+            identity=IdentityTemplate.TASK_ASSISTANT,
+        ),
+    )
+    session.agent_client = FakeMCPClient({"mcpServers": []})
+    session.session_just_started = True
+    turn = AgentTurn(
+        text="actual response",
+        cost_usd=None,
+        duration_ms=None,
+        num_turns=1,
+        is_error=False,
+    )
+
+    await post_reply(
+        slack,
+        "C07TEST123",
+        turn,
+        session=session,
+        model="claude-opus-test",
+        memory_db_path=tmp_path / "missing-memory.db",
+    )
+
+    first_text = slack.post_calls[0]["blocks"][0]["text"]
+    assert "MCPs: linear, gmail" in first_text
+
+
+@pytest.mark.asyncio
 async def test_post_reply_chunks_long_text():
     slack = FakeSlackClient()
     long_text = "a" * (SLACK_MAX_TEXT_LEN + 100)
