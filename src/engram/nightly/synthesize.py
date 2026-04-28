@@ -54,6 +54,7 @@ from engram.nightly.schema import (
     synthesis_output_format,
     synthesis_schema_prompt,
 )
+from engram.options import EngramAgentOptions
 from engram.telemetry import cli_stderr_logger, configure_logging, write_json
 
 log = logging.getLogger(__name__)
@@ -349,7 +350,7 @@ def build_nightly_options(
         child_env["ANTHROPIC_API_KEY"] = runtime.api_key
 
     budget_config = BudgetConfig(hard_cap_enabled=False)
-    options = ClaudeAgentOptions(
+    options = EngramAgentOptions(
         setting_sources=["project"],
         cwd=str(current_dir),
         model=plan.model,
@@ -389,15 +390,13 @@ def build_nightly_options(
         hooks={},
         stderr=cli_stderr_logger(NIGHTLY_CHANNEL_ID),
         output_format=synthesis_output_format(),
+        hitl_config=hitl_config,
+        budget_config=budget_config,
+        strict_mcp_config=True,
     )
     # Claude Agent SDK exposes output_format as CLI --json-schema. Nightly uses
     # that native structured output path first, with parse_synthesis_output as
     # defense-in-depth for SDK/model drift.
-    # SDK 0.1.x has no constructor field for these knobs yet; attach them so
-    # nightly callers/tests can assert the invariant and future SDKs can adopt it.
-    options.hitl_config = hitl_config
-    options.budget_config = budget_config
-    options.strict_mcp_config = True
     return options
 
 
