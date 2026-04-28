@@ -332,6 +332,8 @@ async def test_stop_hook_watermark_not_found_ingests_all(
         await _stop_hook(router)(_hook_input(session.session_id, transcript_path, tmp_path), None, {})
 
     assert "memory.stop_watermark_not_found" in caplog.text
+    assert "transcript may have been archived/truncated" in caplog.text
+    assert "INSERT OR IGNORE will dedup by message_uuid" in caplog.text
     row = _fetch_one(memory_db_path, "SELECT COUNT(*) AS count FROM transcripts")
     assert row["count"] == 2
 

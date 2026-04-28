@@ -200,7 +200,9 @@ def _messages_after_watermark(
             return messages[index + 1 :]
 
     log.warning(
-        "memory.stop_watermark_not_found session_id=%s message_uuid=%s",
+        "memory.stop_watermark_not_found session_id=%s message_uuid=%s "
+        "note=transcript may have been archived/truncated; falling back to full re-ingest "
+        "(INSERT OR IGNORE will dedup by message_uuid)",
         session_id,
         watermark_uuid,
     )
