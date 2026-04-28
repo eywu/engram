@@ -63,6 +63,15 @@ def test_extract_servers_handles_model_dump() -> None:
     assert _extract_servers(_Resp()) == [{"name": "x", "status": "connected"}]
 
 
+def test_extract_servers_handles_malformed_servers_value() -> None:
+    assert _extract_servers({"mcpServers": 42}) == []
+    assert _extract_servers({"mcpServers": True}) == []
+    assert _extract_servers({"mcpServers": "not-a-list"}) == []
+    assert _extract_servers({"mcp_servers": object()}) == []
+    assert _extract_servers(42) == []
+    assert _extract_servers("not-a-dict") == []
+
+
 def test_warning_chunk_for_pre_turn_renders_one_or_many() -> None:
     assert warning_chunk_for_pre_turn([]) is None
     assert warning_chunk_for_pre_turn(["camoufox"]) is not None

@@ -76,11 +76,11 @@ def _extract_servers(mcp_status: Any) -> list[dict[str, Any]]:
             raw = raw.model_dump(mode="python")
         except TypeError:  # pragma: no cover — defensive only
             raw = raw.model_dump()
-    servers = (
-        raw.get("mcpServers") or raw.get("mcp_servers") or []
-        if isinstance(raw, dict)
-        else []
-    )
+    if not isinstance(raw, dict):
+        return []
+    servers = raw.get("mcpServers") or raw.get("mcp_servers") or []
+    if not isinstance(servers, list):
+        return []
     out: list[dict[str, Any]] = []
     for s in servers or []:
         if isinstance(s, dict):
