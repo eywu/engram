@@ -83,6 +83,14 @@ def state_dir(home: Path | None = None) -> Path:
     return engram_home(home) / "state"
 
 
+def new_session_requests_dir(home: Path | None = None) -> Path:
+    return state_dir(home) / "new-session-requests"
+
+
+def new_session_request_path(channel_id: str, home: Path | None = None) -> Path:
+    return new_session_requests_dir(home) / f"{channel_id}.json"
+
+
 def log_dir(home: Path | None = None) -> Path:
     return engram_home(home) / "logs"
 

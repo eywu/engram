@@ -11,8 +11,10 @@ import pytest
 from engram.config import AnthropicConfig, EngramConfig, SlackConfig
 from engram.ingress import (
     ACTION_ID_TIER_PICK,
+    NEW_SESSION_CONFIRM_ACTION_ID,
     handle_block_action,
     handle_engram_command,
+    handle_new_session_action,
     handle_tier_pick_action,
 )
 from engram.manifest import (
@@ -52,6 +54,14 @@ class FakeSlackClient:
     async def chat_update(self, **kwargs):
         self.update_calls.append(kwargs)
         return {"ok": True}
+
+
+class DisconnectableClient:
+    def __init__(self) -> None:
+        self.disconnected = False
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
 
 
 def make_config() -> EngramConfig:
@@ -786,6 +796,71 @@ async def test_mcp_command_invalidates_session_for_immediate_effect(
     # rebuilds the SDK client with the new MCP set. Before the fix the
     # session would still be cached with the old client.
     assert router.session_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_new_session_command_rejects_non_owner_in_shared_channel(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".engram"
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.OWNER_SCOPED)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    slack = FakeSlackClient()
+
+    result = await handle_engram_command(
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+        source_channel_id="C07TEAM",
+        source_channel_name="growth",
+        user_id="U07NOTOWNER",
+        command_text="new",
+    )
+
+    assert result == {"ok": False, "error": "not authorized"}
+    assert slack.ephemeral_calls[-1]["text"] == (
+        "Only the owner can start a fresh conversation in this channel."
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_session_confirm_disconnects_and_posts_public_notice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    home = tmp_path / ".engram"
+    write_active_manifest(home, "C07TEAM", tier=PermissionTier.OWNER_SCOPED)
+    router = Router(home=home, owner_dm_channel_id="D07OWNER")
+    session = await router.get("C07TEAM", channel_name="growth", is_dm=False)
+    client = DisconnectableClient()
+    session.agent_client = client
+    session.agent_session_initialized = True
+    slack = FakeSlackClient()
+
+    result = await handle_new_session_action(
+        payload={
+            "actions": [
+                {
+                    "action_id": NEW_SESSION_CONFIRM_ACTION_ID,
+                    "value": '{"channel_id":"C07TEAM"}',
+                }
+            ],
+            "user": {"id": "U07OWNER"},
+        },
+        router=router,
+        config=make_config(),
+        slack_client=slack,
+    )
+
+    assert result["ok"] is True
+    assert client.disconnected is True
+    assert session.agent_client is None
+    assert session.agent_session_initialized is False
+    assert session.session_just_started is True
+    assert slack.post_calls[-1]["channel"] == "C07TEAM"
+    assert slack.post_calls[-1]["text"].startswith("🔄 Started a fresh conversation.")
+    assert "Tier: trusted" in slack.post_calls[-1]["text"]
 
 
 @pytest.mark.asyncio

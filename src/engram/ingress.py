@@ -32,6 +32,7 @@ from engram.egress import (
     _always_allow_label,
     _suggestion_label,
     build_footgun_confirmation_modal,
+    build_new_session_public_notice,
     post_question,
     post_reply,
     post_upgrade_result_in_channel,
@@ -89,6 +90,9 @@ UPGRADE_ACTION_ID_PATTERN = re.compile(
 )
 YOLO_EXTEND_ACTION_ID_PATTERN = re.compile(r"^yolo_extend_[A-Z0-9]+$")
 YOLO_REVOKE_ACTION_ID_PATTERN = re.compile(r"^yolo_revoke_[A-Z0-9]+$")
+NEW_SESSION_ACTION_ID_PATTERN = re.compile(r"^engram_new_session_(confirm|cancel)$")
+NEW_SESSION_CONFIRM_ACTION_ID = "engram_new_session_confirm"
+NEW_SESSION_CANCEL_ACTION_ID = "engram_new_session_cancel"
 FOOTGUN_CONFIRM_OPEN_ACTION_ID = "footgun_confirm_open"
 ACTION_ID_TIER_PICK_PREFIX = "engram_tier_pick"
 ACTION_ID_TIER_PICK = ACTION_ID_TIER_PICK_PREFIX
@@ -328,6 +332,27 @@ def register_listeners(
         task = asyncio.create_task(_run())
         _BACKGROUND_TASKS.add(task)
         task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    @app.action(NEW_SESSION_ACTION_ID_PATTERN)
+    async def on_new_session_action(ack, body, client, respond):
+        await ack()
+        try:
+            result = await handle_new_session_action(
+                payload=body,
+                router=router,
+                config=config,
+                slack_client=client,
+            )
+            response = result.get("response")
+            if response and respond is not None:
+                await respond(**response)
+            if not result.get("ok"):
+                log.warning(
+                    "ingress.new_session_action_failed error=%s",
+                    result.get("error", "unknown"),
+                )
+        except Exception:
+            log.exception("ingress.new_session_action_handler_failed")
 
     @app.action(TIER_PICK_ACTION_PATTERN)
     async def on_channels_tier_pick(ack, body, client, respond):
@@ -598,6 +623,11 @@ def register_listeners(
                 )
                 return
 
+        await _maybe_apply_cli_new_session_request(
+            session=session,
+            router=router,
+        )
+
         await _maybe_demote_expired_yolo(
             session=session,
             router=router,
@@ -628,6 +658,9 @@ def register_listeners(
             turn,
             thread_ts=thread_ts if not is_dm else None,
             session_label=session.label(),
+            session=session,
+            model=config.anthropic.model,
+            memory_db_path=(router.home / "memory.db") if router.home else None,
         )
 
         await _send_budget_warnings(
@@ -725,6 +758,23 @@ async def _maybe_demote_expired_yolo(
         demotion.channel_id,
         demotion.effective_tier,
     )
+
+
+async def _maybe_apply_cli_new_session_request(
+    *,
+    session,
+    router: Router,
+) -> None:
+    if router.home is None:
+        return
+    request_path = paths.new_session_request_path(session.channel_id, router.home)
+    if not request_path.exists():
+        return
+    try:
+        request_path.unlink()
+    except FileNotFoundError:
+        return
+    await router.start_new_conversation(session.channel_id)
 
 
 async def handle_block_action(payload: dict, router, slack_client) -> dict:
@@ -1008,6 +1058,7 @@ async def handle_engram_command(
             user_id=user_id,
             text=(
                 "Usage: /engram channels | /engram mcp | /engram include | /engram exclude "
+                "| /engram new "
                 "| /engram upgrade <tier> [reason...] "
                 "| /engram yolo <list|off|extend> ..."
             ),
@@ -1035,6 +1086,16 @@ async def handle_engram_command(
             user_id=user_id,
             eligible=(subcommand == "include"),
             target_text=target_text,
+        )
+
+    if subcommand == "new":
+        return await handle_new_session_command(
+            router=router,
+            config=config,
+            slack_client=slack_client,
+            source_channel_id=source_channel_id,
+            source_channel_name=source_channel_name,
+            user_id=user_id,
         )
 
     if subcommand == "upgrade":
@@ -1112,6 +1173,162 @@ async def handle_engram_command(
         text=f"Unknown /engram subcommand: {subcommand}",
     )
     return {"ok": False, "error": "unknown subcommand"}
+
+
+async def handle_new_session_command(
+    *,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+    source_channel_id: str,
+    source_channel_name: str | None,
+    user_id: str | None,
+) -> dict[str, object]:
+    session = await router.get(
+        source_channel_id,
+        channel_name=_channel_label_from_name(source_channel_name),
+        is_dm=source_channel_id.startswith("D"),
+    )
+    error = _new_session_authorization_error(
+        session=session,
+        config=config,
+        user_id=user_id,
+    )
+    if error is not None:
+        await _post_ephemeral_reply(
+            slack_client,
+            channel_id=source_channel_id,
+            user_id=user_id,
+            text=error,
+        )
+        return {"ok": False, "error": "not authorized"}
+
+    label = (
+        session.channel_name
+        or (session.manifest.label if session.manifest is not None else None)
+        or source_channel_name
+        or source_channel_id
+    )
+    text, blocks = build_new_session_confirmation_blocks(
+        channel_id=source_channel_id,
+        channel_label=label,
+    )
+    await _post_ephemeral_reply(
+        slack_client,
+        channel_id=source_channel_id,
+        user_id=user_id,
+        text=text,
+        blocks=blocks,
+    )
+    return {"ok": True}
+
+
+async def handle_new_session_action(
+    *,
+    payload: dict,
+    router: Router,
+    config: EngramConfig,
+    slack_client,
+) -> dict[str, object]:
+    actions = payload.get("actions") or []
+    if not actions:
+        return {"ok": False, "error": "no actions"}
+    action = actions[0]
+    action_id = str(action.get("action_id") or "")
+    channel_id = _decode_new_session_action_value(str(action.get("value") or ""))
+    if not channel_id:
+        return {"ok": False, "error": "malformed value"}
+
+    if action_id == NEW_SESSION_CANCEL_ACTION_ID:
+        return {
+            "ok": True,
+            "response": _replace_original_ephemeral(text="Canceled."),
+        }
+
+    clicker_user_id = (payload.get("user") or {}).get("id")
+    session = await router.get(channel_id, is_dm=channel_id.startswith("D"))
+    error = _new_session_authorization_error(
+        session=session,
+        config=config,
+        user_id=clicker_user_id,
+    )
+    if error is not None:
+        return {
+            "ok": False,
+            "error": "not authorized",
+            "response": _replace_original_ephemeral(text=error),
+        }
+
+    await router.start_new_conversation(channel_id)
+    await slack_client.chat_postMessage(
+        channel=channel_id,
+        text=await build_new_session_public_notice(
+            session,
+            memory_db_path=(router.home / "memory.db") if router.home else None,
+        ),
+    )
+    return {
+        "ok": True,
+        "response": _replace_original_ephemeral(
+            text="Fresh conversation will start on the next message."
+        ),
+    }
+
+
+def build_new_session_confirmation_blocks(
+    *,
+    channel_id: str,
+    channel_label: str,
+) -> tuple[str, list[dict[str, object]]]:
+    text = f"Start a new conversation in {channel_label}?"
+    return text, [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"{text}\n"
+                    "• Memory is preserved (semantic search across past sessions still works)\n"
+                    "• The current Claude CLI session ends; a fresh one starts on your next message\n"
+                    "• MCP servers and project config are reloaded"
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "block_id": f"engram_new_session:{channel_id}",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Start fresh"},
+                    "style": "primary",
+                    "value": _encode_new_session_action_value(channel_id),
+                    "action_id": NEW_SESSION_CONFIRM_ACTION_ID,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Cancel"},
+                    "value": _encode_new_session_action_value(channel_id),
+                    "action_id": NEW_SESSION_CANCEL_ACTION_ID,
+                },
+            ],
+        },
+    ]
+
+
+def _new_session_authorization_error(
+    *,
+    session,
+    config: EngramConfig,
+    user_id: str | None,
+) -> str | None:
+    if session.manifest is not None and session.manifest.status != ChannelStatus.ACTIVE:
+        return "This channel is not active yet."
+    if not config.owner_user_id:
+        return "Fresh-session reset is not configured yet. Ask the operator to set owner_user_id."
+    if user_id != config.owner_user_id:
+        return "Only the owner can start a fresh conversation in this channel."
+    return None
 
 
 async def handle_trust_command(
@@ -3176,6 +3393,15 @@ def _encode_upgrade_action_value(*, request_id: str, channel_id: str) -> str:
     return (
         f'{{"channel_id":"{channel_id}","request_id":"{request_id}"}}'
     )
+
+
+def _encode_new_session_action_value(channel_id: str) -> str:
+    return f'{{"channel_id":"{channel_id}"}}'
+
+
+def _decode_new_session_action_value(raw: str) -> str | None:
+    match = re.fullmatch(r'\{"channel_id":"(?P<channel_id>[A-Z0-9]+)"\}', raw)
+    return match.group("channel_id") if match is not None else None
 
 
 def _decode_upgrade_action_value(raw: str) -> dict[str, str] | None:

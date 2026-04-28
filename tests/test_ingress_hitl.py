@@ -16,6 +16,7 @@ from engram.ingress import (
     CHANNELS_PAGE_ACTION_PATTERN,
     FOOTGUN_CONFIRM_OPEN_ACTION_ID,
     HITL_ACTION_ID_PATTERN,
+    NEW_SESSION_ACTION_ID_PATTERN,
     NIGHTLY_TOGGLE_ACTION_PATTERN,
     TIER_PICK_ACTION_PATTERN,
     UPGRADE_ACTION_ID_PATTERN,
@@ -278,13 +279,14 @@ def test_register_listeners_attaches_hitl_action_handler():
 
     register_listeners(app, make_config(), Router(), agent=object())
 
-    assert len(app.actions) == 10
+    assert len(app.actions) == 11
     patterns = [pattern for pattern, _handler in app.actions]
     assert HITL_ACTION_ID_PATTERN in patterns
     assert PENDING_CHANNEL_ACTION_ID_PATTERN in patterns
     assert UPGRADE_ACTION_ID_PATTERN in patterns
     assert YOLO_EXTEND_ACTION_ID_PATTERN in patterns
     assert YOLO_REVOKE_ACTION_ID_PATTERN in patterns
+    assert NEW_SESSION_ACTION_ID_PATTERN in patterns
     assert TIER_PICK_ACTION_PATTERN in patterns
     assert YOLO_DURATION_ACTION_PATTERN in patterns
     assert NIGHTLY_TOGGLE_ACTION_PATTERN in patterns
@@ -306,6 +308,8 @@ def test_register_listeners_attaches_hitl_action_handler():
     assert UPGRADE_ACTION_ID_PATTERN.match("upgrade_decision_deny")
     assert YOLO_EXTEND_ACTION_ID_PATTERN.match("yolo_extend_C07TEST123")
     assert YOLO_REVOKE_ACTION_ID_PATTERN.match("yolo_revoke_C07TEST123")
+    assert NEW_SESSION_ACTION_ID_PATTERN.match("engram_new_session_confirm")
+    assert NEW_SESSION_ACTION_ID_PATTERN.match("engram_new_session_cancel")
     assert TIER_PICK_ACTION_PATTERN.match("engram_tier_pick")
     assert TIER_PICK_ACTION_PATTERN.match("engram_tier_pick:trusted:C07TEST123")
     assert YOLO_DURATION_ACTION_PATTERN.match("engram_yolo_duration")
