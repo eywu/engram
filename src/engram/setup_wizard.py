@@ -12,11 +12,16 @@ Walks the user through first-time configuration:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import sys
+import urllib.error
+import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from textwrap import dedent
+from typing import Any
 
 import yaml
 from rich import print as rprint
@@ -45,6 +50,7 @@ from engram.mcp_onboarding import sync_team_channel_mcp_allow_lists
 from engram.mcp_trust import resolve_mcp_server_trust
 
 console = Console()
+SLACK_AUTH_TEST_URL = "https://slack.com/api/auth.test"
 
 SLACK_APP_MANIFEST = dedent(
     """\
@@ -160,7 +166,9 @@ def _step_claude_cli() -> None:
             sys.exit(1)
 
 
-def _step_slack() -> dict[str, str]:
+def _step_slack(
+    requester: Callable[..., tuple[int, dict[str, Any]]] | None = None,
+) -> dict[str, str]:
     rprint("[bold]Step 2 — Slack App[/bold]")
     rprint("Engram needs its own Slack app (Socket Mode + Bot User).")
     rprint()
@@ -189,7 +197,19 @@ def _step_slack() -> dict[str, str]:
     ).strip()
     if not app_token.startswith("xapp-"):
         rprint("  [yellow]⚠[/yellow] expected prefix 'xapp-' — double-check this token.")
-    return {"bot_token": bot_token, "app_token": app_token}
+    workspace = _validate_slack_workspace(bot_token, requester=requester)
+    team_name = workspace.get("team_name")
+    team_id = workspace.get("team_id")
+    workspace_url = workspace.get("workspace_url")
+    if team_id and team_name:
+        rprint(f"  [green]✓[/green] Connected to [bold]{team_name}[/bold] ({team_id})")
+    elif team_id:
+        rprint(f"  [green]✓[/green] Connected to workspace {team_id}")
+    # else: _validate_slack_workspace already printed a yellow warning
+    # explaining that workspace metadata could not be captured.
+    if workspace_url:
+        rprint(f"    Workspace URL: {workspace_url}")
+    return {"bot_token": bot_token, "app_token": app_token} | workspace
 
 
 def _write_manifest_tempfile() -> Path:
@@ -296,11 +316,16 @@ def _write_config(
     rprint("[bold]Step 6 — Write Config[/bold]")
     DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+    slack_config: dict[str, str] = {
+        "bot_token": slack["bot_token"],
+        "app_token": slack["app_token"],
+    }
+    for key in ("team_id", "team_name", "workspace_url"):
+        if value := slack.get(key):
+            slack_config[key] = value
+
     config: dict = {
-        "slack": {
-            "bot_token": slack["bot_token"],
-            "app_token": slack["app_token"],
-        },
+        "slack": slack_config,
         "anthropic": {
             "api_key": anthropic_key,
             "model": "claude-sonnet-4-6",
@@ -322,6 +347,131 @@ def _write_config(
     # Tight permissions — secrets live here.
     DEFAULT_CONFIG_PATH.chmod(0o600)
     rprint(f"  [green]✓[/green] wrote {DEFAULT_CONFIG_PATH} (mode 600)")
+
+
+def _validate_slack_workspace(
+    bot_token: str,
+    *,
+    requester: Callable[..., tuple[int, dict[str, Any]]] | None = None,
+) -> dict[str, str]:
+    """Best-effort enrichment of Slack workspace metadata at setup time.
+
+    GRO-475 blocker 2: a transient Slack failure (HTTP error, timeout, 503,
+    or missing team_id) must NOT terminate the wizard. The point of capturing
+    team_id at setup is opportunistic enrichment so doctor can verify later —
+    if Slack is temporarily unavailable, the user should still be able to
+    finish setup. Only hard-exit if Slack explicitly rejects the bot token
+    (`ok=false` with a clear auth error like invalid_auth / token_revoked /
+    not_authed), since that means the token will never work.
+    """
+    request = requester or _post_json
+    try:
+        status_code, payload = request(
+            SLACK_AUTH_TEST_URL,
+            headers={
+                "Authorization": f"Bearer {bot_token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            payload={},
+        )
+    except Exception as exc:
+        # Transient transport failure — warn and continue. Doctor will
+        # verify on next run when Slack is reachable again.
+        rprint(
+            "  [yellow]⚠[/yellow] Slack auth.test could not be reached "
+            f"({type(exc).__name__}: {exc}). Continuing without workspace "
+            "metadata; run `engram doctor` after setup completes to verify."
+        )
+        return {}
+
+    if status_code != 200:
+        slack_error = _optional_string(payload.get("error"))
+        suffix = f" ({slack_error})" if slack_error else ""
+        rprint(
+            f"  [yellow]⚠[/yellow] Slack auth.test returned HTTP {status_code}{suffix}; "
+            "continuing without workspace metadata. Run `engram doctor` after setup "
+            "completes to verify."
+        )
+        return {}
+
+    if not payload.get("ok"):
+        error = _optional_string(payload.get("error")) or "unknown_error"
+        # These errors mean the token will never work — hard-exit so the
+        # user fixes it before continuing setup.
+        auth_hard_fail = {
+            "invalid_auth",
+            "token_revoked",
+            "token_expired",
+            "not_authed",
+            "account_inactive",
+        }
+        if error in auth_hard_fail:
+            rprint(f"  [red]✗[/red] Slack bot token rejected by auth.test: {error}.")
+            sys.exit(1)
+        # Other ok=false reasons (rate_limited, fatal_error, internal_error)
+        # are transient — warn and continue.
+        rprint(
+            f"  [yellow]⚠[/yellow] Slack auth.test returned ok=false ({error}); "
+            "this looks transient. Continuing without workspace metadata. "
+            "Run `engram doctor` after setup completes to verify."
+        )
+        return {}
+
+    team_id = _optional_string(payload.get("team_id"))
+    if not team_id:
+        # auth.test succeeded but no team_id — unusual, but not fatal.
+        # The token works, doctor will verify the rest later.
+        rprint(
+            "  [yellow]⚠[/yellow] Slack auth.test succeeded but did not "
+            "return a team_id; continuing without workspace metadata. "
+            "Run `engram doctor` after setup completes to verify."
+        )
+        return {}
+
+    workspace = {"team_id": team_id}
+    if team_name := _optional_string(payload.get("team")):
+        workspace["team_name"] = team_name
+    if workspace_url := _optional_string(payload.get("url")):
+        workspace["workspace_url"] = workspace_url
+    return workspace
+
+
+def _post_json(
+    url: str,
+    *,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float = 3.0,
+) -> tuple[int, dict[str, Any]]:
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            text = response.read().decode("utf-8", errors="replace")
+            return response.status, _parse_json_payload(text)
+    except urllib.error.HTTPError as exc:
+        text = exc.read().decode("utf-8", errors="replace")
+        return exc.code, _parse_json_payload(text)
+
+
+def _parse_json_payload(text: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _step_launchd_sync(*, anthropic_key: str, gemini_key: str | None) -> None:

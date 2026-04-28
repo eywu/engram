@@ -16,11 +16,13 @@ def clean_env(monkeypatch):
         "ENGRAM_SLACK_BOT_TOKEN",
         "ENGRAM_SLACK_APP_TOKEN",
         "ENGRAM_SLACK_SIGNING_SECRET",
+        "ENGRAM_SLACK_TEAM_ID",
         "ENGRAM_ANTHROPIC_API_KEY",
         "ENGRAM_MODEL",
         "SLACK_BOT_TOKEN",
         "SLACK_APP_TOKEN",
         "SLACK_SIGNING_SECRET",
+        "SLACK_TEAM_ID",
         "ANTHROPIC_API_KEY",
         "GEMINI_API_KEY",
     ):
@@ -57,7 +59,13 @@ def test_load_from_yaml(tmp_path, clean_env):
     path = _write_yaml(
         tmp_path,
         {
-            "slack": {"bot_token": "xoxb-file", "app_token": "xapp-file"},
+            "slack": {
+                "bot_token": "xoxb-file",
+                "app_token": "xapp-file",
+                "team_id": "T02G507JU",
+                "team_name": "Growth Gauge",
+                "workspace_url": "https://growthgauge.slack.com/",
+            },
             "anthropic": {"api_key": "sk-ant-file", "model": "claude-sonnet-4-6"},
             "allowed_channels": ["C123"],
             "max_turns_per_message": 5,
@@ -76,6 +84,9 @@ def test_load_from_yaml(tmp_path, clean_env):
     cfg = EngramConfig.load(path)
     assert cfg.slack.bot_token == "xoxb-file"
     assert cfg.slack.app_token == "xapp-file"
+    assert cfg.slack.team_id == "T02G507JU"
+    assert cfg.slack.team_name == "Growth Gauge"
+    assert cfg.slack.workspace_url == "https://growthgauge.slack.com/"
     assert cfg.anthropic.api_key == "sk-ant-file"
     assert cfg.anthropic.model == "claude-sonnet-4-6"
     assert cfg.allowed_channels == ["C123"]
@@ -121,11 +132,13 @@ def test_load_nightly_config_does_not_require_runtime_secrets(tmp_path, clean_en
 def test_env_fallback(tmp_path, clean_env, monkeypatch):
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-env")
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-env")
+    monkeypatch.setenv("SLACK_TEAM_ID", "T02ENV123")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env")
     path = tmp_path / "empty.yaml"  # doesn't exist
     cfg = EngramConfig.load(path)
     assert cfg.slack.bot_token == "xoxb-env"
     assert cfg.slack.app_token == "xapp-env"
+    assert cfg.slack.team_id == "T02ENV123"
     assert cfg.anthropic.api_key == "sk-ant-env"
 
 
