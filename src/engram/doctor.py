@@ -1123,15 +1123,17 @@ def check_launchd_nightly_env_file(*, home: Path | None = None) -> DoctorCheck:
     installed_path = (home or Path.home()) / "Library" / "LaunchAgents" / "com.engram.v3.nightly.plist"
     details = {"installed_path": str(installed_path)}
     if not installed_path.exists():
+        # GRO-572: don't double-warn when the user has intentionally skipped
+        # nightly install. The `launchd_nightly` check (run earlier with
+        # optional=True) already emits the canonical "not installed" WARN.
+        # The env-file check only adds signal when the plist *does* exist
+        # but its ENGRAM_ENV_FILE is misconfigured (the GRO-563 case).
         return DoctorCheck(
             id="launchd_nightly_env_file",
             name="launchd nightly env file",
-            status=CheckStatus.WARN,
-            message=(
-                f"{installed_path} is missing; run `./scripts/install_launchd.sh --install-nightly` "
-                "to install the current nightly plist."
-            ),
-            details=details,
+            status=CheckStatus.PASS,
+            message="launchd nightly plist is not installed; env-file check skipped.",
+            details=details | {"skipped": "plist_not_installed"},
         )
 
     try:
