@@ -173,7 +173,10 @@ def test_check_mcp_commands_on_bridge_path_fails_when_npx_is_missing_from_bridge
             sort_keys=False,
         )
 
-    check = check_mcp_commands_on_bridge_path(home=tmp_path)
+    check = check_mcp_commands_on_bridge_path(
+        home=tmp_path,
+        command_resolver=lambda _command, _bridge_path: None,
+    )
 
     assert check.status == CheckStatus.FAIL
     assert "camoufox -> npx" in check.message

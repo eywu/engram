@@ -482,6 +482,10 @@ def test_install_launchd_bridge_fails_when_npx_mcp_has_no_reachable_node_runtime
         ),
         encoding="utf-8",
     )
+    no_node_shell = tmp_path / "no-node-shell"
+    no_node_shell.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    no_node_shell.chmod(0o755)
+    env["SHELL"] = str(no_node_shell)
 
     result = subprocess.run(
         [str(script)],
