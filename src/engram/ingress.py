@@ -779,14 +779,17 @@ async def _maybe_apply_cli_new_session_request(
 
 
 def _slack_payload_user_id(payload: SlackInteractivePayload) -> str | None:
-    user_id = payload["user"]["id"]
-    return user_id or None
+    user = payload.get("user")
+    if not user:
+        return None
+    return user.get("id") or None
 
 
 def _slack_payload_channel_id(payload: SlackInteractivePayload) -> str:
-    if "channel" not in payload:
+    channel = payload.get("channel")
+    if not channel:
         return ""
-    return payload["channel"]["id"]
+    return channel.get("id") or ""
 
 
 def _slack_payload_view(payload: SlackInteractivePayload) -> SlackView:
