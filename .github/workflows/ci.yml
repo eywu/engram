@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run ruff
+        run: uv run ruff check src tests scripts
+
+      - name: Run mypy
+        run: uv run mypy src/engram
+
+      - name: Prepare pytest environment
+        run: |
+          for binary in /opt/homebrew/bin/npx /usr/local/bin/npx /usr/bin/npx /bin/npx /usr/sbin/npx /sbin/npx; do
+            if [ -e "$binary" ]; then
+              sudo mv "$binary" "$binary.disabled"
+            fi
+          done
+          cat > "$HOME/.claude.json" <<'JSON'
+          {"mcpServers":{"camoufox":{"command":"uvx","args":["camoufox-browser[mcp]==0.1.1"]}}}
+          JSON
+
+      - name: Run pytest
+        run: uv run pytest
