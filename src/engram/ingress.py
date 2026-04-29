@@ -24,6 +24,7 @@ from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from slack_bolt.async_app import AsyncApp
 
 from engram import paths
+from engram._slack_types import SlackBlockAction, SlackInteractivePayload, SlackView
 from engram.agent import Agent
 from engram.config import EngramConfig
 from engram.costs import CostLedger, TurnCost
@@ -777,7 +778,26 @@ async def _maybe_apply_cli_new_session_request(
     await router.start_new_conversation(session.channel_id)
 
 
-async def handle_block_action(payload: dict, router, slack_client) -> dict:
+def _slack_payload_user_id(payload: SlackInteractivePayload) -> str | None:
+    user_id = payload["user"]["id"]
+    return user_id or None
+
+
+def _slack_payload_channel_id(payload: SlackInteractivePayload) -> str:
+    if "channel" not in payload:
+        return ""
+    return payload["channel"]["id"]
+
+
+def _slack_payload_view(payload: SlackInteractivePayload) -> SlackView:
+    if "view" not in payload:
+        return {}
+    return payload["view"]
+
+
+async def handle_block_action(
+    payload: SlackInteractivePayload, router, slack_client
+) -> dict:
     """Handle Slack block_actions event. Must return ACK within 3 seconds."""
     actions = payload.get("actions") or []
     if not actions:
@@ -797,7 +817,7 @@ async def handle_block_action(payload: dict, router, slack_client) -> dict:
     if q.future.done():
         return {"ok": True, "info": "already resolved"}
 
-    clicker_user_id = payload.get("user", {}).get("id")
+    clicker_user_id = _slack_payload_user_id(payload)
     if q.who_can_answer and clicker_user_id != q.who_can_answer:
         return {"ok": False, "error": "not authorized"}
 
@@ -815,7 +835,9 @@ async def handle_block_action(payload: dict, router, slack_client) -> dict:
     return {"ok": True}
 
 
-async def handle_footgun_confirm_open(payload: dict, router, slack_client) -> dict:
+async def handle_footgun_confirm_open(
+    payload: SlackInteractivePayload, router, slack_client
+) -> dict:
     """Open the type-to-confirm modal for a pending footgun question."""
     actions = payload.get("actions") or []
     if not actions:
@@ -833,7 +855,7 @@ async def handle_footgun_confirm_open(payload: dict, router, slack_client) -> di
     if q.footgun_match is None:
         return {"ok": False, "error": "question is not a footgun confirmation"}
 
-    clicker_user_id = payload.get("user", {}).get("id")
+    clicker_user_id = _slack_payload_user_id(payload)
     if q.who_can_answer and clicker_user_id != q.who_can_answer:
         with contextlib.suppress(Exception):
             await slack_client.chat_postEphemeral(
@@ -854,9 +876,11 @@ async def handle_footgun_confirm_open(payload: dict, router, slack_client) -> di
     return {"ok": True}
 
 
-async def handle_footgun_confirm_submit(payload: dict, router, slack_client) -> dict:
+async def handle_footgun_confirm_submit(
+    payload: SlackInteractivePayload, router, slack_client
+) -> dict:
     """Resolve a pending footgun confirmation from modal submission."""
-    view = payload.get("view") or {}
+    view = _slack_payload_view(payload)
     permission_request_id = str(view.get("private_metadata") or "").strip()
     if not permission_request_id:
         return {"ok": False, "error": "missing permission request id"}
@@ -869,7 +893,7 @@ async def handle_footgun_confirm_submit(payload: dict, router, slack_client) -> 
     if q.footgun_match is None:
         return {"ok": False, "error": "question is not a footgun confirmation"}
 
-    submitter_user_id = payload.get("user", {}).get("id")
+    submitter_user_id = _slack_payload_user_id(payload)
     if q.who_can_answer and submitter_user_id != q.who_can_answer:
         return {"ok": False, "error": "not authorized"}
 
@@ -886,9 +910,11 @@ async def handle_footgun_confirm_submit(payload: dict, router, slack_client) -> 
     return {"ok": True}
 
 
-async def handle_footgun_confirm_closed(payload: dict, router, slack_client) -> dict:
+async def handle_footgun_confirm_closed(
+    payload: SlackInteractivePayload, router, slack_client
+) -> dict:
     """Resolve a pending footgun confirmation when the modal is cancelled."""
-    view = payload.get("view") or {}
+    view = _slack_payload_view(payload)
     permission_request_id = str(view.get("private_metadata") or "").strip()
     if not permission_request_id:
         return {"ok": False, "error": "missing permission request id"}
@@ -901,7 +927,7 @@ async def handle_footgun_confirm_closed(payload: dict, router, slack_client) -> 
     if q.footgun_match is None:
         return {"ok": False, "error": "question is not a footgun confirmation"}
 
-    closer_user_id = payload.get("user", {}).get("id")
+    closer_user_id = _slack_payload_user_id(payload)
     if q.who_can_answer and closer_user_id != q.who_can_answer:
         return {"ok": False, "error": "not authorized"}
 
@@ -1225,7 +1251,7 @@ async def handle_new_session_command(
 
 async def handle_new_session_action(
     *,
-    payload: dict,
+    payload: SlackInteractivePayload,
     router: Router,
     config: EngramConfig,
     slack_client,
@@ -1245,7 +1271,7 @@ async def handle_new_session_action(
             "response": _replace_original_ephemeral(text="Canceled."),
         }
 
-    clicker_user_id = (payload.get("user") or {}).get("id")
+    clicker_user_id = _slack_payload_user_id(payload)
     session = await router.get(channel_id, is_dm=channel_id.startswith("D"))
     error = _new_session_authorization_error(
         session=session,
@@ -1444,7 +1470,7 @@ async def handle_channels_command(
 
 async def handle_channels_dashboard_action(
     *,
-    payload: dict[str, object],
+    payload: SlackInteractivePayload,
     router: Router,
     config: EngramConfig,
     slack_client,
@@ -1454,8 +1480,8 @@ async def handle_channels_dashboard_action(
         return {"ok": False, "error": "no actions"}
 
     owner_dm_channel_id = config.owner_dm_channel_id or router.owner_dm_channel_id
-    source_channel_id = str(payload.get("channel", {}).get("id") or "")
-    clicker_user_id = str(payload.get("user", {}).get("id") or "") or None
+    source_channel_id = _slack_payload_channel_id(payload)
+    clicker_user_id = _slack_payload_user_id(payload)
     if not owner_dm_channel_id or source_channel_id != owner_dm_channel_id:
         text = (
             "Channel dashboard is DM-only. "
@@ -2156,7 +2182,7 @@ async def handle_upgrade_picker_command(
 
 async def handle_tier_pick_action(
     *,
-    payload: dict[str, object],
+    payload: SlackInteractivePayload,
     router: Router,
     config: EngramConfig,
     slack_client,
@@ -2177,7 +2203,7 @@ async def handle_tier_pick_action(
     if not block_id.startswith(UPGRADE_PICKER_BLOCK_ID_PREFIX):
         return {"ok": False, "error": "unsupported action"}
 
-    clicker_user_id = str(payload.get("user", {}).get("id") or "") or None
+    clicker_user_id = _slack_payload_user_id(payload)
     parsed = _decode_upgrade_picker_value(str(action.get("value") or ""))
     if parsed is None:
         return {
@@ -2275,7 +2301,7 @@ async def handle_tier_pick_action(
 
 async def handle_upgrade_action(
     *,
-    payload: dict[str, object],
+    payload: SlackInteractivePayload,
     router: Router,
     slack_client,
     owner_user_id: str | None,
@@ -2289,11 +2315,12 @@ async def handle_upgrade_action(
     if not UPGRADE_ACTION_ID_PATTERN.match(action_id):
         return {"ok": False, "error": "unsupported action"}
 
-    clicker_user_id = payload.get("user", {}).get("id")
+    clicker_user_id = _slack_payload_user_id(payload)
+    payload_channel_id = _slack_payload_channel_id(payload)
     if not owner_user_id:
         await _post_ephemeral_reply(
             slack_client,
-            channel_id=str(payload.get("channel", {}).get("id") or ""),
+            channel_id=payload_channel_id,
             user_id=clicker_user_id,
             text="Upgrade approvals are not configured.",
         )
@@ -2301,7 +2328,7 @@ async def handle_upgrade_action(
     if clicker_user_id != owner_user_id:
         await _post_ephemeral_reply(
             slack_client,
-            channel_id=str(payload.get("channel", {}).get("id") or ""),
+            channel_id=payload_channel_id,
             user_id=clicker_user_id,
             text="Only the owner can approve upgrades.",
         )
@@ -2314,7 +2341,7 @@ async def handle_upgrade_action(
     request = _PENDING_UPGRADE_REQUESTS.get(request_ref["request_id"])
     if request is None:
         return {"ok": False, "error": "request not found"}
-    if request.owner_dm_channel_id != payload.get("channel", {}).get("id"):
+    if request.owner_dm_channel_id != payload_channel_id:
         return {"ok": False, "error": "wrong surface"}
     if (
         _PENDING_UPGRADE_REQUESTS_BY_CHANNEL.get(request.source_channel_id)
@@ -2401,7 +2428,7 @@ async def handle_upgrade_action(
 
 async def handle_yolo_action(
     *,
-    payload: dict[str, object],
+    payload: SlackInteractivePayload,
     router: Router,
     config: EngramConfig,
     slack_client,
@@ -2421,8 +2448,8 @@ async def handle_yolo_action(
     if not expected_pattern.match(action_id):
         return {"ok": False, "error": "unsupported action"}
 
-    clicker_user_id = str(payload.get("user", {}).get("id") or "") or None
-    source_channel_id = str(payload.get("channel", {}).get("id") or "")
+    clicker_user_id = _slack_payload_user_id(payload)
+    source_channel_id = _slack_payload_channel_id(payload)
     if not _is_owner_user(config=config, user_id=clicker_user_id):
         await _post_ephemeral_reply(
             slack_client,
@@ -2475,7 +2502,7 @@ async def handle_yolo_action(
 
 async def handle_yolo_duration_action(
     *,
-    payload: dict[str, object],
+    payload: SlackInteractivePayload,
     router: Router,
     config: EngramConfig,
     slack_client,
@@ -2489,7 +2516,7 @@ async def handle_yolo_duration_action(
     if not YOLO_DURATION_ACTION_PATTERN.match(action_id):
         return {"ok": False, "error": "unsupported action"}
 
-    clicker_user_id = str(payload.get("user", {}).get("id") or "") or None
+    clicker_user_id = _slack_payload_user_id(payload)
     if not _is_owner_user(config=config, user_id=clicker_user_id):
         return {
             "ok": False,
@@ -3354,7 +3381,7 @@ def _channels_dashboard_block_id(*, page: int, channel_id: str | None) -> str:
     return f"engram_channels:{page}:{kind}"
 
 
-def _channels_dashboard_page_from_action(action: dict[str, object]) -> int:
+def _channels_dashboard_page_from_action(action: SlackBlockAction) -> int:
     block_id = str(action.get("block_id") or "")
     match = CHANNELS_DASHBOARD_BLOCK_ID_PATTERN.match(block_id)
     if match is None:
@@ -4038,7 +4065,7 @@ async def _resolve_block_action(
         log.exception("resolve_block_action failed")
 
 
-def _footgun_confirmation_value(view: dict) -> str:
+def _footgun_confirmation_value(view: SlackView) -> str:
     state_values = view.get("state", {}).get("values", {})
     input_block = state_values.get("footgun_confirm_input", {})
     input_value = input_block.get("confirmation_text", {}).get("value")
