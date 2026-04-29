@@ -312,8 +312,10 @@ async def test_owner_tier_pick_updates_manifest_and_posts_public_notice(
 @pytest.mark.asyncio
 async def test_mcp_list_command_renders_effective_servers(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / ".engram"
+    monkeypatch.setenv("HOME", str(tmp_path))
     write_mcp_inventory(
         tmp_path,
         {

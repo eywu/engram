@@ -229,6 +229,7 @@ def check_mcp_commands_on_bridge_path(
     home: Path | None = None,
     configured_servers: dict[str, dict[str, Any]] | None = None,
     plist_loader: Callable[[Path], dict[str, Any]] | None = None,
+    command_resolver: Callable[[str, str], str | None] | None = None,
 ) -> DoctorCheck:
     base_home = (home or Path.home()).expanduser()
     inventory_path = base_home / ".claude.json"
@@ -294,7 +295,7 @@ def check_mcp_commands_on_bridge_path(
         command = _mcp_server_command(servers[name])
         if not command:
             continue
-        resolved = _resolve_command_on_bridge_path(command, bridge_path)
+        resolved = (command_resolver or _resolve_command_on_bridge_path)(command, bridge_path)
         checked.append(
             {
                 "server": name,

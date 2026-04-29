@@ -482,6 +482,10 @@ def test_install_launchd_bridge_fails_when_npx_mcp_has_no_reachable_node_runtime
         ),
         encoding="utf-8",
     )
+    no_node_shell = tmp_path / "no-node-shell"
+    no_node_shell.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    no_node_shell.chmod(0o755)
+    env["SHELL"] = str(no_node_shell)
 
     result = subprocess.run(
         [str(script)],
@@ -584,6 +588,13 @@ def _bridge_install_fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str,
     for binary in (uv, grep, launchctl, fake_shell):
         binary.chmod(0o755)
 
+    # Hermetic bridge path: isolate the install script from host filesystem state
+    # (e.g., CI runners that pre-install npx at /usr/bin/npx, which would defeat
+    # the npx-missing assertions). Tests that need node-on-bridge-path supply it
+    # via PATH or NVM_DIR rather than through DEFAULT_BRIDGE_PATH.
+    clean_bridge = tmp_path / "clean-bridge-bin"
+    clean_bridge.mkdir()
+
     base_env = {key: value for key, value in os.environ.items() if key != "NVM_DIR"}
     env = {
         **base_env,
@@ -592,5 +603,6 @@ def _bridge_install_fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str,
         "SHELL": str(fake_shell),
         "LAUNCHCTL_CALLS": str(calls),
         "LAUNCHCTL_STATE": str(state),
+        "ENGRAM_BRIDGE_PATH_OVERRIDE": str(clean_bridge),
     }
     return script, repo_root, home, env

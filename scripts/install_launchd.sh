@@ -22,7 +22,10 @@ READY_LOG="/tmp/engram.bridge.out.log"
 NIGHTLY_PLIST_SRC="$REPO_ROOT/launchd/com.engram.v3.nightly.plist"
 NIGHTLY_PLIST_DST="$HOME/Library/LaunchAgents/com.engram.v3.nightly.plist"
 NIGHTLY_SERVICE_LABEL="com.engram.v3.nightly"
-DEFAULT_BRIDGE_PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# Test-only override hook. Real users should never set ENGRAM_BRIDGE_PATH_OVERRIDE;
+# it exists so smoketests can isolate the script from host filesystem state
+# (e.g., CI runners that pre-install npx at /usr/bin/npx). See tests/README.md.
+DEFAULT_BRIDGE_PATH="${ENGRAM_BRIDGE_PATH_OVERRIDE:-$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
 
 MODE="bridge"
 case "${1:-}" in
