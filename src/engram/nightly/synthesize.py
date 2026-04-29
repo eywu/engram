@@ -335,7 +335,7 @@ def build_nightly_options(
     runtime: AnthropicRuntime,
     hitl_config: HITLConfig,
     config: NightlyConfig,
-) -> ClaudeAgentOptions:
+) -> EngramAgentOptions:
     mcp_servers = {
         MEMORY_SEARCH_SERVER_NAME: make_memory_search_server(
             plan.channel_id or NIGHTLY_CHANNEL_ID,
