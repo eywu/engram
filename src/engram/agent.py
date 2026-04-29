@@ -89,6 +89,7 @@ from engram.mcp_trust import (
     resolve_mcp_server_trust,
 )
 from engram.memory_hooks import make_memory_hooks_with_embeddings
+from engram.options import EngramAgentOptions
 from engram.router import Router, SessionState
 from engram.scope import build_scope_decision, build_tool_guard
 from engram.telemetry import cli_stderr_logger
@@ -763,7 +764,7 @@ class Agent:
         session: SessionState,
         *,
         resume: bool = False,
-    ) -> ClaudeAgentOptions:
+    ) -> EngramAgentOptions:
         """Build ClaudeAgentOptions from config + (optional) channel manifest."""
         manifest = session.manifest
 
@@ -1030,7 +1031,7 @@ class Agent:
             )
 
         if resume:
-            options = ClaudeAgentOptions(
+            options = EngramAgentOptions(
                 # Identity & discovery
                 setting_sources=setting_sources,
                 cwd=str(session.cwd) if session.cwd else None,
@@ -1050,9 +1051,10 @@ class Agent:
                 max_budget_usd=self._max_budget_usd_for_options(),
                 hooks=self._build_hooks(session),
                 stderr=cli_stderr_logger(session.channel_id),
+                strict_mcp_config=strict_mcp_config,
             )
         else:
-            options = ClaudeAgentOptions(
+            options = EngramAgentOptions(
                 # Identity & discovery
                 setting_sources=setting_sources,
                 cwd=str(session.cwd) if session.cwd else None,
@@ -1072,10 +1074,8 @@ class Agent:
                 max_budget_usd=self._max_budget_usd_for_options(),
                 hooks=self._build_hooks(session),
                 stderr=cli_stderr_logger(session.channel_id),
+                strict_mcp_config=strict_mcp_config,
             )
-        # SDK 0.1.x exposes --strict-mcp-config through extra_args. Keep a
-        # plain attribute so diagnostics and tests can inspect the policy.
-        options.strict_mcp_config = strict_mcp_config
         return options
 
     def _build_hooks(self, session: SessionState) -> dict[HookEvent, list[HookMatcher]]:
