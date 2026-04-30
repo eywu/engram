@@ -1,0 +1,67 @@
+# Compatibility copy for historical callers that still reference this path.
+# Keep in sync with `safe.yaml`.
+
+channel_id: "{{channel_id}}"
+identity: task-assistant
+label: "{{channel_label}}"
+status: pending        # operator must approve before bot responds
+nightly_included: false
+permission_tier: safe
+
+# Team channels use project-level priming, NOT user-level.
+# Prevents the operator's personal MCPs / settings from leaking into a
+# shared channel.
+setting_sources: [project]
+
+# Exclude write-side and shell tools by default. Team channels shouldn't
+# get a shell unless the operator explicitly grants one.
+tools:
+  disallowed:
+    - Bash
+    - BashOutput
+    - KillShell
+    - Write
+    - Edit
+    - NotebookEdit
+
+# Team channels must explicitly list privileged MCPs. Engram's own memory
+# search is a base capability; remove it here and add it to `disallowed` only
+# when a channel should not recall stored conversation history.
+# To grant one, add the server name here and define its config in
+# ~/.claude.json under `mcpServers`.
+mcp_servers:
+  allowed:
+    - engram-memory
+
+# Skills: inherit all by default. Exclude per-channel as needed.
+skills: {}
+
+# Permission rules and HITL max_per_day are tier-derived in code from
+# `_TIER_DEFAULTS`. Keep per-channel overrides here only when deviating from
+# the safe baseline.
+
+behavior:
+  style: concise
+  permission_mode: default
+  max_turns: 6
+
+cost_budget:
+  warn_at_percent: 80
+  # daily_usd: 2.0
+  # monthly_usd: 30.0
+
+hitl:
+  enabled: true
+  timeout_s: 300
+
+nightly:
+  model: sonnet
+
+memory:
+  # Channel IDs listed here are hidden from memory_search in every scope.
+  # M5.6 will populate this for OQ31 opt-outs; empty is valid.
+  excluded_channels: []
+
+ask_user_question:
+  enabled: true
+  fallback: escalate-to-owner

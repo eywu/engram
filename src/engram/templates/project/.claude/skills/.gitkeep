@@ -1,0 +1,9 @@
+# Skills go here.
+#
+# Each subdirectory becomes a skill: `<skill-name>/SKILL.md` plus any
+# supporting scripts/references. Every channel inherits all skills in this
+# directory by default; channels can exclude specific skills via their
+# manifest's `skills.disallowed` list.
+#
+# See Claude Code's skill conventions:
+#   https://docs.claude.com/claude-code/skills

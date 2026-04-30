@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+        "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Engram V3 nightly memory pipeline.
+
+  Install:
+    scripts/install_launchd.sh with the install-nightly option
+
+  Manual run:
+    launchctl kickstart gui/$(id -u)/com.engram.v3.nightly
+
+  Logs:
+    tail -f ~/.engram/logs/nightly-stdio-$(date +%F).log
+
+  launchd requires static StandardOutPath and StandardErrorPath values. The
+  wrapper redirects the actual nightly command to the dated stdio log above
+  and adds weekly mode on Mondays.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.engram.v3.nightly</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/engram/scripts/engram_nightly_launchd.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/engram-repo</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Keep in sync with the smoke-test launchd env. HOME is explicit so
+             ~/.engram resolves the same way under launchd and a login shell. -->
+        <key>PATH</key>
+        <string>/REPLACE/WITH/OPTIONAL/NODE/PATH/PREFIX//REPLACE/WITH/HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/REPLACE/WITH/HOME</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+        <key>ENGRAM_ENV_FILE</key>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/engram.env</string>
+        <key>ENGRAM_REPO_ROOT</key>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/engram-repo</string>
+        <key>ENGRAM_UV_BIN</key>
+        <string>/REPLACE/WITH/ABSOLUTE/PATH/TO/uv</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>2</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/REPLACE/WITH/HOME/.engram/logs/nightly-stdio-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/REPLACE/WITH/HOME/.engram/logs/nightly-stdio-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

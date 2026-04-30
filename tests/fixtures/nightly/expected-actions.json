@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "date": "2026-04-22",
+  "channel_id": "C07WORK999",
+  "summary": "The channel settled on one repair retry and identified test coverage plus a weekly-schema follow-up.",
+  "highlights": [],
+  "decisions": [
+    {
+      "text": "Keep the repair retry limit to one attempt.",
+      "source_row_ids": [10]
+    }
+  ],
+  "action_items": [
+    {
+      "text": "Add mocked SDK coverage for malformed-then-valid synthesis responses.",
+      "owner": null,
+      "source_row_ids": [11]
+    }
+  ],
+  "open_questions": [
+    {
+      "text": "Should weekly synthesis reuse the same schema?",
+      "source_row_ids": [12]
+    }
+  ],
+  "cross_channel_flags": [],
+  "source_row_ids": [10, 11, 12]
+}

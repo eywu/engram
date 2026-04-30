@@ -1,0 +1,7 @@
+channel_id: C07LEGACY
+identity: task-assistant
+label: "#legacy"
+status: active
+permission_tier: task-assistant
+pre_yolo_tier: owner-scoped
+setting_sources: [project]

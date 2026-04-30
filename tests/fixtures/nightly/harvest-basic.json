@@ -1,0 +1,37 @@
+{
+  "date": "2026-04-22",
+  "channels": [
+    {
+      "channel_id": "C07TEST123",
+      "row_count": 2,
+      "token_count": 24,
+      "rows": [
+        {
+          "kind": "transcript",
+          "id": 1,
+          "channel_id": "C07TEST123",
+          "ts": "2026-04-22T01:00:00+00:00",
+          "token_count": 12,
+          "text": "Daily summary should preserve deploy checklist context.",
+          "session_id": "session-C07TEST123",
+          "role": "assistant",
+          "message_uuid": "msg-1",
+          "parent_uuid": null
+        },
+        {
+          "kind": "summary",
+          "id": 2,
+          "channel_id": "C07TEST123",
+          "ts": "2026-04-22T02:00:00+00:00",
+          "token_count": 12,
+          "text": "The deploy checklist is the durable context for tomorrow.",
+          "session_id": null,
+          "role": null,
+          "message_uuid": null,
+          "parent_uuid": null
+        }
+      ]
+    }
+  ],
+  "skipped_channels": []
+}

@@ -1,0 +1,53 @@
+# Owner-DM channel manifest template.
+#
+# Copied into contexts/<dm-channel-id>/.claude/channel-manifest.yaml on
+# first provisioning. Full inheritance, user-level setting priming so the
+# operator's personal MCPs (Linear, Gmail, etc.) are available.
+#
+# setting_sources=["user"] also drives the ~47% per-turn cost reduction
+# validated on 2026-04-20. (See scripts/cost_experiment.py.)
+
+channel_id: "{{channel_id}}"
+identity: owner-dm-full
+label: "DM"
+status: active
+nightly_included: true
+permission_tier: trusted
+
+setting_sources: [user]
+
+# Empty scope blocks = full inheritance from project-level .claude/
+tools: {}
+mcp_servers: {}
+skills: {}
+
+# Permission rules and HITL max_per_day are tier-derived in code from
+# `_TIER_DEFAULTS`. Keep per-channel overrides here only when deviating from
+# the trusted baseline.
+
+behavior:
+  style: balanced
+  permission_mode: default
+  # Owner DM defaults to the config.yaml global cap; override here if needed.
+  # max_turns: 12
+
+# Optional: add a personal cost guardrail even for owner-DM.
+cost_budget:
+  warn_at_percent: 80
+  # monthly_usd: 100.0
+
+hitl:
+  enabled: true
+  timeout_s: 300
+
+nightly:
+  model: opus
+
+memory:
+  # Channel IDs listed here are hidden from memory_search in every scope.
+  # M5.6 will populate this for OQ31 opt-outs; empty is valid.
+  excluded_channels: []
+
+ask_user_question:
+  enabled: true
+  fallback: answer-as-self

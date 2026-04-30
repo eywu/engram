@@ -1,0 +1,78 @@
+[project]
+name = "engram"
+version = "0.1.0"
+description = "Personal AI agent for Slack — per-channel isolation, persistent memory, skill integration."
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+license = { text = "MIT" }
+authors = [{ name = "Eric Wu", email = "eric@ericywu.com" }]
+keywords = ["slack", "agent", "claude", "anthropic", "ai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "claude-agent-sdk>=0.1.60",
+    "slack-bolt>=1.28.0",
+    "aiohttp>=3.10",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "typer>=0.12",
+    "rich>=13.0",
+    "structlog>=24.0",
+    "pydantic>=2.10",
+    "google-genai>=1.73.1",
+    "numpy>=2.4.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "types-PyYAML>=6.0",
+]
+
+[project.scripts]
+engram = "engram.cli:app"
+engram-nightly-harvest = "engram.nightly.harvest:main"
+engram-nightly-synthesize = "engram.nightly.synthesize:main"
+engram-nightly-apply = "engram.nightly.apply:main"
+
+[project.urls]
+Homepage = "https://github.com/eywu/engram"
+Repository = "https://github.com/eywu/engram"
+Issues = "https://github.com/eywu/engram/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/engram"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "RUF"]
+ignore = ["E501"]  # line length handled by formatter
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/engram"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "requires_api_key: integration tests that call Anthropic directly and are skipped in CI",
+    "requires_build: wheel build/install smoke tests that are opt-in locally",
+]

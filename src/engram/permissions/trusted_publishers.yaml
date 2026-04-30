@@ -1,0 +1,23 @@
+npm:
+  publishers:
+    - anthropic
+    - microsoft
+    - modelcontextprotocol
+  scopes:
+    - "@anthropic"
+    - "@microsoft"
+    - "@modelcontextprotocol"
+  github_orgs:
+    - anthropics
+    - microsoft
+    - modelcontextprotocol
+
+pypi:
+  publishers:
+    - anthropic
+    - microsoft
+    - modelcontextprotocol
+  github_orgs:
+    - anthropics
+    - microsoft
+    - modelcontextprotocol
