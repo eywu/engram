@@ -14,6 +14,9 @@ import typer
 from engram.paths import engram_home
 
 SLACK_APPS_URL = "https://api.slack.com/apps"
+REPO_CLONE_CLI_HINT = (
+    "You're running engram from a repo clone - to remove the CLI, just delete the clone."
+)
 
 
 @dataclass(frozen=True)
@@ -96,7 +99,7 @@ def run_uninstall(*, keep_data: bool = False, purge: bool = False, dry_run: bool
     if uninstall_cli:
         _uninstall_cli()
     elif running_from_repo_clone:
-        typer.echo("  - running from a repo clone; delete the clone to remove the CLI")
+        typer.echo(f"  - {REPO_CLONE_CLI_HINT}")
     else:
         typer.echo("  - kept engram CLI")
 
@@ -145,7 +148,7 @@ def _print_plan(
     )
     typer.echo(data_line)
     if running_from_repo_clone:
-        typer.echo(f"  [{cli_marker}] remove the `engram` CLI (delete this repo clone)")
+        typer.echo(f"  [{cli_marker}] remove the `engram` CLI ({REPO_CLONE_CLI_HINT})")
     else:
         typer.echo(f"  [{cli_marker}] uninstall the `engram` CLI (uv tool uninstall engram)")
     typer.echo(f"  [{slack_marker}] remove your Slack app (NOT automated — you'll get a link)")
@@ -169,9 +172,7 @@ def _print_dry_run_commands(
     if purge:
         typer.echo(f"  rm -rf {_display_home(engram_home())}/")
         if running_from_repo_clone:
-            typer.echo(
-                "  # running from a repo clone; delete the clone to remove the CLI"
-            )
+            typer.echo(f"  # {REPO_CLONE_CLI_HINT}")
         else:
             typer.echo("  uv tool uninstall engram")
     elif keep_data:
@@ -179,9 +180,7 @@ def _print_dry_run_commands(
     else:
         typer.echo(f"  # prompt before deleting {_display_home(engram_home())}/")
         if running_from_repo_clone:
-            typer.echo(
-                "  # running from a repo clone; delete the clone to remove the CLI"
-            )
+            typer.echo(f"  # {REPO_CLONE_CLI_HINT}")
         else:
             typer.echo("  # prompt before running: uv tool uninstall engram")
     typer.echo(f"  # Slack app cleanup is manual: {SLACK_APPS_URL}")
@@ -263,13 +262,11 @@ def _running_from_repo_clone() -> bool:
     except OSError:
         resolved_entrypoint = entrypoint.absolute()
 
-    cwd = Path.cwd()
-    if not _looks_like_engram_repo(cwd):
-        return False
-    try:
-        return resolved_entrypoint.is_relative_to(cwd.resolve())
-    except OSError:
-        return False
+    return _entrypoint_is_inside_repo_clone(resolved_entrypoint)
+
+
+def _entrypoint_is_inside_repo_clone(entrypoint: Path) -> bool:
+    return any(_looks_like_engram_repo(parent) for parent in entrypoint.parents)
 
 
 def _looks_like_engram_repo(path: Path) -> bool:

@@ -8,6 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 from engram.cli import app
+from engram.uninstall import _entrypoint_is_inside_repo_clone
 
 
 def test_uninstall_dry_run_outputs_plan_without_commands(
@@ -46,7 +47,7 @@ def test_uninstall_dry_run_from_repo_clone_suppresses_uv_tool_uninstall(
     result = CliRunner().invoke(app, ["uninstall", "--purge", "--dry-run"])
 
     assert result.exit_code == 0
-    assert "delete the clone to remove the CLI" in result.output
+    assert "You're running engram from a repo clone" in result.output
     assert "uv tool uninstall engram" not in result.output
 
 
@@ -171,7 +172,30 @@ def test_uninstall_purge_from_repo_clone_skips_uv_tool_uninstall(
 
     assert result.exit_code == 0
     assert ["uv", "tool", "uninstall", "engram"] not in commands
-    assert "delete the clone to remove the CLI" in result.output
+    assert "You're running engram from a repo clone" in result.output
+
+
+def test_entrypoint_inside_repo_clone_does_not_depend_on_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "engram"
+    entrypoint = repo / ".venv" / "bin" / "engram"
+    entrypoint.parent.mkdir(parents=True)
+    (repo / "src" / "engram").mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname = 'engram'\n", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    assert _entrypoint_is_inside_repo_clone(entrypoint)
+
+
+def test_entrypoint_outside_repo_clone_is_not_repo_run(tmp_path: Path) -> None:
+    tool_entrypoint = tmp_path / ".local" / "bin" / "engram"
+    tool_entrypoint.parent.mkdir(parents=True)
+
+    assert not _entrypoint_is_inside_repo_clone(tool_entrypoint)
 
 
 def test_uninstall_keep_data_skips_data_prompt_only(
