@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import datetime
+import io
 import json
 import plistlib
 from pathlib import Path
 
 import pytest
 import yaml  # type: ignore[import-untyped]
+from rich.console import Console
 from typer.testing import CliRunner
 
 from engram.bootstrap import provision_channel
@@ -36,6 +38,7 @@ from engram.doctor import (
     check_slack_bot_token,
     check_slack_slash_commands,
     check_uv_on_path,
+    render_report,
 )
 from engram.launchd import render_bridge_plist, write_bridge_env_file
 from engram.manifest import IdentityTemplate
@@ -1027,6 +1030,35 @@ def test_doctor_json_schema_is_stable() -> None:
             },
         ],
     }
+
+
+def test_doctor_render_points_to_uninstall_when_unhealthy() -> None:
+    report = DoctorReport(
+        checks=[
+            DoctorCheck("one", "One", CheckStatus.PASS, "ok"),
+            DoctorCheck("two", "Two", CheckStatus.WARN, "warn"),
+        ]
+    )
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=False, color_system=None, width=120)
+
+    render_report(report, console)
+
+    assert "If you want to start over: engram uninstall --dry-run" in stream.getvalue()
+
+
+def test_doctor_render_omits_uninstall_hint_when_healthy() -> None:
+    report = DoctorReport(
+        checks=[
+            DoctorCheck("one", "One", CheckStatus.PASS, "ok"),
+        ]
+    )
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=False, color_system=None, width=120)
+
+    render_report(report, console)
+
+    assert "engram uninstall --dry-run" not in stream.getvalue()
 
 
 def test_doctor_cli_json_against_tmp_config(

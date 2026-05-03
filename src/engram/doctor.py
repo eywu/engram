@@ -192,6 +192,8 @@ def render_report(report: DoctorReport, console: Console | None = None) -> None:
         f"{summary['warnings']} warnings, "
         f"{summary['failed']} failed"
     )
+    if summary["warnings"] or summary["failed"]:
+        target.print("If you want to start over: engram uninstall --dry-run")
 
 
 def check_uv_on_path(
