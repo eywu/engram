@@ -148,7 +148,9 @@ def _print_plan(
     )
     typer.echo(data_line)
     if running_from_repo_clone:
-        typer.echo(f"  [{cli_marker}] remove the `engram` CLI ({REPO_CLONE_CLI_HINT})")
+        # `[-]` (not `[x]`/`[ ]`) signals manual-action: the script will not
+        # delete the clone for the user; they must do it themselves.
+        typer.echo(f"  [-] remove the `engram` CLI ({REPO_CLONE_CLI_HINT})")
     else:
         typer.echo(f"  [{cli_marker}] uninstall the `engram` CLI (uv tool uninstall engram)")
     typer.echo(f"  [{slack_marker}] remove your Slack app (NOT automated — you'll get a link)")
@@ -184,6 +186,8 @@ def _print_dry_run_commands(
         else:
             typer.echo("  # prompt before running: uv tool uninstall engram")
     typer.echo(f"  # Slack app cleanup is manual: {SLACK_APPS_URL}")
+    for line in _slack_cleanup_lines():
+        typer.echo(f"  #   {line}")
 
 
 def _unload_launchd_job(job: LaunchdJob) -> None:
@@ -237,20 +241,28 @@ def _uninstall_cli() -> None:
     _warn_command("could not uninstall engram CLI", result)
 
 
+def _slack_cleanup_lines() -> list[str]:
+    """Return Slack-app cleanup guidance lines (AC3).
+
+    Single source of truth so the live (`_print_slack_cleanup_message`) and
+    dry-run (`_print_dry_run_commands`) paths can't drift.
+    """
+    return [
+        f"Personal workspace: You can delete the entire app at {SLACK_APPS_URL} "
+        "- that workspace is yours.",
+        f"Company workspace: Revoke the install or rotate the app's tokens at "
+        f"{SLACK_APPS_URL}. Don't delete the app if other people in your org are "
+        "also using it.",
+    ]
+
+
 def _print_slack_cleanup_message(*, selected: bool) -> None:
     if selected:
         typer.echo("Slack app cleanup is manual:")
     else:
         typer.echo("Optional Slack app cleanup remains manual:")
-    typer.echo(
-        f"  Personal workspace: You can delete the entire app at {SLACK_APPS_URL} "
-        "- that workspace is yours."
-    )
-    typer.echo(
-        f"  Company workspace: Revoke the install or rotate the app's tokens at "
-        f"{SLACK_APPS_URL}. Don't delete the app if other people in your org are "
-        "also using it."
-    )
+    for line in _slack_cleanup_lines():
+        typer.echo(f"  {line}")
 
 
 def _running_from_repo_clone() -> bool:

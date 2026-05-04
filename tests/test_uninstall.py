@@ -49,6 +49,32 @@ def test_uninstall_dry_run_from_repo_clone_suppresses_uv_tool_uninstall(
     assert result.exit_code == 0
     assert "You're running engram from a repo clone" in result.output
     assert "uv tool uninstall engram" not in result.output
+    # Blocker-1 contract (GRO-595 iter-3 reviewer fix): the repo-clone CLI line
+    # must use the [-] manual-action marker, not [x]/[ ], so the user does not
+    # think the script will delete their clone.
+    assert "[-] remove the `engram` CLI" in result.output
+    assert "[x] remove the `engram` CLI" not in result.output
+
+
+def test_uninstall_dry_run_includes_personal_and_company_slack_guidance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3 sharpened Slack guidance must surface in --dry-run, not just live path."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def fail_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise AssertionError(f"unexpected command: {args} {kwargs}")
+
+    monkeypatch.setattr("engram.uninstall.subprocess.run", fail_run)
+
+    result = CliRunner().invoke(app, ["uninstall", "--dry-run"])
+
+    assert result.exit_code == 0
+    # Both workspace-mode hints must appear in the dry-run preview, prefixed
+    # as comments since dry-run renders the section as commands.
+    assert "Personal workspace: You can delete the entire app" in result.output
+    assert "Company workspace: Revoke the install" in result.output
 
 
 def test_uninstall_purge_executes_all_destructive_actions_without_prompts(
