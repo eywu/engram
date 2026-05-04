@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,9 @@ import typer
 from engram.paths import engram_home
 
 SLACK_APPS_URL = "https://api.slack.com/apps"
+REPO_CLONE_CLI_HINT = (
+    "You're running engram from a repo clone - to remove the CLI, just delete the clone."
+)
 
 
 @dataclass(frozen=True)
@@ -29,15 +33,33 @@ def run_uninstall(*, keep_data: bool = False, purge: bool = False, dry_run: bool
 
     home = engram_home()
     jobs = _launchd_jobs()
+    running_from_repo_clone = _running_from_repo_clone()
 
     if dry_run:
         typer.echo("Dry run: no changes will be made.")
-        _print_plan(home, jobs, purge=purge, keep_data=keep_data)
-        _print_dry_run_commands(jobs, purge=purge, keep_data=keep_data)
+        _print_plan(
+            home,
+            jobs,
+            purge=purge,
+            keep_data=keep_data,
+            running_from_repo_clone=running_from_repo_clone,
+        )
+        _print_dry_run_commands(
+            jobs,
+            purge=purge,
+            keep_data=keep_data,
+            running_from_repo_clone=running_from_repo_clone,
+        )
         return
 
     if not purge:
-        _print_plan(home, jobs, purge=False, keep_data=keep_data)
+        _print_plan(
+            home,
+            jobs,
+            purge=False,
+            keep_data=keep_data,
+            running_from_repo_clone=running_from_repo_clone,
+        )
         if not typer.confirm("Continue?", default=False):
             typer.echo("Aborted.")
             return
@@ -49,9 +71,14 @@ def run_uninstall(*, keep_data: bool = False, purge: bool = False, dry_run: bool
             default=False,
         )
     )
-    uninstall_cli = purge or typer.confirm(
-        "Uninstall the `engram` CLI with `uv tool uninstall engram`?",
-        default=False,
+    uninstall_cli = (
+        False
+        if running_from_repo_clone
+        else purge
+        or typer.confirm(
+            "Uninstall the `engram` CLI with `uv tool uninstall engram`?",
+            default=False,
+        )
     )
     slack_cleanup = purge or typer.confirm(
         "Open Slack app cleanup instructions at the end?",
@@ -71,6 +98,8 @@ def run_uninstall(*, keep_data: bool = False, purge: bool = False, dry_run: bool
 
     if uninstall_cli:
         _uninstall_cli()
+    elif running_from_repo_clone:
+        typer.echo(f"  - {REPO_CLONE_CLI_HINT}")
     else:
         typer.echo("  - kept engram CLI")
 
@@ -100,6 +129,7 @@ def _print_plan(
     *,
     purge: bool,
     keep_data: bool,
+    running_from_repo_clone: bool,
 ) -> None:
     typer.echo("This will remove Engram from your system.")
     typer.echo()
@@ -117,7 +147,12 @@ def _print_plan(
         f"(config, memory DB, logs, {_home_size(home)}){data_suffix}"
     )
     typer.echo(data_line)
-    typer.echo(f"  [{cli_marker}] uninstall the `engram` CLI (uv tool uninstall engram)")
+    if running_from_repo_clone:
+        # `[-]` (not `[x]`/`[ ]`) signals manual-action: the script will not
+        # delete the clone for the user; they must do it themselves.
+        typer.echo(f"  [-] remove the `engram` CLI ({REPO_CLONE_CLI_HINT})")
+    else:
+        typer.echo(f"  [{cli_marker}] uninstall the `engram` CLI (uv tool uninstall engram)")
     typer.echo(f"  [{slack_marker}] remove your Slack app (NOT automated — you'll get a link)")
     typer.echo()
 
@@ -127,6 +162,7 @@ def _print_dry_run_commands(
     *,
     purge: bool,
     keep_data: bool,
+    running_from_repo_clone: bool,
 ) -> None:
     domain = _launchctl_domain()
     typer.echo("Commands that would run:")
@@ -137,13 +173,21 @@ def _print_dry_run_commands(
         typer.echo(f"  rm -f {_display_path(job.plist_path)}")
     if purge:
         typer.echo(f"  rm -rf {_display_home(engram_home())}/")
-        typer.echo("  uv tool uninstall engram")
+        if running_from_repo_clone:
+            typer.echo(f"  # {REPO_CLONE_CLI_HINT}")
+        else:
+            typer.echo("  uv tool uninstall engram")
     elif keep_data:
         typer.echo(f"  # keep {_display_home(engram_home())}/")
     else:
         typer.echo(f"  # prompt before deleting {_display_home(engram_home())}/")
-        typer.echo("  # prompt before running: uv tool uninstall engram")
+        if running_from_repo_clone:
+            typer.echo(f"  # {REPO_CLONE_CLI_HINT}")
+        else:
+            typer.echo("  # prompt before running: uv tool uninstall engram")
     typer.echo(f"  # Slack app cleanup is manual: {SLACK_APPS_URL}")
+    for line in _slack_cleanup_lines():
+        typer.echo(f"  #   {line}")
 
 
 def _unload_launchd_job(job: LaunchdJob) -> None:
@@ -197,13 +241,48 @@ def _uninstall_cli() -> None:
     _warn_command("could not uninstall engram CLI", result)
 
 
+def _slack_cleanup_lines() -> list[str]:
+    """Return Slack-app cleanup guidance lines (AC3).
+
+    Single source of truth so the live (`_print_slack_cleanup_message`) and
+    dry-run (`_print_dry_run_commands`) paths can't drift.
+    """
+    return [
+        f"Personal workspace: You can delete the entire app at {SLACK_APPS_URL} "
+        "- that workspace is yours.",
+        f"Company workspace: Revoke the install or rotate the app's tokens at "
+        f"{SLACK_APPS_URL}. Don't delete the app if other people in your org are "
+        "also using it.",
+    ]
+
+
 def _print_slack_cleanup_message(*, selected: bool) -> None:
     if selected:
         typer.echo("Slack app cleanup is manual:")
     else:
         typer.echo("Optional Slack app cleanup remains manual:")
-    typer.echo(f"  {SLACK_APPS_URL}")
-    typer.echo("Open your Engram app there and remove it from the workspace if desired.")
+    for line in _slack_cleanup_lines():
+        typer.echo(f"  {line}")
+
+
+def _running_from_repo_clone() -> bool:
+    entrypoint = Path(sys.argv[0]).expanduser()
+    if entrypoint.name != "engram":
+        return False
+    try:
+        resolved_entrypoint = entrypoint.resolve()
+    except OSError:
+        resolved_entrypoint = entrypoint.absolute()
+
+    return _entrypoint_is_inside_repo_clone(resolved_entrypoint)
+
+
+def _entrypoint_is_inside_repo_clone(entrypoint: Path) -> bool:
+    return any(_looks_like_engram_repo(parent) for parent in entrypoint.parents)
+
+
+def _looks_like_engram_repo(path: Path) -> bool:
+    return (path / "pyproject.toml").exists() and (path / "src" / "engram").is_dir()
 
 
 def _run_command(args: Sequence[str]) -> subprocess.CompletedProcess[str] | None:

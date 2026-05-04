@@ -73,6 +73,18 @@ engram run
 Then DM the Engram bot in your Slack workspace. First response typically
 arrives within ~30 seconds.
 
+## Uninstalling
+
+To see what Engram would remove, run a dry run first, then run the
+interactive uninstall when you're ready. Use `--keep-data` for an
+upgrade-style uninstall that leaves `~/.engram/` in place, or `--purge` for
+non-interactive removal.
+
+```bash
+uv run engram uninstall --dry-run   # see what would happen
+uv run engram uninstall              # interactive
+```
+
 ## What things cost
 
 Engram calls Claude via your own Anthropic API key — billed separately from
